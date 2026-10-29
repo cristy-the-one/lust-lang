@@ -20,6 +20,16 @@
 // Both binaries include this module and each uses only part of it.
 #![allow(dead_code)]
 
+/// The main thread's stack is fixed when the binary is linked. Unix raises
+/// it at startup (`raise_stack_limit` in src/main.rs) toward
+/// `pool::STACK_SIZE`; Windows cannot, so the same 256 MiB is a linker
+/// directive. The default 1 MiB overflows const-eval of a deep expression
+/// on the main thread.
+#[cfg(all(windows, target_env = "msvc"))]
+#[used]
+#[link_section = ".drectve"]
+static LUST_MAIN_STACK: [u8; 18] = *b" /STACK:268435456\0";
+
 use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;

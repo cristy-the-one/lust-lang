@@ -256,11 +256,17 @@ pub fn compile_units(units: &[(PathBuf, String)], debug: bool) -> Result<(), Str
 fn link_objects(tcc: &Tcc, objs: &[PathBuf], out: &Path) -> Result<(), String> {
     // The float methods call libm (sqrt, pow, exp, log, floor, ...),
     // the same entry points rustc lowers them to on this platform.
-    let libm = CString::new("m").unwrap();
+    // Windows has no libm: those names live in msvcrt, which tcc links
+    // already, and the C99 ones tcc's msvcrt import library lacks are
+    // defined by the runtime (float.c).
     // SAFETY: valid state and NUL-terminated strings that outlive the calls.
     unsafe {
-        if tcc_add_library(tcc.s, libm.as_ptr()) != 0 {
-            return Err(tcc.fail("load libm"));
+        #[cfg(not(windows))]
+        {
+            let libm = CString::new("m").unwrap();
+            if tcc_add_library(tcc.s, libm.as_ptr()) != 0 {
+                return Err(tcc.fail("load libm"));
+            }
         }
         for o in objs {
             if tcc_add_file(tcc.s, cstr(o).as_ptr()) != 0 {

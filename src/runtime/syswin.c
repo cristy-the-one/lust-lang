@@ -226,6 +226,25 @@ static int32_t lust_sys_final_path(HANDLE h, lust_Vec *out) {
     return 0;
 }
 
+/* `env::current_exe`: GetModuleFileNameW, UTF-8, no trailing NUL.
+   std does not add the `\\?\` prefix here. */
+int32_t lust_sys_current_exe(lust_Vec *out) {
+    WCHAR buf[1024];
+    DWORD n = GetModuleFileNameW(0, buf, 1024);
+    if (n == 0) return (int32_t)GetLastError();
+    if (n >= 1024) {
+        WCHAR *big = malloc(sizeof(WCHAR) * 32768);
+        if (!big) lust_oom();
+        n = GetModuleFileNameW(0, big, 32768);
+        if (n == 0 || n >= 32768) { int32_t e = (int32_t)GetLastError(); free(big); return e ? e : 122; }
+        lust_sys_push_wide(out, big, (int)n);
+        free(big);
+        return 0;
+    }
+    lust_sys_push_wide(out, buf, (int)n);
+    return 0;
+}
+
 int32_t lust_sys_readlink(const uint8_t *p, uint64_t len, lust_Vec *out) {
     /* env::current_exe reads /proc/self/exe through this intrinsic. */
     if (len == 14 && memcmp(p, "/proc/self/exe", 14) == 0) {

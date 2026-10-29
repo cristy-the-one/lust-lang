@@ -75,7 +75,7 @@ unsupported=0
 # `@STD@/library/..`: boat's rustc prints `/rustc/<hash>/library/..`, a toolchain with
 # rust-src installed prints its local `lib/rustlib/src/rust/library/..`. W-PANIC compares
 # the rest byte for byte.
-mask_stderr() { sed -E -e "s/^thread '([^']*)' \([0-9]+\) /thread '\1' (TID) /" -e 's#(/rustc/[0-9a-f]+|/[^ :]*/lib/rustlib/src/rust)/library/#@STD@/library/#g' -e '/^timeout: the monitored command dumped core$/d' -e '/: line [0-9]+: +[0-9]+ .* timeout /d' "$1"; }
+mask_stderr() { sed -E -e 's#\\#/#g' -e "s/^thread '([^']*)' \([0-9]+\) /thread '\1' (TID) /" -e 's#(/rustc/[0-9a-f]+|/[^ :]*/lib/rustlib/src/rust)/library/#@STD@/library/#g' -e '/^timeout: the monitored command dumped core$/d' -e '/: line [0-9]+: +[0-9]+ .* timeout /d' "$1"; }
 
 # mask_stdout <case file> <stdout file>: a program's stdout with the paths it can print
 # masked: the case's path as @CASE@ and the checkout root as @ROOT@ (`file!()`,

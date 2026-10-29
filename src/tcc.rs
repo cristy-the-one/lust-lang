@@ -137,8 +137,15 @@ impl Tcc {
         // No asynchronous unwind tables: tcc writes overlapping .eh_frame
         // FDEs (spike K6), which makes the system linker reject its
         // objects. Lust frames never unwind, so the tables are pure cost.
-        let opts =
-            CString::new(if debug { "-g -w -fno-asynchronous-unwind-tables" } else { "-w -fno-asynchronous-unwind-tables" }).unwrap();
+        // Windows executables otherwise reserve 1 MiB of stack. Linux
+        // gives the main thread 8 MiB, which is what the programs under
+        // test were written for.
+        let stack = if cfg!(windows) && (output == TCC_OUTPUT_EXE || output == TCC_OUTPUT_DLL) { " -Wl,-stack=8388608" } else { "" };
+        let opts = CString::new(format!(
+            "{}{stack}",
+            if debug { "-g -w -fno-asynchronous-unwind-tables" } else { "-w -fno-asynchronous-unwind-tables" }
+        ))
+        .unwrap();
         // SAFETY: a fresh libtcc state; the error vector is boxed so its address is stable.
         unsafe {
             let s = tcc_new();

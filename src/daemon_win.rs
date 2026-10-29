@@ -57,7 +57,8 @@ unsafe extern "system" fn on_ctrl(ctrl: u32) -> i32 {
         super::request_shutdown();
         let wake = WAKE.load(Ordering::SeqCst);
         if !wake.is_null() {
-            SetEvent(wake);
+            // Edition 2024 does not treat an unsafe fn body as an unsafe block.
+            unsafe { SetEvent(wake) };
         }
         1
     } else {

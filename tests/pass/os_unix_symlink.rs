@@ -1,3 +1,4 @@
+// only: unix
 // `std::os::unix::fs::symlink`: creates the link, and a second
 // creation at the same path is std's AlreadyExists error.
 use std::os::unix::fs::symlink;

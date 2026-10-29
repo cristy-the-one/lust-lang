@@ -233,6 +233,9 @@ The zip contains `bin\lust.exe`, `bin\lust-core.exe`, the pinned `tcc.exe`, and 
 - The default output name is `stem.exe` when you omit `-o`, as rustc does. Paths in diagnostics use `\`.
 - The front-image save (`LUST_FRONT_STATE`, a fixed-address heap snapshot) stays Linux-only. Warm incremental checks in the daemon do not use it.
 - `scripts/build-tcc.ps1` and `scripts/release.ps1` are the Windows build and package scripts. CI runs the same `scripts/ci.sh` gate on `windows-latest`. ASan is not run there.
+- `lust.exe` and `lust-core.exe` reserve a 16 MiB stack. The Windows default (1 MiB) is too small for the const evaluator.
+- The Windows C runtime loads a few Win32 entry points (`FlsAlloc`, `InitOnceExecuteOnce`, `CommandLineToArgvW`, and the Vista path APIs) with `GetProcAddress`, because the pinned TinyCC import libraries do not list them.
+- `std::net` sockets are not implemented on Windows yet: those calls fail with "not supported". The daemon does not use them.
 
 ### Use
 

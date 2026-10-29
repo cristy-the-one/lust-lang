@@ -1,3 +1,4 @@
+// only: unix
 // OpenOptionsExt::mode and custom_flags (O_PATH, O_DIRECTORY) with std's
 // OpenOptions Debug; Read and BufRead through Box<dyn BufRead + Send> and
 // Box<dyn Read>; sync::Weak::upgrade as a fn value into an Arc<dyn Tr>.

@@ -1,3 +1,4 @@
+// only: unix
 // std::io::copy from OS handles into Box<dyn Write> (the ts-rust shape: a socket into a boxed writer).
 use std::io::{self, Write};
 fn main() {

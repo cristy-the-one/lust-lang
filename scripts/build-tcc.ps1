@@ -100,13 +100,6 @@ Invoke-Tcc @('-c', '../lib/bt-dll.c', '-o', 'lib/bt-dll.o')
 Invoke-Tcc @('-c', '../lib/runmain.c', '-o', 'lib/runmain.o')
 Pop-Location
 
-# Same header merge as build-tcc.bat: win32 headers, then the shared ones.
-$includeStage = Join-Path $win32 'include'
-Copy-Item (Join-Path $src 'include\*.h') $includeStage -Force
-if (Test-Path (Join-Path $src 'tcclib.h')) {
-    Copy-Item (Join-Path $src 'tcclib.h') $includeStage -Force
-}
-
 $rt = Join-Path $out 'lib\tcc'
 New-Item -ItemType Directory -Force -Path (Join-Path $out 'bin'), (Join-Path $out 'lib'), (Join-Path $rt 'include') | Out-Null
 Copy-Item $tcc (Join-Path $out 'bin\tcc.exe') -Force

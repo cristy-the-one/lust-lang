@@ -134,7 +134,7 @@ impl Error {
     /// True for the kind `write_all` and `read_exact` retry on.
     pub(crate) fn is_interrupted(&self) -> bool {
         match self.repr {
-            Repr::Os(code) => code == 4,
+            Repr::Os(code) => os_is_interrupted(code),
             Repr::Simple(kind) => kind == ErrorKind::Interrupted,
             Repr::SimpleMessage(kind, _) => kind == ErrorKind::Interrupted,
             Repr::Custom(kind, _) => kind == ErrorKind::Interrupted,
@@ -439,6 +439,76 @@ fn decode_error_kind(code: i32) -> ErrorKind {
         70 => ErrorKind::StaleNetworkFileHandle,
         78 => ErrorKind::Unsupported,
         102 => ErrorKind::Unsupported,
+        _ => ErrorKind::__Uncategorized,
+    }
+}
+
+/// EINTR is 4 on Linux and macOS. Windows has no EINTR: rustc's
+/// `is_interrupted` is always false there, and 4 is
+/// `ERROR_TOO_MANY_OPEN_FILES`.
+#[cfg(windows)]
+fn os_is_interrupted(_code: i32) -> bool {
+    false
+}
+
+#[cfg(not(windows))]
+fn os_is_interrupted(code: i32) -> bool {
+    code == 4
+}
+
+/// The kind of an OS error code, as std's `decode_error_kind` on Windows.
+#[cfg(windows)]
+fn decode_error_kind(code: i32) -> ErrorKind {
+    match code as u32 {
+        5 => return ErrorKind::PermissionDenied,
+        183 => return ErrorKind::AlreadyExists,
+        80 => return ErrorKind::AlreadyExists,
+        109 => return ErrorKind::BrokenPipe,
+        2 | 3 | 15 | 53 | 67 => return ErrorKind::NotFound,
+        232 => return ErrorKind::BrokenPipe,
+        123 | 161 | 206 => return ErrorKind::InvalidFilename,
+        87 | 131 => return ErrorKind::InvalidInput,
+        8 | 14 => return ErrorKind::OutOfMemory,
+        121 | 258 | 594 | 995 | 1053 | 1121 | 1460 | 5910 | 7012 | 7040 | 8014 | 8226 | 9705 | 13805 | 15402 | 15403 => {
+            return ErrorKind::TimedOut
+        }
+        120 => return ErrorKind::Unsupported,
+        1232 => return ErrorKind::HostUnreachable,
+        1231 => return ErrorKind::NetworkUnreachable,
+        267 => return ErrorKind::NotADirectory,
+        336 => return ErrorKind::IsADirectory,
+        145 => return ErrorKind::DirectoryNotEmpty,
+        19 => return ErrorKind::ReadOnlyFilesystem,
+        112 | 39 => return ErrorKind::StorageFull,
+        132 => return ErrorKind::NotSeekable,
+        1295 => return ErrorKind::QuotaExceeded,
+        223 => return ErrorKind::FileTooLarge,
+        170 => return ErrorKind::ResourceBusy,
+        1131 => return ErrorKind::Deadlock,
+        17 => return ErrorKind::CrossesDevices,
+        1142 => return ErrorKind::TooManyLinks,
+        4 => return ErrorKind::__TooManyOpenFiles,
+        1921 => return ErrorKind::__FilesystemLoop,
+        1117 => return ErrorKind::__InputOutputError,
+        _ => {}
+    }
+    match code {
+        10013 => ErrorKind::PermissionDenied,
+        10048 => ErrorKind::AddrInUse,
+        10049 => ErrorKind::AddrNotAvailable,
+        10053 => ErrorKind::ConnectionAborted,
+        10061 => ErrorKind::ConnectionRefused,
+        10054 => ErrorKind::ConnectionReset,
+        10022 => ErrorKind::InvalidInput,
+        10057 => ErrorKind::NotConnected,
+        10035 => ErrorKind::WouldBlock,
+        10060 => ErrorKind::TimedOut,
+        10065 => ErrorKind::HostUnreachable,
+        10050 => ErrorKind::NetworkDown,
+        10051 => ErrorKind::NetworkUnreachable,
+        10069 => ErrorKind::QuotaExceeded,
+        10024 => ErrorKind::__TooManyOpenFiles,
+        10058 => ErrorKind::BrokenPipe,
         _ => ErrorKind::__Uncategorized,
     }
 }

@@ -150,6 +150,25 @@ impl ExitStatus {
     }
 }
 
+#[cfg(target_os = "windows")]
+impl fmt::Display for ExitStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The runtime packs the process exit code the Unix way (the
+        // next byte of the wait status). rustc prints that code.
+        let code = (self.raw >> 8) & 0xff;
+        write!(f, "exit code: {code}")
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl fmt::Debug for ExitStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let code = (self.raw >> 8) & 0xff;
+        write!(f, "ExitStatus(ExitStatus({code}))")
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
 impl fmt::Display for ExitStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // std's unix Display: exited, signaled, stopped, continued, or
@@ -174,8 +193,10 @@ impl fmt::Display for ExitStatus {
 }
 
 /// Std's unix inner status Debug: `unix_wait_status(N)`.
+#[cfg(not(target_os = "windows"))]
 struct WaitStatus(i32);
 
+#[cfg(not(target_os = "windows"))]
 impl fmt::Debug for WaitStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("unix_wait_status").field(&self.0).finish()
@@ -183,6 +204,7 @@ impl fmt::Debug for WaitStatus {
 }
 
 /// Std derives it over the inner status: `ExitStatus(unix_wait_status(N))`.
+#[cfg(not(target_os = "windows"))]
 impl fmt::Debug for ExitStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("ExitStatus").field(&WaitStatus(self.raw)).finish()

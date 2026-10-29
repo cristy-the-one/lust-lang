@@ -150,6 +150,13 @@ impl Tcc {
             tcc_set_lib_path(s, lib.as_ptr());
             tcc_set_options(s, opts.as_ptr());
             tcc_set_output_type(s, output);
+            // On Windows, tcc searches `{B}/lib` for libtcc1.a and the
+            // import .def files. The runtime dir we pass as B already
+            // is that directory (`.../lib/tcc`), so add it itself.
+            #[cfg(windows)]
+            {
+                tcc_add_library_path(s, lib.as_ptr());
+            }
             Ok(t)
         }
     }

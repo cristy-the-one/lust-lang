@@ -35,14 +35,13 @@ pub fn wait_ready() {
 /// Starts reading the files the last build listed in `dir` (`write_list`), on four threads
 /// of their own (the image's readers run beside them); once per process.
 pub fn start(dir: &Path) {
-    use std::os::unix::ffi::OsStrExt;
     if STARTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         return;
     }
     let list = dir.join(LIST);
     let run = std::thread::Builder::new().name("lust-prefetch".into()).spawn(move || {
         let Ok(bytes) = std::fs::read(&list) else { return FxMap::default() };
-        let paths: Vec<PathBuf> = bytes.split(|&b| b == b'\n').filter(|l| !l.is_empty()).map(|l| PathBuf::from(std::ffi::OsStr::from_bytes(l))).collect();
+        let paths: Vec<PathBuf> = bytes.split(|&b| b == b'\n').filter(|l| !l.is_empty()).map(|l| path_from_bytes(l)).collect();
         // While the checkout may still write them, only ask the kernel to read the files
         // ahead (their bytes are not used), so the reads after it hit the page cache.
         if std::env::var_os(READY_ENV).is_some_and(|v| !v.is_empty()) {
@@ -53,7 +52,7 @@ pub fn start(dir: &Path) {
         std::thread::scope(|s| {
             let readers: Vec<_> = paths
                 .chunks(part)
-                .map(|ps| s.spawn(move || ps.iter().filter_map(|p| Some((p.clone(), std::fs::read_to_string(p).ok()?))).collect::<Vec<_>>()))
+                .map(|ps| s.spawn(move || ps.iter().filter_map(|p| Some((p.clone(), crate::srctext::read(p).ok()?))).collect::<Vec<_>>()))
                 .collect();
             readers.into_iter().flat_map(|r| r.join().unwrap_or_default()).collect()
         })
@@ -64,16 +63,30 @@ pub fn start(dir: &Path) {
 }
 
 /// Asks the kernel to read `path` ahead into the page cache (`posix_fadvise` WILLNEED).
+/// Windows has no equivalent that is worth a syscall here: the real read follows.
 fn read_ahead(path: &Path) {
-    use std::os::fd::AsRawFd;
-    unsafe extern "C" {
-        fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        unsafe extern "C" {
+            fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32;
+        }
+        const WILLNEED: i32 = 3;
+        if let Ok(f) = std::fs::File::open(path) {
+            // SAFETY: a libc call on a descriptor this function owns; it reads nothing back.
+            unsafe { posix_fadvise(f.as_raw_fd(), 0, 0, WILLNEED) };
+        }
     }
-    const WILLNEED: i32 = 3;
-    if let Ok(f) = std::fs::File::open(path) {
-        // SAFETY: a libc call on a descriptor this function owns; it reads nothing back.
-        unsafe { posix_fadvise(f.as_raw_fd(), 0, 0, WILLNEED) };
+    #[cfg(windows)]
+    {
+        let _ = path;
     }
+}
+
+/// A path list entry written by `write_list` (`OsStr::as_encoded_bytes`).
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    // SAFETY: the inverse of `as_encoded_bytes` for bytes this process wrote.
+    PathBuf::from(unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(bytes) }.to_os_string())
 }
 
 /// The texts `start` read, by path, once it is done; None when no prefetch ran (or a
@@ -85,10 +98,9 @@ pub fn take() -> Option<FxMap<PathBuf, String>> {
 
 /// Writes the files `paths` as `dir`'s list for the next build's `start`.
 pub fn write_list<'p>(dir: &Path, paths: impl Iterator<Item = &'p Path>) {
-    use std::os::unix::ffi::OsStrExt;
     let mut out = Vec::new();
     for p in paths {
-        out.extend_from_slice(p.as_os_str().as_bytes());
+        out.extend_from_slice(p.as_os_str().as_encoded_bytes());
         out.push(b'\n');
     }
     let tmp = dir.join(format!("{LIST}.tmp"));

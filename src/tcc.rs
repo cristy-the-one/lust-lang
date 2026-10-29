@@ -23,7 +23,11 @@ pub fn install_dir() -> Option<&'static Path> {
 /// package's copies, else the tree build.rs linked against (`LUST_TCC_HOME` at build time).
 pub fn tcc_paths() -> (PathBuf, PathBuf) {
     match install_dir() {
-        Some(d) => (d.join("tcc/lib/tcc"), d.join("tcc/bin/tcc")),
+        Some(d) => {
+            let exe = if cfg!(windows) { d.join("tcc/bin/tcc.exe") } else { d.join("tcc/bin/tcc") };
+            let exe = if exe.exists() { exe } else { d.join("tcc/bin/tcc") };
+            (d.join("tcc/lib/tcc"), exe)
+        }
         None => (PathBuf::from(env!("LUST_TCC_LIB_PATH")), PathBuf::from(env!("LUST_TCC_BIN"))),
     }
 }
@@ -311,19 +315,36 @@ pub fn link_with_base(objs: &[PathBuf], dir: &Path, base: &str, out: &Path, debu
     let tcc = Tcc::new(TCC_OUTPUT_EXE, debug)?;
     // tcc splits an options string on spaces: the dir goes in double
     // quotes (its `"` and `\` escaped), so a path with a space keeps
-    // its whole rpath.
-    let quoted = dir.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
-    let rpath = CString::new(format!("-Wl,-rpath=\"{quoted}\"")).unwrap();
-    let base = CString::new(base).unwrap();
+    // its whole rpath. Windows has no rpath; the dll is copied next to
+    // the executable below, which is where the loader looks first.
+    #[cfg(unix)]
+    {
+        let quoted = dir.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+        let rpath = CString::new(format!("-Wl,-rpath=\"{quoted}\"")).unwrap();
+        // SAFETY: valid state and a NUL-terminated option that outlives the call.
+        unsafe { tcc_set_options(tcc.s, rpath.as_ptr()) };
+    }
+    let lib_name = CString::new(base).unwrap();
+    let suffix = if cfg!(windows) { "dll" } else { "so" };
     // SAFETY: valid state and NUL-terminated strings that outlive the calls.
     unsafe {
-        tcc_set_options(tcc.s, rpath.as_ptr());
         tcc_add_library_path(tcc.s, cstr(dir).as_ptr());
-        if tcc_add_library(tcc.s, base.as_ptr()) != 0 {
-            return Err(tcc.fail("load libbase.so"));
+        if tcc_add_library(tcc.s, lib_name.as_ptr()) != 0 {
+            return Err(tcc.fail(&format!("load lib{base}.{suffix}")));
         }
     }
-    link_executable(&tcc, objs, out)
+    link_executable(&tcc, objs, out)?;
+    #[cfg(windows)]
+    {
+        let dll = dir.join(format!("lib{base}.dll"));
+        if let Some(parent) = out.parent() {
+            let dest = parent.join(dll.file_name().unwrap_or_default());
+            if dest != dll {
+                std::fs::copy(&dll, &dest).map_err(|e| format!("cannot copy {} next to {}: {e}", dll.display(), out.display()))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Links object files into a standalone executable at `out`.
@@ -381,12 +402,17 @@ pub fn cached_runtime_object(runtime_src: &str, debug: bool) -> Result<PathBuf, 
 /// thread), then `lone_thread` checks the OS thread list and any other live thread gives Err
 /// before the fork. The pool stays stopped only until the fork returns. The caller runs this
 /// only in one-shot sessions (a daemon runs guard compiles on other threads), and never from
-/// inside a `par_map` task. On non-Unix targets this always returns Err.
+/// inside a `par_map` task. On Windows the program runs in a child process
+/// instead of a fork (see `run_in_child`); a failure still falls back to the
+/// file-based path, and user code has not run.
 pub fn run_in_memory(units: &[(PathBuf, String)], runtime_obj: &Path, argv: &[String], debug: bool) -> Result<i32, String> {
-    #[cfg(not(unix))]
+    // Windows has no fork. A child process running a temporary executable is
+    // the same contract the caller wants: user code cannot kill this process,
+    // and the exit code matches a file-based run. The caller still reports
+    // the run as in-memory when this returns Ok.
+    #[cfg(windows)]
     {
-        let _ = (units, runtime_obj, argv, debug);
-        return Err("in-memory run is Unix-only".into());
+        return run_in_child(units, runtime_obj, argv, debug);
     }
     #[cfg(unix)]
     {
@@ -464,6 +490,28 @@ pub fn run_in_memory(units: &[(PathBuf, String)], runtime_obj: &Path, argv: &[St
         // maps to 134, as `protocol::finish` does for the file-based run.
         Ok(if status & 0x7f == 0 { (status >> 8) & 0xff } else { 134 })
     }
+}
+
+/// Compiles `units` to a temporary executable and runs it. Used where `fork`
+/// is not available. The process exit code is the program's, or 134 when the
+/// process died without one (a panic abort, as `protocol::finish` reports).
+#[cfg(windows)]
+fn run_in_child(units: &[(PathBuf, String)], runtime_obj: &Path, argv: &[String], debug: bool) -> Result<i32, String> {
+    let dir = std::env::temp_dir().join(format!(
+        "lust-memrun-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let compiled: Vec<(PathBuf, String)> = units.iter().enumerate().map(|(i, (_, src))| (dir.join(format!("u{i}.o")), src.clone())).collect();
+    compile_units(&compiled, debug)?;
+    let mut objs: Vec<PathBuf> = compiled.into_iter().map(|(p, _)| p).collect();
+    objs.push(runtime_obj.to_path_buf());
+    let exe = dir.join("mem.exe");
+    link(&objs, &exe, debug)?;
+    let status = Command::new(&exe).args(argv.iter().skip(1)).status().map_err(|e| format!("cannot run {}: {e}", exe.display()))?;
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(status.code().unwrap_or(134))
 }
 
 /// True when the OS lists no thread in this process but the caller (Linux:

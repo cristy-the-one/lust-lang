@@ -17,17 +17,23 @@
 mod protocol;
 
 use protocol::Invocation;
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
 unsafe extern "C" {
     fn setsid() -> i32;
     fn flock(fd: i32, operation: i32) -> i32;
     fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
 }
+#[cfg(unix)]
 const LOCK_EX: i32 = 2;
+#[cfg(unix)]
 const LOCK_NB: i32 = 4;
+#[cfg(unix)]
 const F_SETFD: i32 = 2;
 
 /// True when an env flag is set to a value other than "" or "0".
@@ -42,8 +48,15 @@ fn env_on(name: &str) -> bool {
 /// daemon holds a lock on would let a second daemon lock a new file at the same path.
 fn claim_start(lock: &Path) -> Option<std::fs::File> {
     let f = std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(lock).ok()?;
-    // SAFETY: flock on the live fd of `f`. LOCK_NB: fail at once when the lock is taken.
-    (unsafe { flock(f.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0).then_some(f)
+    #[cfg(unix)]
+    {
+        // SAFETY: flock on the live fd of `f`. LOCK_NB: fail at once when the lock is taken.
+        return (unsafe { flock(f.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0).then_some(f);
+    }
+    #[cfg(windows)]
+    {
+        protocol::try_lock(&f).then_some(f)
+    }
 }
 
 /// The cache dir for daemon logs. The same rule as the disk cache (src/driver/cache.rs).
@@ -70,6 +83,7 @@ fn maybe_autostart(sock: &Path, file: &Path, core: &Path) {
         return;
     }
     let Some(lock) = claim_start(&protocol::daemon_lock_path(sock)) else { return };
+    #[cfg(unix)]
     let lock_fd = lock.as_raw_fd();
     let dir = log_dir(file);
     let _ = std::fs::create_dir_all(&dir);
@@ -82,8 +96,19 @@ fn maybe_autostart(sock: &Path, file: &Path, core: &Path) {
         .envs(daemon_alloc_env())
         .env("LUST_DAEMON_PREWARM", file)
         .env("LUST_DAEMON_PREWARM_AFTER", std::process::id().to_string())
-        .env("LUST_DAEMON_LOCK_FD", lock_fd.to_string())
         .stdin(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        cmd.env("LUST_DAEMON_LOCK_FD", lock_fd.to_string());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use std::os::windows::process::CommandExt;
+        protocol::set_inherit(&lock, true);
+        cmd.env("LUST_DAEMON_LOCK_HANDLE", (lock.as_raw_handle() as usize).to_string());
+        cmd.creation_flags(protocol::DETACH_FLAGS);
+    }
     if let Ok(f) = log {
         if let Ok(f2) = f.try_clone() {
             cmd.stdout(f).stderr(f2);
@@ -92,7 +117,9 @@ fn maybe_autostart(sock: &Path, file: &Path, core: &Path) {
     // SAFETY: pre_exec runs after fork, before exec. setsid gives the daemon its own
     // session, so it outlives this client and its terminal. Clearing close-on-exec on
     // the lock fd (in the child only) passes the held flock to the daemon. Both are
-    // plain syscalls; no Rust code runs.
+    // plain syscalls; no Rust code runs. Windows passes the lock handle instead
+    // (`LUST_DAEMON_LOCK_HANDLE`) and detaches with creation flags above.
+    #[cfg(unix)]
     unsafe {
         cmd.pre_exec(move || {
             setsid();
@@ -117,19 +144,19 @@ fn main() {
     // `lust port scan ...` runs the standalone `lust-port` binary
     // (tools/lust-port), found next to this executable like `lust-core`.
     if args.first().map(String::as_str) == Some("port") {
-        let tool = std::env::current_exe().map(|p| p.with_file_name("lust-port")).unwrap_or_else(|_| "lust-port".into());
-        let err = std::process::Command::new(&tool).args(&args[1..]).exec();
-        eprintln!("error: cannot run {}: {err}", tool.display());
-        std::process::exit(2);
+        let tool = std::env::current_exe().map(|p| protocol::sibling_tool(&p, "lust-port")).unwrap_or_else(|_| tool_name("lust-port"));
+        let mut cmd = std::process::Command::new(&tool);
+        cmd.args(&args[1..]);
+        replace_with(&mut cmd, &tool);
     }
-    let core = std::env::current_exe().map(|p| p.with_file_name("lust-core")).unwrap_or_else(|_| "lust-core".into());
+    let core = std::env::current_exe().map(|p| protocol::sibling_tool(&p, "lust-core")).unwrap_or_else(|_| tool_name("lust-core"));
     // A build that waits for its sources (`LUST_SOURCES_READY`, resolve/prefetch.rs) reads no
     // workspace file before they are there, and parsing its request reads the manifest: the
     // core takes the build at once and parses it after the wait, with no daemon.
     if protocol::waits_for_sources(&args) {
-        let err = std::process::Command::new(&core).args(&args).exec();
-        eprintln!("error: cannot run {}: {err}", core.display());
-        std::process::exit(2);
+        let mut cmd = std::process::Command::new(&core);
+        cmd.args(&args);
+        replace_with(&mut cmd, &core);
     }
     match protocol::parse_args(&args) {
         // Release builds and the rustc oracle run right here, streaming output.
@@ -139,9 +166,9 @@ fn main() {
         // The release driver runs in lust-core (cold, one target after
         // another); the client only hands it the same arguments.
         Some(Invocation::ReleaseCc { .. }) => {
-            let err = std::process::Command::new(&core).args(&args).exec();
-            eprintln!("error: cannot run {}: {err}", core.display());
-            std::process::exit(2);
+            let mut cmd = std::process::Command::new(&core);
+            cmd.args(&args);
+            replace_with(&mut cmd, &core);
         }
         Some(Invocation::RustcCheck { file }) => protocol::run_rustc_check(&file),
         Some(Invocation::Compile { req, run, args: run_args }) => {
@@ -158,9 +185,9 @@ fn main() {
             }
             // No daemon answered: start one for the next command, answer this one cold.
             maybe_autostart(&sock, &req.file, &core);
-            let err = std::process::Command::new(&core).args(&args).exec();
-            eprintln!("error: cannot run {}: {err}", core.display());
-            std::process::exit(2);
+            let mut cmd = std::process::Command::new(&core);
+            cmd.args(&args);
+            replace_with(&mut cmd, &core);
         }
         // A daemon command or bad arguments: let the compiler handle it.
         _ => {
@@ -168,9 +195,43 @@ fn main() {
             if args.first().map(String::as_str) == Some("daemon") {
                 cmd.envs(daemon_alloc_env());
             }
-            let err = cmd.args(&args).exec();
-            eprintln!("error: cannot run {}: {err}", core.display());
-            std::process::exit(2);
+            cmd.args(&args);
+            replace_with(&mut cmd, &core);
+        }
+    }
+}
+
+/// `name` as this host spells an executable (`name.exe` on Windows).
+fn tool_name(name: &str) -> PathBuf {
+    #[cfg(windows)]
+    {
+        return PathBuf::from(format!("{name}.exe"));
+    }
+    #[cfg(not(windows))]
+    {
+        PathBuf::from(name)
+    }
+}
+
+/// Replaces this process with `cmd` on Unix (`exec` keeps the pid, which the
+/// daemon's pre-warm waits on). Windows has no exec: wait for the child and
+/// exit with its code. The client pid stays alive until then, so the pre-warm
+/// still waits out the cold compile.
+fn replace_with(cmd: &mut std::process::Command, tool: &Path) -> ! {
+    #[cfg(unix)]
+    {
+        let err = cmd.exec();
+        eprintln!("error: cannot run {}: {err}", tool.display());
+        std::process::exit(2);
+    }
+    #[cfg(windows)]
+    {
+        match cmd.status() {
+            Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+            Err(err) => {
+                eprintln!("error: cannot run {}: {err}", tool.display());
+                std::process::exit(2);
+            }
         }
     }
 }

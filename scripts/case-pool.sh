@@ -12,6 +12,8 @@
 #                        order) has i % n == k. The n shards together run every case once; the
 #                        landing gate runs them on separate machines. $matched counts the cases
 #                        the filter matched before the shard cut.
+# shellcheck source=scripts/gnu-tools.sh
+source "${BASH_SOURCE[0]%/*}/gnu-tools.sh"
 case_timeout=${CASE_TIMEOUT:-30}
 run_timeout=${RUN_TIMEOUT:-10}
 retry_timeout=${RETRY_CASE_TIMEOUT:-$((case_timeout * 6))}

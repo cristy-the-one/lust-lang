@@ -1,0 +1,6 @@
+# Keep source and shell scripts as LF so a Windows checkout does not rewrite
+# them to CRLF (bash and the compiler's own tests compare bytes). PowerShell
+# scripts stay CRLF, which Windows PowerShell accepts.
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.bat text eol=crlf

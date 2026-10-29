@@ -817,7 +817,7 @@ fn find_edits(front: &mut Front, inputs: u64, root: &str, request_start: SystemT
         {
             continue;
         }
-        let text = std::fs::read_to_string(path).map_err(|_| "file gone")?;
+        let text = crate::srctext::read(std::path::Path::new(path)).map_err(|_| "file gone")?;
         if front.map.text(file) == Some(text.as_str()) {
             reads += 1;
             fresh_stamps.push((k, stamp_of(path, request_start)));

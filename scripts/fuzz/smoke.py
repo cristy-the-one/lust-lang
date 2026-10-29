@@ -7,9 +7,11 @@
 # once alone at 6x the limit and is reported as "slow" when it finishes; a
 # second timeout raises, which fails the suite as a hang.
 import glob, os, re, shutil, subprocess, sys, tempfile, time
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import daemon_argv  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-LUST = os.path.join(ROOT, "target/release/lust")
+LUST = daemon_argv.lust_bin(os.path.join(ROOT, "target/release/lust"))
 failures = []
 
 
@@ -40,7 +42,7 @@ def main():
     sock = os.path.join(work, "d.sock")
     env = dict(os.environ, LUST_DAEMON_SOCKET=sock, LUST_NO_CACHE="1")
     log = open(os.path.join(work, "daemon.log"), "w")
-    daemon = subprocess.Popen([LUST, "daemon"], cwd=work, env=env, stderr=log)
+    daemon = subprocess.Popen(daemon_argv.daemon_argv(LUST), cwd=work, env=env, stderr=log)
     t0 = time.time()
     while not os.path.exists(sock):
         if time.time() - t0 > 10 or daemon.poll() is not None:
@@ -54,7 +56,11 @@ def main():
 
     try:
         # 1. A tab (and a newline) in a file name goes through the daemon.
-        for name in ("with\ttab.rs", "with newline\nname.rs"):
+        # A newline is a legal file name on Unix and illegal on Windows.
+        names = ["with\ttab.rs"]
+        if os.name != "nt":
+            names.append("with newline\nname.rs")
+        for name in names:
             p = os.path.join(work, name)
             open(p, "w").write('fn main() { println!("hi"); }\n')
             rc, out, err = run_lust(["run", p, "-o", os.path.join(work, "x.bin")])
@@ -83,16 +89,22 @@ def main():
         # daemon's temp dir, so they survive the daemon (section 12).
         bases_dir = os.path.join(work, ".lust-cache", "bases")
 
+        base_ext = "dll" if os.name == "nt" else "so"
+
         def base_of(binpath):
-            m = re.search(rb"libbase-\d+-[0-9a-f]+\.so", open(binpath, "rb").read())
+            m = re.search(rb"libbase-\d+-[0-9a-f]+\.(?:so|dll)", open(binpath, "rb").read())
             return m.group(0).decode() if m else None
 
-        bases_before = set(glob.glob(os.path.join(bases_dir, "libbase-*.so")))
+        def run_bin(path):
+            exe = path if os.path.isfile(path) else path + ".exe"
+            return subprocess.run([exe], capture_output=True, text=True)
+
+        bases_before = set(glob.glob(os.path.join(bases_dir, f"libbase-*.{base_ext}")))
         prog = os.path.join(work, "prog.rs")
         open(prog, "w").write('fn val() -> i64 { 1 }\nfn main() { println!("v{}", val()); }\n')
         rc, out, err = run_lust(["build", prog, "-o", os.path.join(work, "p1.bin")])
         check("build v1", rc == 0, err)
-        r = subprocess.run([os.path.join(work, "p1.bin")], capture_output=True, text=True)
+        r = run_bin(os.path.join(work, "p1.bin"))
         check("v1 runs", r.stdout == "v1\n", r.stdout)
         # Many signature edits force several base rebuilds (overlay cap is 32 units, so
         # add many functions to outgrow the table instead).
@@ -103,14 +115,14 @@ def main():
             if rc != 0:
                 break
         check("builds after base rebuilds", rc == 0, err)
-        r = subprocess.run([os.path.join(work, "p1.bin")], capture_output=True, text=True)
+        r = run_bin(os.path.join(work, "p1.bin"))
         check("old binary unchanged after base rebuilds", r.stdout == "v1\n",
               f"stdout={r.stdout!r} stderr={r.stderr!r}")
-        r = subprocess.run([os.path.join(work, "p2.bin")], capture_output=True, text=True)
+        r = run_bin(os.path.join(work, "p2.bin"))
         check("new binary has new output", r.stdout == "v9\n", r.stdout)
         # This session's bases: the newest 4 generations plus any still referenced by a
         # live binary (here p1.bin's base). Unreferenced old generations must be gone.
-        new_bases = set(glob.glob(os.path.join(bases_dir, "libbase-*.so"))) - bases_before
+        new_bases = set(glob.glob(os.path.join(bases_dir, f"libbase-*.{base_ext}"))) - bases_before
         p1_base = base_of(os.path.join(work, "p1.bin"))
         check("base generations bounded per session",
               0 < len(new_bases) <= 5 and p1_base is not None
@@ -185,8 +197,8 @@ def main():
               and os.path.exists(os.path.join(bases_dir, fa_base))
               and os.path.exists(os.path.join(bases_dir, fb_base)),
               f"alpha base={fa_base} beta base={fb_base}")
-        r = subprocess.run([os.path.join(work, "fa.bin")], capture_output=True, text=True)
-        r2 = subprocess.run([os.path.join(work, "fb.bin")], capture_output=True, text=True)
+        r = run_bin(os.path.join(work, "fa.bin"))
+        r2 = run_bin(os.path.join(work, "fb.bin"))
         check("routing: cfg(feature) differs per session",
               r.stdout == "feat 11\n" and r2.stdout == "feat 22\n",
               f"alpha={r.stdout!r} beta={r2.stdout!r}")
@@ -392,7 +404,7 @@ fn grown() -> i64 { 1 }
         open(heal, "w").write('fn main() { println!("heal {}", 2); }\n')
         rc, out, err = run_lust(["build", heal, "-o", os.path.join(sub, "h2.bin")])
         check("vanished bases dir: build still works", rc == 0, err)
-        r = subprocess.run([os.path.join(sub, "h2.bin")], capture_output=True, text=True)
+        r = run_bin(os.path.join(sub, "h2.bin"))
         check("vanished bases dir: binary runs", r.stdout == "heal 2\n",
               f"stdout={r.stdout!r} stderr={r.stderr!r}")
 
@@ -784,10 +796,18 @@ fn grown() -> i64 { 1 }
         # live in `.lust-cache/bases`, section 4).
         daemon_dir = os.path.join(tempfile.gettempdir(), f"lust-daemon-{daemon.pid}")
         check("temp: daemon temp dir exists while running", os.path.isdir(daemon_dir), daemon_dir)
-        daemon.terminate()
+        # Windows TerminateProcess cannot run the daemon's cleanup. Removing
+        # the address file is the graceful stop, same as deleting the socket.
+        if os.name == "nt":
+            try:
+                os.remove(sock)
+            except OSError:
+                daemon.terminate()
+        else:
+            daemon.terminate()
         daemon.wait(timeout=10)
         check("temp: daemon temp dir removed on SIGTERM", not os.path.exists(daemon_dir), daemon_dir)
-        r = subprocess.run([os.path.join(work, "p1.bin")], capture_output=True, text=True)
+        r = run_bin(os.path.join(work, "p1.bin"))
         check("temp: kept binary still runs after daemon exit", r.stdout == "v1\n",
               f"stdout={r.stdout!r} stderr={r.stderr!r}")
         p1_base_path = os.path.join(bases_dir, p1_base) if p1_base else ""
@@ -800,7 +820,7 @@ fn grown() -> i64 { 1 }
         sock2 = os.path.join(work, "d2.sock")
         env2 = dict(env, LUST_DAEMON_SOCKET=sock2)
         with open(os.path.join(work, "daemon2.log"), "w") as log2:
-            daemon2 = subprocess.Popen([LUST, "daemon"], cwd=work, env=env2, stderr=log2)
+            daemon2 = subprocess.Popen(daemon_argv.daemon_argv(LUST), cwd=work, env=env2, stderr=log2)
             try:
                 t0 = time.time()
                 while not os.path.exists(sock2):
@@ -816,7 +836,7 @@ fn grown() -> i64 { 1 }
                 daemon2.wait(timeout=10)
         check("temp: deleted binary's base swept by the next daemon",
               bool(p1_base_path) and not os.path.exists(p1_base_path), p1_base_path)
-        r = subprocess.run([os.path.join(work, "fa.bin")], capture_output=True, text=True)
+        r = run_bin(os.path.join(work, "fa.bin"))
         check("temp: another kept binary still runs after the sweep", r.stdout == "feat 11\n",
               f"stdout={r.stdout!r} stderr={r.stderr!r}")
     finally:

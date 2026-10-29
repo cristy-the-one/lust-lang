@@ -40,6 +40,54 @@ jobs:
           LUST_TCC_HOME: ${{ github.workspace }}/third_party/tcc
         run: bash scripts/ci.sh
 
+  windows-x86_64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install rustc 1.99
+        uses: dtolnay/rust-toolchain@1.99.0
+      - name: Cache pinned tcc
+        id: tcc
+        uses: actions/cache@v4
+        with:
+          path: |
+            third_party/tcc
+            third_party/tinycc
+          key: tcc-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-tcc.ps1') }}
+      - name: Build pinned tcc
+        if: steps.tcc.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: ./scripts/build-tcc.ps1
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+      # Same gate as Linux (scripts/ci.sh). ASan is skipped in the script
+      # off Linux. Git Bash runs the scripts; the MSVC environment is loaded
+      # first so cargo can link with link.exe and build mimalloc.
+      - name: Run CI gate
+        shell: pwsh
+        env:
+          LUST_TCC_HOME: ${{ github.workspace }}/third_party/tcc
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          Import-Module "$vs\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
+          Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64'
+          bash scripts/ci.sh
+      - name: Pack the Windows release zip
+        if: success()
+        shell: pwsh
+        run: ./scripts/release.ps1 -NoBuild
+      - name: Upload Windows release zip
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lust-x86_64-windows
+          path: |
+            dist/*.zip
+            dist/*.sha256
+
   macos-arm64:
     runs-on: macos-14
     steps:

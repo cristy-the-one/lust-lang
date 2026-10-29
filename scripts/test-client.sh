@@ -21,10 +21,26 @@
 set -uo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 lust=$root/target/release/lust
-if [ ! -x "$lust" ]; then
+win=0
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) win=1 ;;
+esac
+if [ "$win" = 1 ] && [ -f "$lust.exe" ]; then
+  lust=$lust.exe
+fi
+if [ ! -x "$lust" ] && [ ! -f "$lust" ]; then
   echo "error: $lust not built. Run cargo build --release first."
   exit 2
 fi
+# shellcheck source=scripts/os-sh.sh
+source "$root/scripts/os-sh.sh"
+# Run a built program whether the file is `name` or `name.exe`.
+runb() {
+  if [ -f "$1" ]; then "$1"
+  elif [ -f "$1.exe" ]; then "$1.exe"
+  else return 127
+  fi
+}
 unset LUST_DAEMON_SOCKET LUST_CACHE_DIR LUST_NO_DAEMON LUST_NO_CACHE \
   LUST_CACHE_COMPILER_ID LUST_CACHE_MAX_BYTES LUST_DAEMON_IDLE LUST_THREADS
 work=$(mktemp -d)
@@ -75,15 +91,24 @@ trap cleanup EXIT
 # loads_base <exe> : true when <exe> loads libbase.so, so a daemon built it. ldd output is
 # captured first: `ldd | grep -q` under pipefail fails when grep exits at the match and ldd
 # takes SIGPIPE on its next line (the `race` flake: the binary was right, the check was not).
-loads_base() { local out; out=$(ldd "$1" 2>/dev/null) && [[ $out == *libbase* ]]; }
+loads_base() {
+  local bin=$1
+  [ -f "$bin" ] || bin=$1.exe
+  if [ "$win" = 1 ]; then
+    python3 -c 'import sys; d=open(sys.argv[1],"rb").read(); sys.exit(0 if b"libbase" in d else 1)' "$bin"
+    return
+  fi
+  local out
+  out=$(ldd "$bin" 2>/dev/null) && [[ $out == *libbase* ]]
+}
 wait_socket() { # wait_socket <dir> : true when the daemon socket appears
   local i
-  for i in $(seq 1 100); do [ -S "$(sock "$1")" ] && return 0; sleep 0.05; done
+  for i in $(seq 1 100); do is_daemon_endpoint "$(sock "$1")" && return 0; sleep 0.05; done
   return 1
 }
 wait_socket_path() { # wait_socket_path <socket> : true when that socket appears
   local i
-  for i in $(seq 1 100); do [ -S "$1" ] && return 0; sleep 0.05; done
+  for i in $(seq 1 100); do is_daemon_endpoint "$1" && return 0; sleep 0.05; done
   return 1
 }
 fresh() { # fresh <name> : a new dir with a hello.rs, prints its path
@@ -96,13 +121,13 @@ fresh() { # fresh <name> : a new dir with a hello.rs, prints its path
 # ---------------------------------------------------------------- autostart
 d=$(fresh autostart); daemon_dirs+=("$d")
 (cd "$d" && "$lust" build hello.rs -o h1) >/dev/null 2>&1
-check "autostart: first build ok" test -x "$d/h1"
+check "autostart: first build ok" test -f "$d/h1" -o -f "$d/h1.exe"
 if loads_base "$d/h1"; then
   bad "autostart: first build is standalone" "loads libbase.so, so a daemon built it"
 else
   ok "autostart: first build is standalone (cold)"
 fi
-check "autostart: first build runs" test "$("$d/h1")" = "hello 42"
+check "autostart: first build runs" test "$(runb "$d/h1")" = "hello 42"
 check "autostart: daemon socket appears" wait_socket "$d"
 (cd "$d" && "$lust" build hello.rs -o h2) >/dev/null 2>&1
 if loads_base "$d/h2"; then
@@ -110,14 +135,14 @@ if loads_base "$d/h2"; then
 else
   bad "autostart: second build served by the daemon" "no libbase.so in ldd output"
 fi
-check "autostart: second build runs" test "$("$d/h2")" = "hello 42"
+check "autostart: second build runs" test "$(runb "$d/h2")" = "hello 42"
 check "autostart: log file in cache dir" test -s "$d/.lust-cache/daemon.log"
 stop_daemon "$d"; sleep 0.3
 
 d=$(fresh nodaemon)
 (cd "$d" && LUST_NO_DAEMON=1 "$lust" check hello.rs) >/dev/null 2>&1
 sleep 0.5
-if [ -S "$(sock "$d")" ]; then bad "LUST_NO_DAEMON: no daemon starts" "socket exists"; else ok "LUST_NO_DAEMON: no daemon starts"; fi
+if is_daemon_endpoint "$(sock "$d")"; then bad "LUST_NO_DAEMON: no daemon starts" "socket exists"; else ok "LUST_NO_DAEMON: no daemon starts"; fi
 
 # A warm daemon must re-expand what positions and included files feed:
 # adding blank lines moves `line!`, and editing only the included file
@@ -160,14 +185,37 @@ d=$(fresh lockheld); s=$d/s.sock
 sh -c 'exit 0' & dead=$!; wait $dead
 printf '%s' "$dead" >"$s.lock"
 # One process holds the lock: the subshell execs into sleep with fd 9, so killing it frees the lock.
-( exec 9>>"$s.lock"; flock 9; exec sleep 30 ) & holder=$!
-for i in $(seq 1 100); do flock -n "$s.lock" true || break; sleep 0.05; done
-ino=$(stat -c %i "$s.lock")
+# On Windows a Python process holds the same first byte with LockFile (msvcrt).
+if [ "$win" = 1 ]; then
+  python3 -c 'import msvcrt,time,sys; f=open(sys.argv[1],"r+"); msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1); time.sleep(30)' "$s.lock" &
+  holder=$!
+  for i in $(seq 1 100); do
+    python3 -c 'import msvcrt,sys
+f=open(sys.argv[1],"r+")
+try:
+    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+    sys.exit(0)
+except OSError:
+    sys.exit(1)' "$s.lock" && sleep 0.05 && continue
+    break
+  done
+  before=$(cat "$s.lock")
+else
+  ( exec 9>>"$s.lock"; flock 9; exec sleep 30 ) & holder=$!
+  for i in $(seq 1 100); do flock -n "$s.lock" true || break; sleep 0.05; done
+  ino=$(stat -c %i "$s.lock")
+fi
 (cd "$d" && LUST_DAEMON_SOCKET=$s LUST_DAEMON_IDLE=5 "$lust" check hello.rs) >/dev/null 2>&1
 check "lockheld: client answers cold" test $? -eq 0
-check "lockheld: a held lock file is never replaced" test "$(stat -c %i "$s.lock")" = "$ino"
+if [ "$win" = 1 ]; then
+  check "lockheld: a held lock file is never replaced" test "$(cat "$s.lock")" = "$before"
+else
+  check "lockheld: a held lock file is never replaced" test "$(stat -c %i "$s.lock")" = "$ino"
+fi
 sleep 0.5
-check "lockheld: no second daemon starts" test ! -S "$s"
+if is_daemon_endpoint "$s"; then bad "lockheld: no second daemon starts" "socket exists"; else ok "lockheld: no second daemon starts"; fi
+
 kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
 # Once the holder is gone, the leftover file (stale pid, no flock) does not block a start.
 (cd "$d" && LUST_DAEMON_SOCKET=$s LUST_DAEMON_IDLE=5 "$lust" check hello.rs) >/dev/null 2>&1
@@ -184,7 +232,7 @@ for i in $(seq 1 100); do
   sleep 0.1
 done
 check "idle: daemon exits after the idle span" test $gone -eq 1
-if [ -S "$(sock "$d")" ]; then bad "idle: socket removed on exit" "socket still there"; else ok "idle: socket removed on exit"; fi
+if is_daemon_endpoint "$(sock "$d")"; then bad "idle: socket removed on exit" "socket still there"; else ok "idle: socket removed on exit"; fi
 (cd "$d" && LUST_DAEMON_IDLE=0 "$lust" check hello.rs) >/dev/null 2>&1
 check "idle: next command works and restarts a daemon" wait_socket "$d"
 stop_daemon "$d"; sleep 0.3
@@ -195,7 +243,13 @@ stop_daemon "$d"; sleep 0.3
 # must keep running (bases live in .lust-cache/bases, not in temp space).
 # A private TMPDIR keeps these checks exact and fast.
 saved_tmpdir=${TMPDIR:-}
+saved_temp=${TEMP:-}
+saved_tmp=${TMP:-}
 export TMPDIR=$work/td; mkdir -p "$TMPDIR"
+# Rust's temp_dir on Windows reads TMP/TEMP, not TMPDIR, and wants a Windows path.
+if [ "$win" = 1 ]; then
+  export TEMP=$(cygpath -w "$TMPDIR") TMP=$TEMP
+fi
 wait_gone() { # wait_gone <path>
   local i
   for i in $(seq 1 100); do [ ! -e "$1" ] && return 0; sleep 0.05; done
@@ -217,11 +271,14 @@ for sig in TERM INT; do
   warm_build "$d" warm2
   pid=$(cat "$(sock "$d").lock" 2>/dev/null)
   check "temp $sig: temp dir exists while daemon runs" test -d "$TMPDIR/lust-daemon-$pid"
-  kill -"$sig" "$pid" 2>/dev/null
+  # Git bash `kill -TERM` is TerminateProcess, which cannot run the daemon's
+  # cleanup. Removing the address file is the Windows graceful stop (the
+  # same path as socket removal). SIGKILL stays a hard kill.
+  if [ "$win" = 1 ]; then rm -f "$(sock "$d")"; else kill -"$sig" "$pid" 2>/dev/null; fi
   check "temp $sig: daemon exits" wait_dead_pid "$pid"
   if wait_gone "$TMPDIR/lust-daemon-$pid"; then ok "temp $sig: temp dir removed on exit"; else bad "temp $sig: temp dir removed on exit" "$TMPDIR/lust-daemon-$pid remains"; fi
-  if [ -S "$(sock "$d")" ]; then bad "temp $sig: socket removed on exit" "socket still there"; else ok "temp $sig: socket removed on exit"; fi
-  check "temp $sig: daemon-built binary still runs" test "$("$d/warm2")" = "hello 42"
+  if is_daemon_endpoint "$(sock "$d")"; then bad "temp $sig: socket removed on exit" "socket still there"; else ok "temp $sig: socket removed on exit"; fi
+  check "temp $sig: daemon-built binary still runs" test "$(runb "$d/warm2")" = "hello 42"
 done
 # Removing the socket file is also a stop request: the daemon takes the
 # same controlled exit and removes its temp dir.
@@ -233,7 +290,7 @@ check "temp sockrm: temp dir exists while daemon runs" test -d "$TMPDIR/lust-dae
 rm -f "$s"
 check "temp sockrm: daemon exits" wait_dead_pid "$pid"
 if wait_gone "$TMPDIR/lust-daemon-$pid"; then ok "temp sockrm: temp dir removed on exit"; else bad "temp sockrm: temp dir removed on exit" "$TMPDIR/lust-daemon-$pid remains"; fi
-check "temp sockrm: daemon-built binary still runs" test "$("$d/warm2")" = "hello 42"
+check "temp sockrm: daemon-built binary still runs" test "$(runb "$d/warm2")" = "hello 42"
 # Idle exit also removes the temp dir (directory checked here; the
 # socket and restart behavior are covered in the idle section above).
 d=$(fresh tmpidle); daemon_dirs+=("$d")
@@ -264,15 +321,19 @@ else
 fi
 check "temp sweep: live-pid dir kept" test -d "$TMPDIR/lust-daemon-$$"
 rm -rf "$TMPDIR/lust-daemon-$$"
-check "temp sweep: kept binary still runs after sweep" test "$("$d/warm2")" = "hello 42"
+check "temp sweep: kept binary still runs after sweep" test "$(runb "$d/warm2")" = "hello 42"
 stop_daemon "$d2"; sleep 0.3
 # A cold one-shot build leaves no temp dir either (the cached runtime
 # object file is intentional; only directories count here).
 d=$(fresh tmpcold)
 (cd "$d" && LUST_NO_DAEMON=1 "$lust" build hello.rs -o cold1) >/dev/null 2>&1
 if [ -z "$(find "$TMPDIR" -mindepth 1 -type d -print -quit)" ]; then ok "temp cold: no temp dir after a one-shot build"; else bad "temp cold: no temp dir after a one-shot build" "a dir remains in TMPDIR"; fi
-check "temp cold: binary runs" test "$("$d/cold1")" = "hello 42"
+check "temp cold: binary runs" test "$(runb "$d/cold1")" = "hello 42"
 if [ -n "$saved_tmpdir" ]; then export TMPDIR=$saved_tmpdir; else unset TMPDIR; fi
+if [ "$win" = 1 ]; then
+  if [ -n "$saved_temp" ]; then export TEMP=$saved_temp; else unset TEMP; fi
+  if [ -n "$saved_tmp" ]; then export TMP=$saved_tmp; else unset TMP; fi
+fi
 
 # -------------------------------------------------------------------- cache
 d=$(fresh cache)
@@ -282,14 +343,14 @@ case "$out" in *"cache hit"*) bad "cache: first build misses" "reported a hit";;
 check "cache: default dir next to source" test -d "$d/.lust-cache"
 out=$(run_lust build hello.rs -o h --timings)
 case "$out" in *"whole-request cache hit"*) ok "cache: second build hits";; *) bad "cache: second build hits" "no hit line";; esac
-check "cache: hit build runs" test "$("$d/h")" = "hello 42"
+check "cache: hit build runs" test "$(runb "$d/h")" = "hello 42"
 run_lust check hello.rs --timings >/dev/null
 out=$(run_lust check hello.rs --timings)
 case "$out" in *"whole-request cache hit"*) ok "cache: second check hits";; *) bad "cache: second check hits" "no hit line";; esac
 sed -i 's/40 + 2/1 + 2/' "$d/hello.rs"
 out=$(run_lust build hello.rs -o h --timings)
 case "$out" in *"cache hit"*) bad "cache: edit misses" "reported a hit after an edit";; *) ok "cache: edit misses";; esac
-check "cache: edited build has new output" test "$("$d/h")" = "hello 3"
+check "cache: edited build has new output" test "$(runb "$d/h")" = "hello 3"
 out=$(run_lust build hello.rs -o h -g --timings)
 case "$out" in *"cache hit"*) bad "cache: -g change misses" "reported a hit";; *) ok "cache: -g change misses";; esac
 out=$(run_lust build hello.rs -o h -g --timings)
@@ -325,7 +386,7 @@ d=$(fresh release1)
 out=$( (cd "$d" && "$lust" build --release hello.rs -o rel) 2>&1 ); rc=$?
 check "release: single file builds" test $rc -eq 0
 case "$out" in *"via rustc"*) ok "release: single file names rustc";; *) bad "release: single file names rustc" "output: $out";; esac
-check "release: single file runs" test "$("$d/rel")" = "hello 42"
+check "release: single file runs" test "$(runb "$d/rel")" = "hello 42"
 out=$( (cd "$d" && "$lust" check --rustc hello.rs) 2>&1 ); rc=$?
 check "check --rustc: valid file passes" test $rc -eq 0
 case "$out" in *rustc*) ok "check --rustc: names rustc";; *) bad "check --rustc: names rustc" "output: $out";; esac
@@ -350,7 +411,7 @@ if [ $rc -ne 0 ]; then ok "release: unconditional_panic rejects"; else bad "rele
 (cd "$d" && "$lust" build --release ovf.rs -o ovfrel) >/dev/null 2>&1; rc=$?
 if [ $rc -ne 0 ]; then ok "release: arithmetic_overflow rejects (overflow-checks off)"; else bad "release: arithmetic_overflow rejects (overflow-checks off)" "exit 0"; fi
 (cd "$d" && "$lust" build --release idx_allow.rs -o allowrel) >/dev/null 2>&1; rc=$?
-check "release: a source #![allow] is kept" test $rc -eq 0 -a "$("$d/allowrel" 2>/dev/null)" = "ok"
+check "release: a source #![allow] is kept" test $rc -eq 0 -a "$(runb "$d/allowrel" 2>/dev/null)" = "ok"
 ls "$d" | grep -q '\.o$' && bad "check --rustc: leaves no object file" "$(ls "$d")" || ok "check --rustc: leaves no object file"
 (cd "$d" && "$lust" check --release hello.rs) >/dev/null 2>&1; rc=$?
 check "release: --release on check is a usage error" test $rc -eq 2
@@ -362,16 +423,16 @@ out=$( (cd "$d/proj" && "$lust" build --release src/main.rs) 2>&1 ); rc=$?
 check "cargo: release build passes" test $rc -eq 0
 case "$out" in *"via cargo"*) ok "cargo: names cargo";; *) bad "cargo: names cargo" "output: $out";; esac
 case "$out" in *"--bin tinyproj"*) ok "cargo: src/main.rs selects the package bin";; *) bad "cargo: src/main.rs selects the package bin" "output: $out";; esac
-check "cargo: release binary runs" test "$("$d/proj/target/release/tinyproj")" = "tiny main 42"
+check "cargo: release binary runs" test "$(runb "$d/proj/target/release/tinyproj")" = "tiny main 42"
 if [ -e "$d/proj/target/release/extra" ]; then bad "cargo: other bin not built" "extra exists"; else ok "cargo: other bin not built"; fi
 out=$( (cd "$d/proj" && "$lust" build --release src/bin/extra.rs -o "$d/extra") 2>&1 ); rc=$?
 check "cargo: src/bin build passes" test $rc -eq 0
 case "$out" in *"--bin extra"*) ok "cargo: src/bin/extra.rs selects --bin extra";; *) bad "cargo: src/bin/extra.rs selects --bin extra" "output: $out";; esac
-check "cargo: -o copies the artifact" test "$("$d/extra")" = "tiny extra"
+check "cargo: -o copies the artifact" test "$(runb "$d/extra")" = "tiny extra"
 out=$( (cd "$d/proj" && "$lust" build --profile fast src/main.rs) 2>&1 ); rc=$?
 check "cargo: --profile build passes" test $rc -eq 0
 case "$out" in *"--profile fast"*) ok "cargo: --profile name passes through";; *) bad "cargo: --profile name passes through" "output: $out";; esac
-check "cargo: profile binary runs" test "$("$d/proj/target/fast/tinyproj")" = "tiny main 42"
+check "cargo: profile binary runs" test "$(runb "$d/proj/target/fast/tinyproj")" = "tiny main 42"
 
 # Timeout report (see the shim at the top). Slow retries do not fail; every
 # hang does, even when the checks around the hung call happened to pass.

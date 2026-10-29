@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Builds the release package for linux x86_64: dist/lust-<version>-x86_64-linux.tar.gz.
+# The Windows package is scripts/release.ps1 (dist/lust-<version>-x86_64-windows.zip).
 #
 #   scripts/release.sh            # cargo build --release, then pack and print the sha256
 #   scripts/release.sh --no-build # pack the binaries already in target/release

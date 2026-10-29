@@ -21,6 +21,7 @@
 #![allow(dead_code)]
 
 use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
@@ -111,9 +112,10 @@ impl SessionKey {
     /// stem, and `test` marks a `lust test` harness build. This keeps
     /// `lust check file.rs` unchanged for users (section 9.2, S6).
     pub fn synthetic(file: &Path, test: bool) -> SessionKey {
+        // `file_stem` splits on either separator, so a Windows path does not
+        // keep the directory in the target name.
         let path = file.to_string_lossy();
-        let stem = path.rsplit('/').next().unwrap_or(&path);
-        let stem = stem.strip_suffix(".rs").unwrap_or(stem);
+        let stem = file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "main".into());
         SessionKey {
             krate: CrateKey {
                 package_id: format!("file:{path}"),
@@ -262,6 +264,8 @@ pub fn host_triple() -> &'static str {
         ("aarch64", "linux") => "aarch64-unknown-linux-gnu",
         ("x86_64", "macos") => "x86_64-apple-darwin",
         ("aarch64", "macos") => "aarch64-apple-darwin",
+        ("x86_64", "windows") => "x86_64-pc-windows-msvc",
+        ("aarch64", "windows") => "aarch64-pc-windows-msvc",
         _ => "",
     }
 }
@@ -774,7 +778,7 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
         return None;
     }
     crate_flags.target_triple = targets.into_iter().next();
-    let out = out.unwrap_or_else(|| PathBuf::from(file.file_stem().unwrap_or_default()));
+    let out = out.unwrap_or_else(|| default_exe_name(&file));
     let run = cmd == "run";
     let typed = file.clone();
     let file = abs(&file);
@@ -814,6 +818,110 @@ pub fn socket_path() -> PathBuf {
     std::env::var_os("LUST_DAEMON_SOCKET")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(format!(".lust-daemon-{}.sock", &env!("LUST_BUILD_HASH")[..8])))
+}
+
+/// The output name rustc would pick when `-o` is omitted: the source stem,
+/// plus `.exe` on Windows.
+fn default_exe_name(file: &Path) -> PathBuf {
+    let mut p = PathBuf::from(file.file_stem().unwrap_or_default());
+    #[cfg(windows)]
+    if p.extension().is_none() {
+        p.set_extension("exe");
+    }
+    p
+}
+
+/// `name` next to `exe`. On Windows the sibling keeps the `.exe` suffix
+/// (`lust.exe` -> `lust-core.exe`). On Unix the name is used as given.
+pub fn sibling_tool(exe: &Path, name: &str) -> PathBuf {
+    let stem = exe.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let file_name = exe.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    if stem == name || file_name == name {
+        return exe.to_path_buf();
+    }
+    #[cfg(windows)]
+    {
+        // Cargo writes `name.exe`. A test may copy the binary without the
+        // suffix. Prefer whichever file is actually there.
+        let with_exe = exe.with_file_name(format!("{name}.exe"));
+        let bare = exe.with_file_name(name);
+        if with_exe.is_file() {
+            return with_exe;
+        }
+        if bare.is_file() {
+            return bare;
+        }
+        return with_exe;
+    }
+    #[cfg(not(windows))]
+    {
+        exe.with_file_name(name)
+    }
+}
+
+fn file_identity(m: std::fs::Metadata) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        format!("{:x}.{:x}.{:x}.{:x}.{:x}", m.dev(), m.ino(), m.size(), m.mtime(), m.mtime_nsec())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // `file_index` is still unstable. Size plus the two FILETIME stamps
+        // (100 ns) change when the binary is replaced.
+        format!("{:x}.{:x}.{:x}", m.file_size(), m.creation_time(), m.last_write_time())
+    }
+}
+
+/// A path field from the wire. The bytes are `OsStr::as_encoded_bytes` from
+/// the same host, which is the raw path on Unix and WTF-8 on Windows.
+fn path_from_bytes(bytes: Vec<u8>) -> PathBuf {
+    // SAFETY: the inverse of `as_encoded_bytes` for bytes this process wrote.
+    PathBuf::from(unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(&bytes) }.to_os_string())
+}
+
+/// `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`: the daemon has no console
+/// window, and this client's Ctrl+C does not arrive in the daemon's group.
+#[cfg(windows)]
+pub const DETACH_FLAGS: u32 = 0x0800_0000 | 0x0000_0200;
+
+/// Exclusive non-blocking lock of the first byte. The same byte the daemon
+/// locks, so a client and a daemon exclude each other.
+#[cfg(windows)]
+pub fn try_lock(file: &std::fs::File) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    #[repr(C)]
+    struct Overlapped {
+        internal: usize,
+        internal_high: usize,
+        offset: u32,
+        offset_high: u32,
+        event: *mut std::ffi::c_void,
+    }
+    unsafe extern "system" {
+        fn LockFileEx(file: *mut std::ffi::c_void, flags: u32, reserved: u32, low: u32, high: u32, overlapped: *mut Overlapped) -> i32;
+    }
+    let mut overlapped = Overlapped { internal: 0, internal_high: 0, offset: 0, offset_high: 0, event: std::ptr::null_mut() };
+    unsafe { LockFileEx(file.as_raw_handle() as *mut _, 2 | 1, 0, 1, 0, &mut overlapped) != 0 }
+}
+
+#[cfg(windows)]
+pub fn set_inherit(file: &std::fs::File, on: bool) {
+    use std::os::windows::io::AsRawHandle;
+    unsafe extern "system" {
+        fn SetHandleInformation(handle: *mut std::ffi::c_void, mask: u32, flags: u32) -> i32;
+    }
+    let flags = if on { 1 } else { 0 };
+    unsafe { SetHandleInformation(file.as_raw_handle() as *mut _, 1, flags) };
+}
+
+#[cfg(windows)]
+pub fn clear_inherit_raw(handle: *mut std::ffi::c_void) {
+    unsafe extern "system" {
+        fn SetHandleInformation(handle: *mut std::ffi::c_void, mask: u32, flags: u32) -> i32;
+    }
+    unsafe { SetHandleInformation(handle, 1, 0) };
 }
 
 /// Appends one length-prefixed field: "<byte len>\n<bytes>".
@@ -858,13 +966,8 @@ pub fn source_override() -> Option<&'static str> {
 pub fn build_id() -> &'static str {
     static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     ID.get_or_init(|| {
-        use std::os::unix::fs::MetadataExt;
-        let core = std::env::current_exe()
-            .map(|e| if e.file_name().is_some_and(|n| n == "lust-core") { e } else { e.with_file_name("lust-core") });
-        let file = core.and_then(std::fs::metadata).map_or_else(
-            |_| "-".to_string(),
-            |m| format!("{:x}.{:x}.{:x}.{:x}.{:x}", m.dev(), m.ino(), m.size(), m.mtime(), m.mtime_nsec()),
-        );
+        let core = std::env::current_exe().map(|e| sibling_tool(&e, "lust-core"));
+        let file = core.and_then(std::fs::metadata).map_or_else(|_| "-".to_string(), file_identity);
         format!("{}.{file}", env!("LUST_BUILD_HASH"))
     })
 }
@@ -940,9 +1043,7 @@ pub fn read_request(r: &mut impl BufRead) -> Result<Request, ReadError> {
 
 /// The length-prefixed fields after a request header `f`.
 fn read_fields(r: &mut impl BufRead, f: &[&str]) -> Option<Request> {
-    #[allow(unused_imports)]
-    use std::os::unix::ffi::OsStringExt as _;
-    let path = |bytes: Vec<u8>| PathBuf::from(std::ffi::OsString::from_vec(bytes));
+    let path = |bytes: Vec<u8>| path_from_bytes(bytes);
     let text = |bytes: Vec<u8>| String::from_utf8(bytes).ok();
     let file = path(get_field(r)?);
     let out = path(get_field(r)?);
@@ -1020,13 +1121,69 @@ pub fn write_other_build(w: &mut impl Write) -> std::io::Result<()> {
     write!(w, "- - - {}\n", build_id())
 }
 
+/// The daemon connection. One variant per host, so the read and write path
+/// below does not care which transport `connect_daemon` opened.
+enum DaemonConn {
+    #[cfg(unix)]
+    Unix(UnixStream),
+    #[cfg(windows)]
+    Tcp(std::net::TcpStream),
+}
+
+impl Read for DaemonConn {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            #[cfg(unix)]
+            DaemonConn::Unix(s) => s.read(buf),
+            #[cfg(windows)]
+            DaemonConn::Tcp(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for DaemonConn {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            #[cfg(unix)]
+            DaemonConn::Unix(s) => s.write(buf),
+            #[cfg(windows)]
+            DaemonConn::Tcp(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            #[cfg(unix)]
+            DaemonConn::Unix(s) => s.flush(),
+            #[cfg(windows)]
+            DaemonConn::Tcp(s) => s.flush(),
+        }
+    }
+}
+
+fn connect_daemon(sock: &Path) -> Option<DaemonConn> {
+    #[cfg(unix)]
+    {
+        UnixStream::connect(sock).ok().map(DaemonConn::Unix)
+    }
+    #[cfg(windows)]
+    {
+        // The address file is one line, `127.0.0.1:<port>`, written by the daemon.
+        let text = std::fs::read_to_string(sock).ok()?;
+        let addr = text.lines().next()?.trim();
+        if addr.is_empty() {
+            return None;
+        }
+        std::net::TcpStream::connect(addr).ok().map(DaemonConn::Tcp)
+    }
+}
+
 /// Sends a request to a running daemon. None if no daemon answers, or if the
 /// one that answers is another lust build: that answer is dropped and the
 /// caller compiles cold. A daemon of another build that knows the build
 /// field exits by itself; an older one is stopped by removing its socket
 /// (its stop request), so the next command starts a daemon of this build.
 pub fn request(sock: &Path, req: &Request) -> Option<Response> {
-    let mut conn = UnixStream::connect(sock).ok()?;
+    let mut conn = connect_daemon(sock)?;
     conn.write_all(&encode(req)).ok()?;
     let mut reader = BufReader::new(conn);
     let mut head = String::new();
@@ -1360,7 +1517,16 @@ pub fn run_release(file: &Path, out: Option<&Path>, profile: Option<&str>, debug
         // Cargo has no stable -o. Copy the artifact when the caller asked for one.
         if let Some(out) = out {
             let name = bin.as_ref().or(m.package.as_ref());
-            let artifact = name.and_then(|n| cargo_target_dir(&m.path).map(|t| t.join(if dev { "debug" } else { profile }).join(n)));
+            let artifact = name.and_then(|n| {
+                let dir = cargo_target_dir(&m.path)?.join(if dev { "debug" } else { profile });
+                let plain = dir.join(n);
+                if plain.exists() {
+                    return Some(plain);
+                }
+                // Cargo names the binary `name.exe` on Windows.
+                let exe = dir.join(format!("{n}.exe"));
+                exe.exists().then_some(exe)
+            });
             match artifact {
                 Some(a) if a.exists() => {
                     if let Err(e) = std::fs::copy(&a, out) {
@@ -1382,7 +1548,7 @@ pub fn run_release(file: &Path, out: Option<&Path>, profile: Option<&str>, debug
     // No Cargo.toml: rustc on the single file, with DESIGN.md's release oracle flags at
     // rustc's default lint levels and its default panic strategy (unwind), so deny-by-default lints (unconditional_panic,
     // arithmetic_overflow) reject as they do for any rustc user; a source `#[allow]` still works.
-    let fallback = PathBuf::from(file.file_stem().unwrap_or_default());
+    let fallback = default_exe_name(file);
     let out: &Path = out.unwrap_or(&fallback);
     let mut cmd = std::process::Command::new("rustc");
     cmd.args(["--edition", "2024"]);

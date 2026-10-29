@@ -69,10 +69,10 @@ else
 fi
 cargo build --release
 # Test scripts name `target/release/lust`. Cargo on Windows writes lust.exe.
+# Git bash treats `lust` as `lust.exe`, so `cp lust.exe lust` is a same-file copy.
 if [ -f target/release/lust.exe ]; then
-  cp -f target/release/lust.exe target/release/lust
-  cp -f target/release/lust-core.exe target/release/lust-core
-  chmod +x target/release/lust target/release/lust-core
+  powershell.exe -NoProfile -Command "Copy-Item -LiteralPath 'target\release\lust.exe' -Destination 'target\release\lust' -Force; Copy-Item -LiteralPath 'target\release\lust-core.exe' -Destination 'target\release\lust-core' -Force"
+  chmod +x target/release/lust.exe target/release/lust-core.exe || true
 fi
 
 step "diagnostic code registry"

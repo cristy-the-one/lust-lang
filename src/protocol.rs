@@ -27,7 +27,7 @@
 /// on the main thread.
 #[cfg(all(windows, target_env = "msvc"))]
 #[used]
-#[link_section = ".drectve"]
+#[unsafe(link_section = ".drectve")]
 static LUST_MAIN_STACK: [u8; 18] = *b" /STACK:268435456\0";
 
 use std::io::{BufRead, BufReader, Read, Write};

@@ -67,6 +67,14 @@ Pop-Location
 
 $win32 = Join-Path $src 'win32'
 $tcc = Join-Path $src 'tcc.exe'
+# tcc -B. looks in win32/include. The shared headers (tccdefs.h and the rest)
+# have to be there before libtcc1 is compiled. build-tcc.bat copies them at
+# the same point.
+$includeStage = Join-Path $win32 'include'
+Copy-Item (Join-Path $src 'include\*.h') $includeStage -Force
+if (Test-Path (Join-Path $src 'tcclib.h')) {
+    Copy-Item (Join-Path $src 'tcclib.h') $includeStage -Force
+}
 Push-Location $win32
 function Invoke-Tcc([string[]]$TccArgs) {
     & $tcc -B. @TccArgs

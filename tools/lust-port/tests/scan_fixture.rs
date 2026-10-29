@@ -129,7 +129,7 @@ fn human_output_groups_findings() {
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("Gaps by root cause"), "{text}");
-    assert!(text.contains("attrs.unsupported"));
+    assert!(text.contains("attrs.unsupported"), "{text}");
     // Grouped, not one line per finding: only 2 samples per feature.
     let attr_samples = text.matches("attrs.unsupported").count();
     assert!(attr_samples <= 3, "too many attr lines: {attr_samples}");

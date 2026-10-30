@@ -2102,7 +2102,13 @@ fn ret_by_out(p: &Program, t: &CTy) -> bool {
         // size is wrong (`overaligned_locals`, exit 127, no stderr). Dev C
         // on Windows passes it through the out pointer; the slot is one
         // this compiler allocated. Release C realigns the frame itself.
-        || (cfg!(windows) && align > 16 && !names::release() && !ll::on(p))
+        || (pe_frame() && align > 16 && !ll::on(p))
+}
+
+/// Dev C for PE tcc, whose frame stays 16-aligned. `LUST_PE_FRAME` selects
+/// the same frame choices on another host so the C can be compiled and read.
+fn pe_frame() -> bool {
+    !names::release() && (cfg!(windows) || std::env::var_os("LUST_PE_FRAME").is_some())
 }
 
 /// `LUST_RELEASE_AGG_RET`: which 9-32 byte returns release C passes through the out pointer.
@@ -2299,7 +2305,7 @@ fn param_ctype(p: &Program, t: &CTy) -> String {
 /// pointer arithmetic is not (every copy of a `#[repr(align(64))]`
 /// struct was a real copy).
 fn overaligned_local(out: &mut String, i: usize, ct: &str, decl: &str, align: u64) {
-    if cfg!(windows) {
+    if pe_frame() {
         let _ = writeln!(
             out,
             "  void *l{i}_b = lust_overaligned_alloc(sizeof({ct}), {align}); {ct} *l{i}_p = l{i}_b;\n#define l{i} (*l{i}_p)"
@@ -2320,7 +2326,7 @@ fn overaligned_local(out: &mut String, i: usize, ct: &str, decl: &str, align: u6
 /// themselves. The block is not registered with tcc's cleanup attribute:
 /// that attribute fail-fasts under PE (`overaligned_local`).
 fn win_heap_align(align: u64) -> bool {
-    cfg!(windows) && align > 16 && !names::release()
+    pe_frame() && align > 16
 }
 
 /// Declaration of a heap temporary `name` (the value is `(*name_p)`).
@@ -2329,6 +2335,118 @@ fn win_heap_slot(name: &str, ct: &str, align: u64) -> String {
     format!(
         "void *{name}_b = lust_overaligned_alloc(sizeof({ct}), {align}ull); {ct} *{name}_p = {name}_b"
     )
+}
+
+/// C type names in `roots` (and the types they contain) whose alignment
+/// is past 16. PE dev C cannot put those in a frame slot.
+fn pe_overaligned_names(p: &Program, roots: &[CTy]) -> HashMap<String, u64> {
+    let mut set = HashSet::new();
+    for t in roots {
+        set.insert(t.clone());
+        collect_types(t, &mut set);
+    }
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for t in set.clone() {
+            let CTy::Adt(a) = &t else { continue };
+            let before = set.len();
+            for v in &p.adt(*a).variants {
+                for f in &v.fields {
+                    collect_types(&cty(&p.tys, f.ty), &mut set);
+                }
+            }
+            grew |= set.len() != before;
+        }
+    }
+    let mut names = HashMap::new();
+    for t in &set {
+        let align = c_size_align(p, t).1;
+        if align > 16 {
+            names.insert(ctype(t), align);
+        }
+    }
+    names
+}
+
+/// `T tN` / `T tN =` in function text, for an align>16 `T`, becomes a
+/// heap slot and `#define tN (*tN_p)`. A frame slot of that alignment
+/// makes PE tcc fail-fast on entry (exit 127, no stderr). Returns the
+/// names to `#undef` after the function. No change when `aligns` is empty.
+fn sink_pe_temps(text: &str, aligns: &HashMap<String, u64>) -> (String, Vec<String>) {
+    if aligns.is_empty() {
+        return (text.to_string(), Vec::new());
+    }
+    let mut types: Vec<&str> = aligns.keys().map(String::as_str).collect();
+    types.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    let b = text.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut i = 0;
+    let mut out = String::with_capacity(text.len() + 64);
+    let mut undefs = Vec::new();
+    while i < b.len() {
+        match b[i] {
+            b'"' | b'\'' => {
+                let q = b[i];
+                let start = i;
+                i += 1;
+                while i < b.len() && b[i] != q {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+                i = (i + 1).min(b.len());
+                out.push_str(&text[start..i]);
+                continue;
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                let start = i;
+                i = text[i + 2..].find("*/").map_or(b.len(), |k| i + 2 + k + 2);
+                out.push_str(&text[start..i]);
+                continue;
+            }
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                let start = i;
+                i = text[i..].find('\n').map_or(b.len(), |k| i + k);
+                out.push_str(&text[start..i]);
+                continue;
+            }
+            _ => {}
+        }
+        let at_ident = i == 0 || !ident(b[i - 1]);
+        if at_ident {
+            let rest = &text[i..];
+            if let Some(ty) = types.iter().copied().find(|ty| rest.starts_with(ty) && !rest.as_bytes().get(ty.len()).is_some_and(|c| ident(*c))) {
+                let mut j = i + ty.len();
+                if j < b.len() && b[j].is_ascii_whitespace() {
+                    while j < b.len() && b[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if b.get(j) == Some(&b't') {
+                        let ns = j;
+                        j += 1;
+                        let nd = j;
+                        while j < b.len() && b[j].is_ascii_digit() {
+                            j += 1;
+                        }
+                        if j > nd && !b.get(j).is_some_and(|c| ident(*c)) {
+                            let name = &text[ns..j];
+                            let align = aligns[ty];
+                            let _ = write!(
+                                out,
+                                "{};\n#define {name} (*{name}_p)\n{name}",
+                                win_heap_slot(name, ty, align)
+                            );
+                            undefs.push(name.to_string());
+                            i = j;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    if undefs.is_empty() { (text.to_string(), undefs) } else { (out, undefs) }
 }
 
 /// True when `f` gets C of its own: a plain fn, an instance, or a
@@ -3087,6 +3205,32 @@ impl FnGen<'_, '_> {
             self.out.truncate(body_start);
             self.out.push_str(&text);
         }
+        // PE tcc fail-fasts if any local is aligned past 16. User locals
+        // are already heap slots (`high`); builtin temps (`T tN`) are not.
+        if pe_frame() {
+            let mut roots = self.local_cty.clone();
+            roots.extend(self.sig_types.iter().cloned());
+            let aligns = pe_overaligned_names(self.p, &roots);
+            if !aligns.is_empty() {
+                let (text, undefs) = sink_pe_temps(&self.out[body_start..], &aligns);
+                if !undefs.is_empty() {
+                    self.out.truncate(body_start);
+                    self.out.push_str(&text);
+                    for n in &undefs {
+                        let _ = writeln!(self.out, "#undef {n}");
+                    }
+                }
+                if !cl_text.is_empty() {
+                    let (text, undefs) = sink_pe_temps(&cl_text, &aligns);
+                    if !undefs.is_empty() {
+                        cl_text = text;
+                        for n in undefs {
+                            let _ = writeln!(cl_text, "#undef {n}");
+                        }
+                    }
+                }
+            }
+        }
         for (i, ..) in &high {
             let _ = writeln!(self.out, "#undef l{i}");
         }
@@ -3775,7 +3919,7 @@ impl FnGen<'_, '_> {
                     e = if let Some(b) = b {
                         let len = format!("{e}.len");
                         let base = format!("(({el_ct}*){e}.ptr)");
-                        self.index_unw(&len, &base, *l, &loc, b)
+                        self.index_unw(&len, &base, &el_ct, *l, &loc, b)
                     } else {
                         format!("(({el_ct}*){e}.ptr)[lust_bounds(l{l}, {e}.len, {loc})]")
                     };
@@ -3805,7 +3949,8 @@ impl FnGen<'_, '_> {
                     e = if let Some(b) = b {
                         let len = n.to_string();
                         let base = format!("{e}.v");
-                        self.index_unw(&len, &base, *l, &loc, b)
+                        let el_ct = ctype(&el);
+                        self.index_unw(&len, &base, &el_ct, *l, &loc, b)
                     } else {
                         format!("{e}.v[lust_bounds(l{l}, {n}, {loc})]")
                     };
@@ -3849,7 +3994,8 @@ impl FnGen<'_, '_> {
                     e = if let Some(b) = b {
                         let len = format!("{e}.len");
                         let base = format!("{e}.ptr");
-                        self.index_unw(&len, &base, *l, &loc, b)
+                        let el_ct = ctype(&el);
+                        self.index_unw(&len, &base, &el_ct, *l, &loc, b)
                     } else {
                         format!("{e}.ptr[lust_bounds(l{l}, {e}.len, {loc})]")
                     };
@@ -3873,25 +4019,31 @@ impl FnGen<'_, '_> {
     /// cleanup at block `b` before any element is read. The `(void)`
     /// keeps `wrap_calls` from adding its own check in front of `b`.
     ///
-    /// PE tcc miscompiles that `goto` when the statement expression is a
-    /// function argument (the closure's `ret` then `__fastfail`s, and
-    /// `catch_unwind` never sees the panic). Windows dev C emits the
-    /// check as its own statement and loads the element plainly.
-    fn index_unw(&mut self, len: &str, base: &str, l: Local, loc: &str, b: u32) -> String {
+    /// PE tcc `__fastfail`s when that statement expression is a function
+    /// argument (`runtime_inline_helpers`: the panic is printed, then
+    /// exit 127, and `catch_unwind` never sees it). A bare `goto` in the
+    /// function instead makes a recursive frame skip the guard page
+    /// (`panic_stack_overflow`, exit 139, no overflow text). Bind the
+    /// address to a pointer temporary so the statement expression is an
+    /// initializer, and the element itself is never a frame slot.
+    fn index_unw(&mut self, len: &str, base: &str, elem: &str, l: Local, loc: &str, b: u32) -> String {
         if self.p.unwind_tables {
             // The bounds panic never returns: the frame's cleanup runs from `L.st`.
             return format!(
                 "(*({{ if (__builtin_expect(l{l} >= {len}, 0)) {{ (void)lust_bounds(l{l}, {len}, {loc}); __builtin_unreachable(); }} &{base}[l{l}]; }}))"
             );
         }
-        if cfg!(windows) && !self.suppress_index {
+        let expr = format!("(*({{ if (l{l} >= {len}) {{ (void)lust_bounds(l{l}, {len}, {loc}); lust_unw_take(&ex); goto bb{b}; }} &{base}[l{l}]; }}))");
+        if pe_frame() && !self.suppress_index {
+            let tmp = self.tmp();
             let _ = writeln!(
                 self.out,
-                "    if (l{l} >= {len}) {{ (void)lust_bounds(l{l}, {len}, {loc}); lust_unw_take(&ex); goto bb{b}; }}"
+                "    {elem} *{tmp} = ({{ if (l{l} >= {len}) {{ (void)lust_bounds(l{l}, {len}, {loc}); lust_unw_take(&ex); goto bb{b}; }} &{base}[l{l}]; }});"
             );
-            return format!("({base})[l{l}]");
+            return format!("(*{tmp})");
         }
-        format!("(*({{ if (l{l} >= {len}) {{ (void)lust_bounds(l{l}, {len}, {loc}); lust_unw_take(&ex); goto bb{b}; }} &{base}[l{l}]; }}))")
+        let _ = elem;
+        expr
     }
 
     /// `place` for its type only. The index check is not emitted; the
@@ -4868,6 +5020,21 @@ impl FnGen<'_, '_> {
     /// A variant literal of `t`: it names `t`'s fields (`nested_block`).
     fn make_variant(&mut self, t: &CTy, variant: usize, vals: &[String]) -> String {
         self.note_held(t);
+        // A compound literal of an align>16 value is a frame slot. PE tcc
+        // fail-fasts on it (`overaligned_locals`: `Some(s)`, `Ok`/`Err`).
+        // The field expressions have to run at the use, not here: a caller
+        // such as `HashMap::insert` builds both arms before the call that
+        // fills the slot they read. A statement expression keeps that
+        // order and yields a pointer, so the value is never a frame slot.
+        let align = c_size_align(self.p, t).1;
+        if win_heap_align(align) {
+            let name = self.tmp();
+            let ct = ctype(t);
+            let mut stores = String::new();
+            variant_stores(&mut stores, self.p, &format!("{name}_p"), t, variant, vals);
+            let slot = win_heap_slot(&name, &ct, align);
+            return format!("(*({{ {slot}; memset((void *){name}_p, 0, sizeof({ct})); {stores}{name}_p; }}))");
+        }
         variant_lit(self.p, t, variant, vals)
     }
 
@@ -13281,6 +13448,197 @@ fn type_decls_with(p: &Program, out: &mut String, roots: &HashSet<CTy>, named: &
 /// returns for `args` (the method's C arguments, comma separated),
 /// called through the fn table with the large-return out pointer
 /// when the method uses one (see `FnGen::call_value`).
+/// Prototype of `clone`/`default` glue. An over-aligned `T` returned by
+/// value makes tcc give the caller an sret slot aligned past 16, and PE
+/// tcc fail-fasts on entry of that caller (exit 127, no stderr). The
+/// value is a heap block; a macro keeps the old call shape.
+fn write_value_proto(protos: &mut String, ct: &str, align: u64, name: &str, params: &str) {
+    if win_heap_align(align) {
+        let _ = writeln!(protos, "{ct} *{name}_p({params});\n#define {name}(...) (*{name}_p(__VA_ARGS__))");
+    } else {
+        let _ = writeln!(protos, "{ct} {name}({params});");
+    }
+}
+
+fn write_value_def(defs: &mut String, ct: &str, align: u64, name: &str, params: &str, body: &str) {
+    if !win_heap_align(align) {
+        let _ = writeln!(defs, "{ct} {name}({params}) {{\n{body}}}\n");
+        return;
+    }
+    let body = heapify_value_body(ct, body);
+    let _ = writeln!(
+        defs,
+        "{ct} *{name}_p({params}) {{\n  {ct} *hr = ({ct} *)lust_overaligned_alloc(sizeof({ct}), {align}ull);\n{body}}}\n"
+    );
+}
+
+/// The by-value body of clone/default glue, rewritten to fill `hr`.
+fn heapify_value_body(ct: &str, body: &str) -> String {
+    let mut b = body.to_string();
+    let copy = format!("{ct} r = *p;");
+    let bare = format!("{ct} r;");
+    if let Some(i) = b.find(&copy) {
+        b.replace_range(i..i + copy.len(), "lust_memcpy(hr, p, sizeof(*hr));");
+    } else if let Some(i) = b.find(&bare) {
+        b.replace_range(i..i + bare.len(), "memset(hr, 0, sizeof(*hr));");
+    }
+    b = b.replace("r.", "hr->");
+    b = replace_amp_r(&b);
+    rewrite_value_returns(ct, &b)
+}
+
+fn replace_amp_r(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'&' && bytes.get(i + 1) == Some(&b'r') {
+            let next = bytes.get(i + 2).copied().unwrap_or(b' ');
+            if !next.is_ascii_alphanumeric() && next != b'_' {
+                out.push_str("hr");
+                i += 2;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn rewrite_value_returns(ct: &str, body: &str) -> String {
+    let mut out = String::new();
+    let mut rest = body;
+    while let Some(i) = rest.find("return ") {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + "return ".len()..];
+        let mut depth = 0i32;
+        let mut end = None;
+        for (j, c) in after.char_indices() {
+            match c {
+                '(' | '{' | '[' => depth += 1,
+                ')' | '}' | ']' => depth -= 1,
+                ';' if depth == 0 => {
+                    end = Some(j);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else {
+            out.push_str("return ");
+            rest = after;
+            break;
+        };
+        let expr = after[..end].trim();
+        if expr == "hr" || expr == "r" {
+            out.push_str("return hr;");
+        } else if expr == "*p" {
+            out.push_str("lust_memcpy(hr, p, sizeof(*hr)); return hr;");
+        } else if let Some(inner) = compound_inner(ct, expr) {
+            out.push_str(&expand_designators(inner));
+            out.push_str("return hr;");
+        } else {
+            out.push_str(&format!("*hr = ({expr}); return hr;"));
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn compound_inner<'a>(ct: &str, expr: &'a str) -> Option<&'a str> {
+    let e = expr.trim();
+    let prefix = format!("(({ct}){{");
+    let prefix_sp = format!("(({ct}) {{");
+    let n = if e.starts_with(&prefix) {
+        prefix.len()
+    } else if e.starts_with(&prefix_sp) {
+        prefix_sp.len()
+    } else {
+        return None;
+    };
+    let e = e.trim_end();
+    if !e.ends_with("})") {
+        return None;
+    }
+    Some(e[n..e.len() - 2].trim())
+}
+
+fn expand_designators(inner: &str) -> String {
+    let mut out = String::from("  memset(hr, 0, sizeof(*hr));\n");
+    if inner.is_empty() || inner == "0" {
+        return out;
+    }
+    for part in split_top_commas(inner) {
+        let part = part.trim();
+        if let Some(rest) = part.strip_prefix('.') {
+            if let Some((field, expr)) = split_designator(rest) {
+                out.push_str(&expand_nested(&format!("hr->{field}"), expr.trim()));
+            }
+        }
+    }
+    out
+}
+
+fn expand_nested(prefix: &str, expr: &str) -> String {
+    let e = expr.trim();
+    if let Some(inner) = e.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+        let inner = inner.trim();
+        if inner.is_empty() {
+            return String::new();
+        }
+        if inner.trim_start().starts_with('.') {
+            let mut out = String::new();
+            for part in split_top_commas(inner) {
+                if let Some(rest) = part.trim().strip_prefix('.') {
+                    if let Some((field, ex)) = split_designator(rest) {
+                        out.push_str(&expand_nested(&format!("{prefix}.{field}"), ex.trim()));
+                    }
+                }
+            }
+            return out;
+        }
+        let mut out = String::new();
+        for (i, part) in split_top_commas(inner).into_iter().enumerate() {
+            out.push_str(&format!("  {prefix}[{i}] = {part};\n"));
+        }
+        return out;
+    }
+    format!("  {prefix} = {e};\n")
+}
+
+fn split_designator(rest: &str) -> Option<(&str, &str)> {
+    let eq = rest.find('=')?;
+    let field = rest[..eq].trim();
+    if field.is_empty() || field.contains(' ') {
+        return None;
+    }
+    Some((field, rest[eq + 1..].trim()))
+}
+
+fn split_top_commas(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' | '{' | '[' => depth += 1,
+            ')' | '}' | ']' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(s[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let tail = s[start..].trim();
+    if !tail.is_empty() {
+        out.push(tail);
+    }
+    out
+}
+
 fn written_glue_call(p: &Program, slots: &Slots, f: LocalDefId, args: &str, types: &mut Vec<CTy>) -> String {
     let callee = glue_callee(p, slots, f, types);
     let mut pre = String::new();
@@ -13348,10 +13706,15 @@ fn glue_def(
     types: &mut Vec<CTy>,
 ) {
     if matches!(g, Glue::Default | Glue::Clone) && c_size_align(p, t).0 == 0 && ret_by_out(p, t) {
-        let (mut proto, mut def) = (String::new(), String::new());
-        glue_def_value(p, slots, g, t, &mut proto, &mut def, more, types);
-        zst_out_glue(g, t, &def, protos, defs);
-        return;
+        // An align>16 value already returns `T *` from the heap
+        // (`write_value_def`). Rewriting that as an out-pointer ZST
+        // would look for a by-value signature that is no longer there.
+        if !win_heap_align(c_size_align(p, t).1) {
+            let (mut proto, mut def) = (String::new(), String::new());
+            glue_def_value(p, slots, g, t, &mut proto, &mut def, more, types);
+            zst_out_glue(p, g, t, &def, protos, defs);
+            return;
+        }
     }
     glue_def_value(p, slots, g, t, protos, defs, more, types);
 }
@@ -13361,14 +13724,29 @@ fn glue_def(
 /// a function that writes through an out-pointer (each `return X;`
 /// becomes `*o = X;`), and a macro of the glue's name, so every call
 /// stays an expression.
-fn zst_out_glue(g: &Glue, t: &CTy, def: &str, protos: &mut String, defs: &mut String) {
+fn zst_out_glue(p: &Program, g: &Glue, t: &CTy, def: &str, protos: &mut String, defs: &mut String) {
     let (m, ct) = (mangle(t), ctype(t));
     let (name, head, params, call) = match g {
         Glue::Default => (format!("default_{m}"), format!("{ct} default_{m}(void) {{"), format!("{ct} *o"), "&r_".to_string()),
         _ => (format!("clone_{m}"), format!("{ct} clone_{m}({ct} *p) {{"), format!("{ct} *o, {ct} *p"), "&r_, (p)".to_string()),
     };
     let arg = if matches!(g, Glue::Default) { "" } else { "p" };
-    let _ = writeln!(protos, "void {name}_o({params});\n#define {name}({arg}) ({{ {ct} r_; {name}_o({call}); r_; }})");
+    let align = c_size_align(p, t).1;
+    if win_heap_align(align) {
+        // `{ct} r_` would be an align>16 frame slot. The block is heap,
+        // and the statement expression yields a pointer, not a `T`.
+        let invoke = if matches!(g, Glue::Default) {
+            format!("{name}_o(r_)")
+        } else {
+            format!("{name}_o(r_, __VA_ARGS__)")
+        };
+        let _ = writeln!(
+            protos,
+            "void {name}_o({params});\n#define {name}(...) (*({{ {ct} *r_ = ({ct} *)lust_overaligned_alloc(sizeof({ct}), {align}ull); {invoke}; r_; }}))"
+        );
+    } else {
+        let _ = writeln!(protos, "void {name}_o({params});\n#define {name}({arg}) ({{ {ct} r_; {name}_o({call}); r_; }})");
+    }
     let mut body = def.replacen(&head, &format!("void {name}_o({params}) {{"), 1);
     while let Some(i) = body.find("return ") {
         let end = i + body[i..].find(';').unwrap_or(body.len() - i);
@@ -13670,7 +14048,8 @@ fn glue_def_value(
             let _ = writeln!(defs, "void drop_{m}({ct} *p) {{\n{body}}}\n");
         }
         Glue::Clone => {
-            let _ = writeln!(protos, "{ct} clone_{m}({ct} *p);");
+            let align = c_size_align(p, t).1;
+            write_value_proto(protos, &ct, align, &format!("clone_{m}"), &format!("{ct} *p"));
             // A field type with a written `Clone` impl clones through
             // that impl even when it is `Copy` (rustc's derived bodies
             // call `Clone::clone` on each field).
@@ -13687,7 +14066,7 @@ fn glue_def_value(
                 && let Some(&f) = p.gx.glue_methods.get(&(*a, p.gx.lang.clone))
             {
                 let call = written_glue_call(p, slots, f, "p", types);
-                let _ = writeln!(defs, "{ct} clone_{m}({ct} *p) {{\n{call}}}\n");
+                write_value_def(defs, &ct, align, &format!("clone_{m}"), &format!("{ct} *p"), &call);
                 return;
             }
             match t {
@@ -13843,7 +14222,7 @@ fn glue_def_value(
                 }
                 _ => body.push_str("  return *p;\n"),
             }
-            let _ = writeln!(defs, "{ct} clone_{m}({ct} *p) {{\n{body}}}\n");
+            write_value_def(defs, &ct, align, &format!("clone_{m}"), &format!("{ct} *p"), &body);
         }
         Glue::Eq => {
             let _ = writeln!(protos, "uint8_t eq_{m}({ct} *a, {ct} *b);");
@@ -14162,12 +14541,13 @@ fn glue_def_value(
             let _ = writeln!(defs, "int8_t {pre}_{m}({ct} *a, {ct} *b) {{\n{body}}}\n");
         }
         Glue::Default => {
-            let _ = writeln!(protos, "{ct} default_{m}(void);");
+            let align = c_size_align(p, t).1;
+            write_value_proto(protos, &ct, align, &format!("default_{m}"), "void");
             if let CTy::Adt(a) = t
                 && let Some(&f) = p.gx.glue_methods.get(&(*a, p.gx.lang.default))
             {
                 let call = written_glue_call(p, slots, f, "", types);
-                let _ = writeln!(defs, "{ct} default_{m}(void) {{\n{call}}}\n");
+                write_value_def(defs, &ct, align, &format!("default_{m}"), "void", &call);
                 return;
             }
             // A written `impl Default for &'static A` (check
@@ -14177,7 +14557,7 @@ fn glue_def_value(
                 && let Some(&f) = p.gx.ref_default_methods.get(a)
             {
                 let call = written_glue_call(p, slots, f, "", types);
-                let _ = writeln!(defs, "{ct} default_{m}(void) {{\n{call}}}\n");
+                write_value_def(defs, &ct, align, &format!("default_{m}"), "void", &call);
                 return;
             }
             let def_of = |t: &CTy, need: &mut dyn FnMut(Glue, &CTy)| -> String {
@@ -14276,7 +14656,7 @@ fn glue_def_value(
                     let _ = writeln!(body, "  return {};", def_of(t, &mut need));
                 }
             }
-            let _ = writeln!(defs, "{ct} default_{m}(void) {{\n{body}}}\n");
+            write_value_def(defs, &ct, align, &format!("default_{m}"), "void", &body);
         }
         Glue::TlsInit | Glue::TlsDtor => tls_glue(p, g, t, protos, defs, &mut need),
         Glue::Debug => {

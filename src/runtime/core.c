@@ -76,19 +76,27 @@ void *lust_alloc(uint64_t size, uint64_t align) LUST_BODY({
     return p;
 })
 
-/* A dev-C local whose alignment is over 16 (cgen `overaligned_local`).
-   tcc's frame is only 16-aligned, and a char buffer big enough to
-   realign a 128-byte local inside it faults on PE. The value lives in
-   an _aligned_malloc block; tcc's cleanup calls the free when the
-   function returns. `pp` points at the void* slot. */
-#ifdef _WIN32
+/* A dev-C value whose alignment is over 16 (cgen `overaligned_local`,
+   and clone/default glue). tcc's frame is only 16-aligned, and a char
+   buffer big enough to realign a 128-byte local inside it faults on PE.
+   The value lives in an aligned block for the rest of the process:
+   tcc's cleanup attribute on that pointer fail-fasts under PE. */
 void *lust_overaligned_alloc(uint64_t size, uint64_t align) LUST_BODY({
     if (!size) size = 1;
     if (align < sizeof(void *)) align = sizeof(void *);
-    void *p = _aligned_malloc((size_t)size, (size_t)align);
+    void *p;
+#ifdef _WIN32
+    p = _aligned_malloc((size_t)size, (size_t)align);
+#else
+    p = 0;
+    if (align <= 16) p = malloc(size);
+    else if ((size & (align - 1)) == 0) p = aligned_alloc(align, size);
+    else if (posix_memalign(&p, align, size) != 0) p = 0;
+#endif
     if (!p) lust_oom_size(size);
     return p;
 })
+#ifdef _WIN32
 void lust_overaligned_free(void *pp) LUST_BODY({
     void *p = *(void **)pp;
     if (p) _aligned_free(p);
@@ -528,6 +536,10 @@ static lust_loc lust_std_loc(uint32_t file, uint32_t line, uint32_t col) {
    `slice::range` is track_caller to there, and `Vec::drain` is not
    track_caller at all. */
 static void lust_range_bounds_check(uint64_t len, uint64_t s_tag, uint64_t s_val, uint64_t e_tag, uint64_t e_val, uint64_t *out_s, uint64_t *out_e) LUST_BODY({
+    /* A failed check panics and, in flag mode, returns. The later
+       checks would also fail (a start past `len` is past `end` too)
+       and raise again while the first panic is still pending. Windows
+       then fail-fasts (exit 127) instead of unwinding to 101. */
     uint64_t end;
     if (e_tag == 0) {
         if (e_val >= len) {
@@ -537,6 +549,7 @@ static void lust_range_bounds_check(uint64_t len, uint64_t s_tag, uint64_t s_val
             lust_string_push_cstr(&s, " out of range for slice of length ");
             lust_fmt_u64(&s, len);
             lust_panic(&s, lust_std_loc(12, 1005, 52));
+            if (lust_unwind_mode && lust_unw_mine()) return;
         }
         end = e_val + 1;
     } else if (e_tag == 1) {
@@ -547,6 +560,7 @@ static void lust_range_bounds_check(uint64_t len, uint64_t s_tag, uint64_t s_val
             lust_string_push_cstr(&s, " out of range for slice of length ");
             lust_fmt_u64(&s, len);
             lust_panic(&s, lust_std_loc(12, 1009, 51));
+            if (lust_unwind_mode && lust_unw_mine()) return;
         }
         end = e_val;
     } else {
@@ -566,6 +580,7 @@ static void lust_range_bounds_check(uint64_t len, uint64_t s_tag, uint64_t s_val
             lust_string_push_cstr(&s, " out of range for slice of length ");
             lust_fmt_u64(&s, len);
             lust_panic(&s, start_loc);
+            if (lust_unwind_mode && lust_unw_mine()) return;
         }
         if (s_tag == 1 && s_val == end) {
             lust_String s = lust_string_new();
@@ -574,6 +589,7 @@ static void lust_range_bounds_check(uint64_t len, uint64_t s_tag, uint64_t s_val
             lust_string_push_cstr(&s, " out of range for slice of length ");
             lust_fmt_u64(&s, len);
             lust_panic(&s, start_loc);
+            if (lust_unwind_mode && lust_unw_mine()) return;
         }
         if (s_val > end) {
             lust_String s = lust_string_new();
@@ -582,6 +598,7 @@ static void lust_range_bounds_check(uint64_t len, uint64_t s_tag, uint64_t s_val
             lust_string_push_cstr(&s, " but ends at ");
             lust_fmt_u64(&s, end);
             lust_panic(&s, start_loc);
+            if (lust_unwind_mode && lust_unw_mine()) return;
         }
         start = s_tag == 1 ? s_val + 1 : s_val;
     }

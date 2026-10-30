@@ -88,7 +88,10 @@ jobs:
             dist/*.zip
             dist/*.sha256
 
+  # macOS is out of scope for now (tcc Mach-O, libbase.so, BSD userland).
+  # The job stays in the file so it can be turned back on by deleting `if: false`.
   macos-arm64:
+    if: false
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4

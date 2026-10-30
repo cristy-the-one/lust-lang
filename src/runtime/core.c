@@ -56,6 +56,30 @@ void lust_oom_size(uint64_t n) LUST_BODY({
     abort();
 })
 
+/* LUST_ALIGNED_EMU (Linux dev only): emulate Windows' _aligned_malloc
+   pairing on Linux. An over-aligned block is then a pointer inside a
+   larger malloc block, so a plain free() of it aborts at once (glibc:
+   "free(): invalid pointer"), as _aligned_malloc + free fail-fasts on
+   Windows. This finds mismatched frees in minutes on Linux instead of in
+   a Windows CI run. Off unless the variable is set. */
+#ifndef _WIN32
+static int lust_aligned_emu_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("LUST_ALIGNED_EMU") != 0;
+    return on;
+}
+static void *lust_emu_aligned_malloc(uint64_t size, uint64_t align) {
+    void *raw = malloc((size_t)(size + align + sizeof(void *)));
+    if (!raw) return 0;
+    uintptr_t a = ((uintptr_t)raw + sizeof(void *) + align - 1) & ~(uintptr_t)(align - 1);
+    ((void **)a)[-1] = raw;
+    return (void *)a;
+}
+static void lust_emu_aligned_free(void *p) {
+    if (p) free(((void **)p)[-1]);
+}
+#endif
+
 /* The `alloc(size, align)` intrinsic family (ARCH 3.2). `align` is a power
    of two, as Rust's Layout guarantees. Alignment up to 4 MiB works (the
    ts-rust jemalloc case). A zero size returns a dangling pointer with the
@@ -70,6 +94,7 @@ void *lust_alloc(uint64_t size, uint64_t align) LUST_BODY({
     p = align <= 16 ? malloc(size) : _aligned_malloc((size_t)size, (size_t)align);
 #else
     if (align <= 16) p = malloc(size);
+    else if (lust_aligned_emu_on()) p = lust_emu_aligned_malloc(size, align);
     else if ((size & (align - 1)) == 0) p = aligned_alloc(align, size);
     else if (posix_memalign(&p, align, size) != 0) p = 0;
 #endif
@@ -91,6 +116,7 @@ void *lust_overaligned_alloc(uint64_t size, uint64_t align) LUST_BODY({
 #else
     p = 0;
     if (align <= 16) p = malloc(size);
+    else if (lust_aligned_emu_on()) p = lust_emu_aligned_malloc(size, align);
     else if ((size & (align - 1)) == 0) p = aligned_alloc(align, size);
     else if (posix_memalign(&p, align, size) != 0) p = 0;
 #endif
@@ -131,6 +157,8 @@ void lust_dealloc(void *ptr, uint64_t size, uint64_t align) LUST_BODY({
     if (!size) return;
 #ifdef _WIN32
     if (align > 16) { _aligned_free(ptr); return; }
+#else
+    if (align > 16 && lust_aligned_emu_on()) { lust_emu_aligned_free(ptr); return; }
 #endif
     (void)align;
     free(ptr);

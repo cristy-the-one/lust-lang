@@ -66,18 +66,28 @@ fn main() {
     let root = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let tcc = std::env::var("LUST_TCC_HOME").map(PathBuf::from).unwrap_or_else(|_| root.join("third_party/tcc"));
     let lib = tcc.join("lib");
-    if !lib.join("libtcc.a").exists() {
-        panic!("libtcc.a not found in {}. Run scripts/build-tcc.sh first.", lib.display());
+    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    // Unix static archives are `libtcc.a`. An MSVC build of libtcc is `tcc.lib`
+    // (scripts/build-tcc.ps1). Either name is the same library.
+    let have_unix = lib.join("libtcc.a").exists();
+    let have_msvc = lib.join("tcc.lib").exists();
+    if !have_unix && !have_msvc {
+        panic!("libtcc.a or tcc.lib not found in {}. Run scripts/build-tcc.sh (Linux) or scripts/build-tcc.ps1 (Windows) first.", lib.display());
     }
     println!("cargo:rustc-link-search=native={}", lib.display());
-    println!("cargo:rustc-link-lib=static=tcc");
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+    if os == "windows" && have_msvc {
+        println!("cargo:rustc-link-lib=static=tcc");
+    } else {
+        println!("cargo:rustc-link-lib=static=tcc");
+    }
+    if os == "linux" {
         println!("cargo:rustc-link-lib=dylib=dl");
         println!("cargo:rustc-link-lib=dylib=pthread");
         println!("cargo:rustc-link-lib=dylib=m");
     }
+    let tcc_bin = if os == "windows" && tcc.join("bin/tcc.exe").exists() { tcc.join("bin/tcc.exe") } else { tcc.join("bin/tcc") };
     println!("cargo:rustc-env=LUST_TCC_LIB_PATH={}", lib.join("tcc").display());
-    println!("cargo:rustc-env=LUST_TCC_BIN={}", tcc.join("bin/tcc").display());
+    println!("cargo:rustc-env=LUST_TCC_BIN={}", tcc_bin.display());
     println!("cargo:rerun-if-env-changed=LUST_TCC_HOME");
     println!("cargo:rerun-if-changed=build.rs");
     // mimalloc, the allocator of musl release builds (src/cc.rs `mimalloc_unit`): its

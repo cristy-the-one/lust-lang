@@ -78,6 +78,12 @@ pub fn load(manifest_path: &Path) -> Result<Metadata, String> {
     let mut cmd = Command::new("cargo");
     cmd.args(["metadata", "--format-version", "1", "--no-deps", "--manifest-path"]);
     cmd.arg(manifest_path);
+    // Run in the package directory. Parallel scans (the fixture tests)
+    // otherwise share the caller's target dir and, on Windows, one
+    // metadata process locks the other out of a complete read.
+    if let Some(dir) = manifest_path.parent() {
+        cmd.current_dir(dir);
+    }
     if find_lock(manifest_path).is_some() {
         cmd.arg("--locked");
     }

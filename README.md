@@ -147,7 +147,7 @@ The daemon exits after 30 idle minutes (`LUST_DAEMON_IDLE`, for example `10m`; `
 
 ## Build and use
 
-Linux x86_64 only. The daemon uses Unix sockets. Other platforms are not verified.
+Linux x86_64 and Windows x86_64 (MSVC, Windows 10 or 11, PowerShell 7). The daemon listens on a Unix socket on Linux and on `127.0.0.1` on Windows (the socket path is a one-line address file). macOS is in CI and is not part of this support claim.
 
 ### From the release
 
@@ -174,6 +174,68 @@ scripts/release.sh        # optional: builds dist/lust-<version>-x86_64-linux.ta
 `scripts/build.sh` builds a profile that compiles faster, for test runs.
 
 `third_party/ts-rust` is a git submodule. It points to a private fork of ts-rust that only the census scripts (`scripts/tsrust-full.sh`) use. You do not need it to build or use lust.
+
+### Windows
+
+Nothing here assumes a compiler is already installed. The commands are PowerShell 7 (`pwsh`). They build lust for `x86_64-pc-windows-msvc`.
+
+1. Install [Visual Studio 2022](https://visualstudio.microsoft.com/downloads/) (or the Build Tools) with the workload **Desktop development with C++**. That provides `cl.exe`, which builds the pinned TinyCC and links lust.
+2. Install [Git for Windows](https://git-scm.com/download/win) if `git` is not already on your PATH.
+3. Install [rustup](https://rustup.rs/) and the 1.99 toolchain. In PowerShell:
+
+```powershell
+winget install Rustlang.Rustup
+rustup toolchain install 1.99.0
+rustup default 1.99.0
+```
+
+Close and reopen the terminal after rustup so `cargo` is on PATH.
+
+4. Clone, build TinyCC, build lust, and run a program:
+
+```powershell
+git clone https://github.com/cristy-the-one/lust-lang.git
+cd lust-lang
+git checkout next
+pwsh -File scripts/build-tcc.ps1
+$env:LUST_TCC_HOME = "$PWD\third_party\tcc"
+cargo build --release
+.\target\release\lust.exe --version
+Set-Content hello.rs 'fn main() { println!("hello {}", 40 + 2); }'
+.\target\release\lust.exe run hello.rs
+.\target\release\lust.exe check hello.rs
+```
+
+`lust run` prints `hello 42` and exits 0. The first command compiles cold and starts a background daemon. The second command is a warm check against that daemon. The daemon's log is `.lust-cache\daemon.log`. Delete `.lust-daemon-*.sock` in the current directory to stop it.
+
+`cargo test` is not the project gate. The gate is Git Bash (installed with Git for Windows):
+
+```powershell
+bash scripts/ci.sh
+```
+
+A release zip, next to the Linux tarball from `scripts/release.sh`:
+
+```powershell
+pwsh -File scripts/release.ps1
+Get-FileHash dist\lust-0.2.0-x86_64-windows.zip -Algorithm SHA256
+```
+
+The zip contains `bin\lust.exe`, `bin\lust-core.exe`, the pinned `tcc.exe`, and the std and adapter sources. You do not need Visual Studio to run a packaged build. You do need it, plus rustup, to build from source. Cargo is still required to check a Cargo crate (`lust` runs `cargo metadata`).
+
+#### What changed for Windows
+
+- The daemon accepts connections on `127.0.0.1` with an ephemeral port. The port is written to `.lust-daemon-<build>.sock` (or `LUST_DAEMON_SOCKET`). Deleting that file stops the daemon. Linux still uses a Unix socket at the same path.
+- The client finds `lust-core.exe` next to `lust.exe`, detaches the daemon with a new process group and no console window, and passes the lock with an inherited handle (`LockFileEx`) instead of `flock`.
+- Small `lust run` programs run in a child process. Windows has no `fork`, so the in-memory path compiles a temporary executable and runs that. Stdout, stderr, and the exit code match the file-based build.
+- Daemon incremental builds write `libbase-….dll` and copy it next to the executable. Windows loads a DLL from the executable's directory. Linux still uses `libbase-….so` and rpath.
+- Source files are read with CRLF turned into LF before spans are assigned, which is how rustc reads them, so diagnostics and `line!()` match rustc on a Windows checkout.
+- The default output name is `stem.exe` when you omit `-o`, as rustc does. Paths in diagnostics use `\`.
+- The front-image save (`LUST_FRONT_STATE`, a fixed-address heap snapshot) stays Linux-only. Warm incremental checks in the daemon do not use it.
+- `scripts/build-tcc.ps1` and `scripts/release.ps1` are the Windows build and package scripts. CI runs the same `scripts/ci.sh` gate on `windows-latest`. ASan is not run there.
+- `lust.exe` and `lust-core.exe` reserve a 256 MiB main-thread stack, the same room the compiler's worker threads get. The Windows default (1 MiB) is too small for the const evaluator.
+- The Windows C runtime loads a few Win32 entry points (`FlsAlloc`, `InitOnceExecuteOnce`, `CommandLineToArgvW`, and the Vista path APIs) with `GetProcAddress`, because the pinned TinyCC import libraries do not list them.
+- `std::net` sockets are not implemented on Windows yet: those calls fail with "not supported". The daemon does not use them.
 
 ### Use
 

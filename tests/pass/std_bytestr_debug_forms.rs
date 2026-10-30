@@ -1,3 +1,4 @@
+// only: unix
 // std's ByteStr Debug where std keeps bytes as CStrings or ByteStrs: a
 // Command's program, argv[0], args (alternate form), and cwd; an abstract
 // socket name (tf-p6). `'` is `\'`, controls `\xNN`, NUL `\0`,

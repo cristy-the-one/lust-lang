@@ -14,22 +14,66 @@ cd "$root"
 
 step() { echo; echo "== ci: $1 =="; }
 
+# Windows Git Bash has no python3 on PATH (only python) and names the
+# release binaries lust.exe. ASan/UBSan in scripts/difftest.sh is a Linux
+# clang extra; it is off unless the caller asked for it.
+case "$(uname -s)" in
+  Linux) ;;
+  *)
+    if [ -z "${CI_SANITIZE+x}" ]; then CI_SANITIZE=0; fi
+    ;;
+esac
+if ! command -v python3 >/dev/null 2>&1 && command -v python >/dev/null 2>&1; then
+  _py_shim=$(mktemp -d)
+  printf '#!/bin/sh\nexec python "$@"\n' >"$_py_shim/python3"
+  chmod +x "$_py_shim/python3"
+  export PATH="$_py_shim:$PATH"
+fi
+
 step "toolchain"
 rustc --version
 cargo --version
 python3 --version
 
 step "build"
+# Git for Windows ships usr/bin/link.exe, which is not the MSVC linker.
+# cargo invokes `link.exe` for the msvc target, so the VC tools directory
+# has to come first or the build script fails immediately.
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    vswhere="/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+    if [ -x "$vswhere" ]; then
+      vs_install=$("$vswhere" -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | tr -d '\r')
+      if [ -n "$vs_install" ]; then
+        vs_msys=$(cygpath -u "$vs_install")
+        msvc_link=$(find "$vs_msys/VC/Tools/MSVC" -path '*/bin/Hostx64/x64/link.exe' -type f 2>/dev/null | head -1)
+        if [ -n "$msvc_link" ]; then
+          export PATH="$(dirname "$msvc_link"):$PATH"
+          echo "msvc link: $msvc_link"
+        fi
+      fi
+    fi
+    ;;
+esac
 if [ -n "${LUST_TCC_HOME:-}" ]; then
   echo "tcc: LUST_TCC_HOME=$LUST_TCC_HOME"
-elif [ -f third_party/tcc/lib/libtcc.a ]; then
+elif [ -f third_party/tcc/lib/libtcc.a ] || [ -f third_party/tcc/lib/tcc.lib ]; then
   export LUST_TCC_HOME=$root/third_party/tcc
   echo "tcc: $LUST_TCC_HOME (already built)"
 else
-  scripts/build-tcc.sh
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) powershell.exe -NoProfile -File scripts/build-tcc.ps1 ;;
+    *) scripts/build-tcc.sh ;;
+  esac
   export LUST_TCC_HOME=$root/third_party/tcc
 fi
 cargo build --release
+# Test scripts name `target/release/lust`. Cargo on Windows writes lust.exe.
+# Git bash treats `lust` as `lust.exe`, so `cp lust.exe lust` is a same-file copy.
+if [ -f target/release/lust.exe ]; then
+  powershell.exe -NoProfile -Command "Copy-Item -LiteralPath 'target\release\lust.exe' -Destination 'target\release\lust' -Force; Copy-Item -LiteralPath 'target\release\lust-core.exe' -Destination 'target\release\lust-core' -Force"
+  chmod +x target/release/lust.exe target/release/lust-core.exe || true
+fi
 
 step "diagnostic code registry"
 scripts/check-codes.sh

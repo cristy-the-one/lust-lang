@@ -47,13 +47,28 @@ use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::ffi::CString;
 use std::io::{BufReader, Seek, Write};
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+#[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd};
-use std::os::unix::net::UnixListener;
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
+
+#[cfg(windows)]
+#[path = "daemon_win.rs"]
+mod win;
+
+/// A connection the hang watchdog can name. A Unix fd on Unix, a Winsock
+/// handle value on Windows.
+#[cfg(unix)]
+type ConnToken = i32;
+#[cfg(windows)]
+type ConnToken = u64;
 
 unsafe extern "C" {
     fn flock(fd: i32, operation: i32) -> i32;
@@ -86,9 +101,17 @@ const IN_CLOEXEC: i32 = 0o2000000;
 const IN_MOVED_FROM: u32 = 0x40;
 const IN_DELETE: u32 = 0x200;
 
-/// Set by the SIGTERM/SIGINT handler; the serve loop sees it and exits
-/// through the same cleanup as the idle timeout.
+/// Set by the SIGTERM/SIGINT handler (and, on Windows, the console control
+/// handler); the serve loop sees it and exits through the same cleanup as
+/// the idle timeout.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// The Windows console handler lives in `daemon_win` and can only touch
+/// this flag plus its own wake event.
+#[cfg(windows)]
+fn request_shutdown() {
+    SHUTDOWN.store(true, Ordering::SeqCst);
+}
 /// The write end of the wakeup pipe the handler pokes, so a `poll` for
 /// the idle timeout wakes at once instead of sleeping through a signal.
 static WAKE_W: AtomicI32 = AtomicI32::new(-1);
@@ -112,10 +135,10 @@ const POLLRDHUP: i16 = 0x2000;
 #[cfg(not(target_os = "linux"))]
 const POLLRDHUP: i16 = 0;
 
-/// The request the serve loop is compiling: its connection fd and start
+/// The request the serve loop is compiling: its connection token and start
 /// time, or None between requests. The hang watchdog reads it; the serve
-/// loop clears it before the connection closes, so a set fd is always open.
-static BUSY: std::sync::Mutex<Option<(i32, std::time::Instant)>> = std::sync::Mutex::new(None);
+/// loop clears it before the connection closes, so a set token is always open.
+static BUSY: std::sync::Mutex<Option<(ConnToken, std::time::Instant)>> = std::sync::Mutex::new(None);
 
 /// How long a request may run before the watchdog checks its client
 /// (`LUST_DAEMON_HANG`, seconds, default 30; 0 turns the watchdog off).
@@ -130,10 +153,16 @@ fn hang_limit() -> Option<std::time::Duration> {
 /// True when the peer of connection `fd` has closed it (the client was
 /// killed, timed out, or got Ctrl-C). A client that still waits for its
 /// answer has sent its whole request and reads, so no event is pending.
-fn client_gone(fd: i32) -> bool {
+#[cfg(unix)]
+fn client_gone(fd: ConnToken) -> bool {
     let mut pfd = PollFd { fd, events: POLLRDHUP, revents: 0 };
     // SAFETY: one valid pollfd for the duration of the call; timeout 0.
     unsafe { poll(&mut pfd, 1, 0) > 0 && pfd.revents & (POLLRDHUP | POLLHUP | POLLERR) != 0 }
+}
+
+#[cfg(windows)]
+fn client_gone(token: ConnToken) -> bool {
+    win::peer_gone(token)
 }
 
 /// Starts the hang watchdog. The daemon compiles one request at a time,
@@ -178,6 +207,7 @@ struct PollFd {
 /// timeout waits forever. True only for a readable listener; the caller
 /// checks the signal flag and the socket watch itself. This is how the
 /// idle exit costs no latency: no sleep-based polling.
+#[cfg(unix)]
 fn wait_readable(listener: &UnixListener, wake: i32, socket_watch: i32, timeout: Option<std::time::Duration>) -> bool {
     let mut pfds = [
         PollFd { fd: listener.as_raw_fd(), events: POLLIN, revents: 0 },
@@ -264,12 +294,19 @@ fn socket_removed(watch: i32, sock: &Path) -> bool {
     socket_removal_event(&buf[..n as usize], name.as_bytes()) || sock.symlink_metadata().is_err()
 }
 
-/// True when the watched socket was removed since the last call. A call
-/// with no pending events is one nonblocking read, so the serve loop can
-/// ask after every wait at no polling cost.
-#[cfg(not(target_os = "linux"))]
+/// True when the watched socket was removed since the last call. macOS has
+/// no inotify watch; the file stays until the other exits.
+#[cfg(all(not(target_os = "linux"), not(windows)))]
 fn socket_removed(_watch: i32, _sock: &Path) -> bool {
     false
+}
+
+/// True when the address file is gone. The watcher thread wakes the serve
+/// loop; this is the check it runs. A call with the file still there is one
+/// metadata lookup.
+#[cfg(windows)]
+fn socket_removed(_watch: i32, sock: &Path) -> bool {
+    !sock.exists()
 }
 
 /// The pid in a lust temp name (`lust-daemon-<pid>`, `lust-<pid>`,
@@ -291,12 +328,19 @@ fn stale_temp_pid(name: &str) -> Option<u32> {
     None
 }
 
-/// True when a process with `pid` exists. Signal 0 plus the /proc
+/// True when a process with `pid` exists. On Unix, signal 0 plus the /proc
 /// fallback for a pid owned by another user (where signal 0 fails).
 /// A reused pid reads as alive, which only keeps a stale dir longer.
 fn pid_alive(pid: u32) -> bool {
-    // SAFETY: signal 0 only probes whether the pid exists.
-    (pid > 0 && unsafe { kill(pid as i32, 0) } == 0) || Path::new(&format!("/proc/{pid}")).exists()
+    #[cfg(unix)]
+    {
+        // SAFETY: signal 0 only probes whether the pid exists.
+        (pid > 0 && unsafe { kill(pid as i32, 0) } == 0) || Path::new(&format!("/proc/{pid}")).exists()
+    }
+    #[cfg(windows)]
+    {
+        crate::sys_host::process_alive(pid)
+    }
 }
 
 /// Deletes lust temp dirs and files from processes that are gone:
@@ -308,6 +352,7 @@ fn pid_alive(pid: u32) -> bool {
 fn sweep_stale_temp_dirs() {
     let tmp = std::env::temp_dir();
     let me = std::process::id();
+    #[cfg(unix)]
     // SAFETY: getuid has no arguments and cannot fail.
     let uid = unsafe { getuid() };
     let Ok(rd) = std::fs::read_dir(&tmp) else { return };
@@ -319,6 +364,9 @@ fn sweep_stale_temp_dirs() {
         }
         let path = e.path();
         let Ok(meta) = path.symlink_metadata() else { continue };
+        // The temp directory is per-user on Windows. On Unix, only this
+        // user's entries are removed.
+        #[cfg(unix)]
         if meta.uid() != uid {
             continue;
         }
@@ -525,7 +573,17 @@ fn changed_input(paths: &[PathBuf], start: std::time::SystemTime) -> Option<Path
     const CTIME_SLACK: std::time::Duration = std::time::Duration::from_millis(50);
     let start = start.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().saturating_sub(CTIME_SLACK);
     let start = (start.as_secs() as i64, start.subsec_nanos() as i64);
+    #[cfg(unix)]
     let newer = |md: &std::fs::Metadata| (md.ctime(), md.ctime_nsec()) > start;
+    // Windows has no ctime in the stable metadata API. Last-write time moves
+    // on the edits the guard compares; a clock set backwards can hide one,
+    // which the fresh-session guard treats as "do not compare", never as a
+    // false match that is applied.
+    #[cfg(windows)]
+    let newer = |md: &std::fs::Metadata| {
+        let t = md.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).unwrap_or_default();
+        (t.as_secs() as i64, t.subsec_nanos() as i64) > start
+    };
     paths
         .iter()
         .find(|p| match p.symlink_metadata() {
@@ -971,16 +1029,218 @@ fn entry_for<'m>(
 /// One resource line every 100 requests, so a daemon.log shows growth
 /// over a long session (scripts/daemon-soak.sh asserts the bounds).
 fn log_stats(served: u64, sessions: usize) {
-    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-    let field =
-        |name: &str| status.lines().find(|l| l.starts_with(name)).and_then(|l| l.split_whitespace().nth(1)).unwrap_or("?").to_string();
+    let (rss, threads) = crate::sys_host::mem_line();
     eprintln!(
-        "lust daemon: stats: {served} requests, {sessions} sessions, rss {} kB, {} threads, {} expansions, {} cached expansions",
-        field("VmRSS:"),
-        field("Threads:"),
+        "lust daemon: stats: {served} requests, {sessions} sessions, rss {rss} kB, {threads} threads, {} expansions, {} cached expansions",
         crate::diag::expansion_count(),
         crate::expand::cache_len()
     );
+}
+
+/// The listen socket plus the wake channel the idle wait blocks on.
+struct Gate {
+    #[cfg(unix)]
+    listener: UnixListener,
+    #[cfg(unix)]
+    wake_r: i32,
+    #[cfg(unix)]
+    socket_watch: i32,
+    #[cfg(windows)]
+    listener: win::Listener,
+}
+
+impl Gate {
+    fn watch_fd(&self) -> i32 {
+        #[cfg(unix)]
+        {
+            self.socket_watch
+        }
+        #[cfg(windows)]
+        {
+            -1
+        }
+    }
+
+    fn ready(&self, timeout: Option<std::time::Duration>) -> bool {
+        #[cfg(unix)]
+        {
+            wait_readable(&self.listener, self.wake_r, self.socket_watch, timeout)
+        }
+        #[cfg(windows)]
+        {
+            self.listener.wait(timeout)
+        }
+    }
+
+    fn take(&self) -> Option<Conn> {
+        #[cfg(unix)]
+        {
+            match self.listener.accept() {
+                Ok((conn, _)) => Some(Conn::Unix(conn)),
+                Err(_) => None,
+            }
+        }
+        #[cfg(windows)]
+        {
+            self.listener.accept().map(Conn::Tcp)
+        }
+    }
+}
+
+enum Conn {
+    #[cfg(unix)]
+    Unix(UnixStream),
+    #[cfg(windows)]
+    Tcp(std::net::TcpStream),
+}
+
+impl std::io::Read for Conn {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            #[cfg(unix)]
+            Conn::Unix(s) => std::io::Read::read(s, buf),
+            #[cfg(windows)]
+            Conn::Tcp(s) => std::io::Read::read(s, buf),
+        }
+    }
+}
+
+impl std::io::Write for Conn {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            #[cfg(unix)]
+            Conn::Unix(s) => s.write(buf),
+            #[cfg(windows)]
+            Conn::Tcp(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            #[cfg(unix)]
+            Conn::Unix(s) => s.flush(),
+            #[cfg(windows)]
+            Conn::Tcp(s) => s.flush(),
+        }
+    }
+}
+
+impl Conn {
+    fn blocking(&self) {
+        match self {
+            #[cfg(unix)]
+            Conn::Unix(s) => {
+                let _ = s.set_nonblocking(false);
+            }
+            #[cfg(windows)]
+            Conn::Tcp(s) => {
+                let _ = s.set_nonblocking(false);
+            }
+        }
+    }
+
+    fn token(&self) -> ConnToken {
+        match self {
+            #[cfg(unix)]
+            Conn::Unix(s) => s.as_raw_fd(),
+            #[cfg(windows)]
+            Conn::Tcp(s) => win::stream_token(s),
+        }
+    }
+}
+
+/// The lock file, already held. An autostart hands over the lock it took so
+/// there is no gap; a direct `lust daemon` locks here.
+fn open_daemon_lock(lock_path: &Path, sock: &Path) -> std::fs::File {
+    #[cfg(unix)]
+    {
+        let inherited = std::env::var("LUST_DAEMON_LOCK_FD")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            // SAFETY: fcntl F_SETFD on an fd number; it fails harmlessly when the fd is not open.
+            .filter(|&fd| unsafe { fcntl(fd, F_SETFD, FD_CLOEXEC) } == 0);
+        let lock_file = match inherited {
+            // SAFETY: the fd is open (checked above) and nothing else in this process owns it.
+            Some(fd) => unsafe { std::fs::File::from_raw_fd(fd) },
+            None => std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(lock_path).unwrap_or_else(|e| {
+                eprintln!("error: cannot open {}: {e}", lock_path.display());
+                std::process::exit(2);
+            }),
+        };
+        // SAFETY: flock on a live fd. LOCK_EX | LOCK_NB: fail at once when another daemon holds it.
+        // On an inherited fd this process already holds the lock, so the call succeeds.
+        if unsafe { flock(lock_file.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
+            eprintln!("lust daemon: another daemon already serves {}", sock.display());
+            std::process::exit(0);
+        }
+        lock_file
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::{FromRawHandle, OwnedHandle};
+        let inherited = std::env::var("LUST_DAEMON_LOCK_HANDLE").ok().and_then(|v| v.parse::<usize>().ok());
+        if let Some(raw) = inherited {
+            let handle = raw as *mut std::ffi::c_void;
+            protocol::clear_inherit_raw(handle);
+            // SAFETY: the client marked this handle inheritable and passed its value.
+            // Nothing else in this process owns it.
+            return unsafe { std::fs::File::from(OwnedHandle::from_raw_handle(handle)) };
+        }
+        let lock_file = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(lock_path).unwrap_or_else(|e| {
+            eprintln!("error: cannot open {}: {e}", lock_path.display());
+            std::process::exit(2);
+        });
+        if !protocol::try_lock(&lock_file) {
+            eprintln!("lust daemon: another daemon already serves {}", sock.display());
+            std::process::exit(0);
+        }
+        lock_file
+    }
+}
+
+fn bind_gate(sock: &Path) -> Gate {
+    #[cfg(unix)]
+    {
+        let _ = std::fs::remove_file(sock);
+        let listener = UnixListener::bind(sock).unwrap_or_else(|e| {
+            eprintln!("error: cannot bind {}: {e}", sock.display());
+            std::process::exit(2);
+        });
+        if listener.set_nonblocking(true).is_err() {
+            eprintln!("error: cannot set {} nonblocking", sock.display());
+            std::process::exit(2);
+        }
+        // Shutdown signals take the controlled exit: the handler only sets
+        // a flag and pokes this pipe (see `wait_readable` and `shutdown`).
+        let mut wake_fds = [0i32; 2];
+        // SAFETY: `wake_fds` has room for the two fds pipe(2) writes.
+        if unsafe { pipe(wake_fds.as_mut_ptr()) } != 0 {
+            eprintln!("error: cannot create the daemon wakeup pipe");
+            std::process::exit(2);
+        }
+        let (wake_r, wake_w) = (wake_fds[0], wake_fds[1]);
+        // SAFETY: fcntl F_SETFD on the fds just made; tcc children must not inherit them.
+        unsafe {
+            fcntl(wake_r, F_SETFD, FD_CLOEXEC);
+            fcntl(wake_w, F_SETFD, FD_CLOEXEC);
+            WAKE_W.store(wake_w, Ordering::SeqCst);
+            signal(SIGINT, on_shutdown_signal as usize);
+            signal(SIGTERM, on_shutdown_signal as usize);
+        }
+        // Removing the socket file is a stop request too. The watch wakes
+        // the same poll as the listener and the signal pipe; the serve loop
+        // checks it before each wait. A removal that lands before the watch
+        // starts is caught by the existence check in `socket_removed`.
+        let socket_watch = watch_socket_removal(sock);
+        Gate { listener, wake_r, socket_watch }
+    }
+    #[cfg(windows)]
+    {
+        let listener = win::Listener::bind(sock).unwrap_or_else(|e| {
+            eprintln!("error: cannot bind {}: {e}", sock.display());
+            std::process::exit(2);
+        });
+        Gate { listener }
+    }
 }
 
 /// Serves requests until idle. Each crate selection (`SessionKey`) has its own session.
@@ -1000,62 +1260,15 @@ pub fn serve(sock: &Path) -> ! {
     // An autostarting client passes its already locked fd (see client.rs `claim_start`), so
     // the lock has no gap between that client and this daemon. The fcntl both checks the
     // fd is open and sets close-on-exec again, so no child of the daemon inherits it.
-    let inherited = std::env::var("LUST_DAEMON_LOCK_FD")
-        .ok()
-        .and_then(|v| v.parse::<i32>().ok())
-        // SAFETY: fcntl F_SETFD on an fd number; it fails harmlessly when the fd is not open.
-        .filter(|&fd| unsafe { fcntl(fd, F_SETFD, FD_CLOEXEC) } == 0);
-    let mut lock_file = match inherited {
-        // SAFETY: the fd is open (checked above) and nothing else in this process owns it.
-        Some(fd) => unsafe { std::fs::File::from_raw_fd(fd) },
-        None => std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(&lock_path).unwrap_or_else(|e| {
-            eprintln!("error: cannot open {}: {e}", lock_path.display());
-            std::process::exit(2);
-        }),
-    };
-    // SAFETY: flock on a live fd. LOCK_EX | LOCK_NB: fail at once when another daemon holds it.
-    // On an inherited fd this process already holds the lock, so the call succeeds.
-    if unsafe { flock(lock_file.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
-        eprintln!("lust daemon: another daemon already serves {}", sock.display());
-        std::process::exit(0);
-    }
+    // On Windows the client passes the lock handle (`LUST_DAEMON_LOCK_HANDLE`).
+    let mut lock_file = open_daemon_lock(&lock_path, sock);
     let _ = lock_file.set_len(0);
     let _ = lock_file.rewind();
     let _ = write!(lock_file, "{}", std::process::id());
     let _ = lock_file.flush();
-    // `lock_file` stays open for the whole serve; process exit releases the flock.
+    // `lock_file` stays open for the whole serve; process exit releases the lock.
 
-    let _ = std::fs::remove_file(sock);
-    let listener = UnixListener::bind(sock).unwrap_or_else(|e| {
-        eprintln!("error: cannot bind {}: {e}", sock.display());
-        std::process::exit(2);
-    });
-    if listener.set_nonblocking(true).is_err() {
-        eprintln!("error: cannot set {} nonblocking", sock.display());
-        std::process::exit(2);
-    }
-    // Shutdown signals take the controlled exit: the handler only sets
-    // a flag and pokes this pipe (see `wait_readable` and `shutdown`).
-    let mut wake_fds = [0i32; 2];
-    // SAFETY: `wake_fds` has room for the two fds pipe(2) writes.
-    if unsafe { pipe(wake_fds.as_mut_ptr()) } != 0 {
-        eprintln!("error: cannot create the daemon wakeup pipe");
-        std::process::exit(2);
-    }
-    let (wake_r, wake_w) = (wake_fds[0], wake_fds[1]);
-    // SAFETY: fcntl F_SETFD on the fds just made; tcc children must not inherit them.
-    unsafe {
-        fcntl(wake_r, F_SETFD, FD_CLOEXEC);
-        fcntl(wake_w, F_SETFD, FD_CLOEXEC);
-        WAKE_W.store(wake_w, Ordering::SeqCst);
-        signal(SIGINT, on_shutdown_signal as usize);
-        signal(SIGTERM, on_shutdown_signal as usize);
-    }
-    // Removing the socket file is a stop request too. The watch wakes
-    // the same poll as the listener and the signal pipe; the serve loop
-    // checks it before each wait. A removal that lands before the watch
-    // starts is caught by the existence check in `socket_removed`.
-    let socket_watch = watch_socket_removal(sock);
+    let gate = bind_gate(sock);
     eprintln!("lust daemon: listening on {}", sock.display());
     let idle = protocol::daemon_idle();
     let mut last = std::time::Instant::now();
@@ -1072,11 +1285,10 @@ pub fn serve(sock: &Path) -> ! {
     // waits for that cold process to exit first, so it never competes with it. A
     // request that arrives meanwhile waits in the listen backlog.
     if let Ok(pid) = std::env::var("LUST_DAEMON_PREWARM_AFTER")
-        && let Ok(pid) = pid.parse::<i32>()
+        && let Ok(pid) = pid.parse::<u32>()
     {
         let start = std::time::Instant::now();
-        // SAFETY: signal 0 only probes whether the pid exists.
-        while unsafe { kill(pid, 0) } == 0 && start.elapsed() < std::time::Duration::from_secs(60) && !SHUTDOWN.load(Ordering::SeqCst) {
+        while pid_alive(pid) && start.elapsed() < std::time::Duration::from_secs(60) && !SHUTDOWN.load(Ordering::SeqCst) {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
     }
@@ -1109,7 +1321,7 @@ pub fn serve(sock: &Path) -> ! {
         last = std::time::Instant::now();
     }
     loop {
-        if socket_removed(socket_watch, sock) {
+        if socket_removed(gate.watch_fd(), sock) {
             shutdown(sock, &base, &sessions, "socket removed");
         }
         if SHUTDOWN.load(Ordering::SeqCst) {
@@ -1126,20 +1338,20 @@ pub fn serve(sock: &Path) -> ! {
             let cap = std::time::Duration::from_millis(20);
             left = Some(left.map_or(cap, |d| d.min(cap)));
         }
-        if !wait_readable(&listener, wake_r, socket_watch, left) {
+        if !gate.ready(left) {
             if jobs.pending == 0 && idle.is_some_and(|d| last.elapsed() >= d) {
                 shutdown(sock, &base, &sessions, "idle timeout");
             }
             continue;
         }
-        let mut conn = match listener.accept() {
-            Ok((conn, _)) => conn,
-            Err(_) => continue,
+        let mut conn = match gate.take() {
+            Some(conn) => conn,
+            None => continue,
         };
         last = std::time::Instant::now();
-        let _ = conn.set_nonblocking(false);
+        conn.blocking();
         let req = {
-            let mut reader = BufReader::new(&conn);
+            let mut reader = BufReader::new(&mut conn);
             protocol::read_request(&mut reader)
         };
         // A client of another lust build (a rebuilt or replaced binary at
@@ -1151,7 +1363,7 @@ pub fn serve(sock: &Path) -> ! {
             drop(conn);
             shutdown(sock, &base, &sessions, "a client of another lust build connected");
         }
-        *BUSY.lock().unwrap_or_else(|e| e.into_inner()) = Some((conn.as_raw_fd(), std::time::Instant::now()));
+        *BUSY.lock().unwrap_or_else(|e| e.into_inner()) = Some((conn.token(), std::time::Instant::now()));
         let resp = match req {
             Ok(req) => {
                 // A daemon never runs user code in memory: that run forks,
@@ -1608,10 +1820,23 @@ mod tests {
     /// The watchdog's peer check: an open client is not gone, a closed one is.
     #[test]
     fn client_gone_sees_a_closed_peer_only() {
-        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
-        assert!(!client_gone(ours.as_raw_fd()));
-        drop(theirs);
-        assert!(client_gone(ours.as_raw_fd()));
+        #[cfg(unix)]
+        {
+            let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+            assert!(!client_gone(ours.as_raw_fd()));
+            drop(theirs);
+            assert!(client_gone(ours.as_raw_fd()));
+        }
+        #[cfg(windows)]
+        {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap();
+            let ours = std::net::TcpStream::connect(port).unwrap();
+            let (theirs, _) = listener.accept().unwrap();
+            assert!(!client_gone(super::win::stream_token(&ours)));
+            drop(theirs);
+            assert!(client_gone(super::win::stream_token(&ours)));
+        }
     }
 
     /// LRU order, the served key's protection, and dir numbers that are never reused.

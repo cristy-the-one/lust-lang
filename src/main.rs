@@ -23,6 +23,8 @@ mod driver;
 mod expand;
 mod explain;
 mod image;
+mod srctext;
+mod sys_host;
 mod intern;
 mod ir;
 mod lexer;

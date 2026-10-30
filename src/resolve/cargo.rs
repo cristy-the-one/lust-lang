@@ -370,13 +370,12 @@ pub fn apply_cargo_env(cmd: &mut Command, env: Option<&[(String, String)]>) {
 /// copies the page table of every resident page of this process: several
 /// GB after a front image restore (src/image.rs), hundreds of ms a spawn.
 pub fn cargo_command(env: Option<&[(String, String)]>) -> Command {
-    use std::os::unix::fs::PermissionsExt;
     let path = match env {
         Some(env) => env.iter().find(|(k, _)| k == "PATH").map(|(_, v)| v.clone()),
         None => std::env::var("PATH").ok(),
     };
-    let found = path.iter().flat_map(std::env::split_paths).map(|d| d.join("cargo")).find(|c| c.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0));
-    let mut cmd = Command::new(found.unwrap_or_else(|| PathBuf::from("cargo")));
+    let found = path.iter().flat_map(std::env::split_paths).find_map(|d| cargo_exe_in(&d));
+    let mut cmd = Command::new(found.unwrap_or_else(|| PathBuf::from(if cfg!(windows) { "cargo.exe" } else { "cargo" })));
     apply_cargo_env(&mut cmd, env);
     cmd
 }
@@ -720,8 +719,35 @@ pub fn path_package_dir(id: &str) -> Option<PathBuf> {
             i += 1;
         }
     }
-    use std::os::unix::ffi::OsStringExt;
-    Some(PathBuf::from(std::ffi::OsString::from_vec(out)))
+    // SAFETY: a `file://` path is a byte string. On Unix that is the OsStr.
+    // On Windows Cargo writes the path as UTF-8 percent-encoding, so the
+    // decoded bytes are UTF-8 and WTF-8 accepts them.
+    Some(PathBuf::from(unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(&out) }.to_os_string()))
+}
+
+/// `dir/cargo`, or `dir/cargo.exe` on Windows. The file must be executable
+/// on Unix (the `+x` bit); on Windows a regular file is enough.
+fn cargo_exe_in(dir: &Path) -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let exe = dir.join("cargo.exe");
+        if exe.is_file() {
+            return Some(exe);
+        }
+    }
+    let plain = dir.join("cargo");
+    let meta = plain.metadata().ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o111 == 0 {
+            return None;
+        }
+    }
+    Some(plain)
 }
 
 /// The stable package identity of section 1.7 step 1.

@@ -1,0 +1,8 @@
+# Windows reserves 1 MiB of stack. The main thread const-evals deep
+# expressions and needs the same 256 MiB the pool threads get
+# (`pool::STACK_SIZE`). The binary also carries this as a .drectve.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/STACK:268435456"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/STACK:268435456"]

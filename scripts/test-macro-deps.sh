@@ -31,9 +31,11 @@ cleanup() {
   rm -rf "$work"
 }
 trap cleanup EXIT
+# shellcheck source=scripts/os-sh.sh
+source "$root/scripts/os-sh.sh"
 wait_socket() {
   local i
-  for i in $(seq 1 100); do [ -S "$(sock "$1")" ] && return 0; sleep 0.05; done
+  for i in $(seq 1 100); do is_daemon_endpoint "$(sock "$1")" && return 0; sleep 0.05; done
   return 1
 }
 
@@ -75,7 +77,7 @@ fi
 mkdir -p "$work/line"
 printf 'fn main() { println!("{}", line!()); }\n' >"$work/line/main.rs"
 (cd "$work/line" && "$lust" run main.rs) >/dev/null 2>&1
-for i in $(seq 1 100); do [ -S "$(sock "$work/line")" ] && break; sleep 0.05; done
+for i in $(seq 1 100); do is_daemon_endpoint "$(sock "$work/line")" && break; sleep 0.05; done
 w1=$(cd "$work/line" && "$lust" run main.rs 2>/dev/null)
 printf '\n\nfn main() { println!("{}", line!()); }\n' >"$work/line/main.rs"
 w2=$(cd "$work/line" && "$lust" run main.rs 2>/dev/null)
@@ -101,7 +103,7 @@ EOF
 printf 'pub fn f() { println!("{}", file!()); }\n' >"$e/sub/m.rs"
 grep -v 'm::f\|mod m' "$e/sub/main.rs" >"$e/one.rs"
 (cd "$e" && env -u LUST_DEPS_FOO LUST_DEPS_BAR=daemon LUST_DAEMON_SOCKET="$e/d.sock" "$lust" daemon 2>/dev/null) &
-for i in $(seq 1 100); do [ -S "$e/d.sock" ] && break; sleep 0.05; done
+for i in $(seq 1 100); do is_daemon_endpoint "$e/d.sock" && break; sleep 0.05; done
 envrun() { (cd "$e/$1" && shift && export LUST_DAEMON_SOCKET="$e/d.sock" && env "$@" 2>&1); }
 for f in one.rs sub/main.rs; do
   for args in "LUST_DEPS_BAR=a LUST_DEPS_FOO=b|.|$f" "-u LUST_DEPS_FOO LUST_DEPS_BAR=c|.|./$f" "LUST_DEPS_BAR=d|$(dirname "$f")|$(basename "$f")"; do

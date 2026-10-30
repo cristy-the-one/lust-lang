@@ -12,6 +12,8 @@
 #                        order) has i % n == k. The n shards together run every case once; the
 #                        landing gate runs them on separate machines. $matched counts the cases
 #                        the filter matched before the shard cut.
+# shellcheck source=scripts/gnu-tools.sh
+source "${BASH_SOURCE[0]%/*}/gnu-tools.sh"
 case_timeout=${CASE_TIMEOUT:-30}
 run_timeout=${RUN_TIMEOUT:-10}
 retry_timeout=${RETRY_CASE_TIMEOUT:-$((case_timeout * 6))}
@@ -73,7 +75,7 @@ unsupported=0
 # `@STD@/library/..`: boat's rustc prints `/rustc/<hash>/library/..`, a toolchain with
 # rust-src installed prints its local `lib/rustlib/src/rust/library/..`. W-PANIC compares
 # the rest byte for byte.
-mask_stderr() { sed -E -e "s/^thread '([^']*)' \([0-9]+\) /thread '\1' (TID) /" -e 's#(/rustc/[0-9a-f]+|/[^ :]*/lib/rustlib/src/rust)/library/#@STD@/library/#g' -e '/^timeout: the monitored command dumped core$/d' -e '/: line [0-9]+: +[0-9]+ .* timeout /d' "$1"; }
+mask_stderr() { sed -E -e 's#\\#/#g' -e "s/^thread '([^']*)' \([0-9]+\) /thread '\1' (TID) /" -e 's#(/rustc/[0-9a-f]+|/[^ :]*/lib/rustlib/src/rust)/library/#@STD@/library/#g' -e '/^timeout: the monitored command dumped core$/d' -e '/: line [0-9]+: +[0-9]+ .* timeout /d' "$1"; }
 
 # mask_stdout <case file> <stdout file>: a program's stdout with the paths it can print
 # masked: the case's path as @CASE@ and the checkout root as @ROOT@ (`file!()`,

@@ -1,4 +1,5 @@
 // expect: L0505
+// only: unix
 // A std item the shipped platform module lacks (`std::os::unix::fs`
 // has MetadataExt and the compat rows only) exists in std all the
 // same: L0505, not L0506.

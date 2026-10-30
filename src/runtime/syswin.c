@@ -143,8 +143,18 @@ void lust_sys_environ(lust_Vec *out) {
 }
 
 void lust_sys_argv(lust_Vec *out) {
+    /* shell32 is not a tcc default library, and CommandLineToArgvW is
+       not in any bundled .def. */
+    typedef WCHAR **(WINAPI *lust_argv_fn)(LPCWSTR, int *);
+    static lust_argv_fn fn;
+    static int ready;
+    if (!ready) {
+        fn = (lust_argv_fn)lust_win_proc("shell32.dll", "CommandLineToArgvW");
+        ready = 1;
+    }
+    if (!fn) return;
     int argc = 0;
-    WCHAR **argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    WCHAR **argv = fn(GetCommandLineW(), &argc);
     if (!argv) return;
     for (int i = 0; i < argc; i++) lust_sys_push_wide0(out, argv[i]);
     LocalFree(argv);
@@ -178,7 +188,15 @@ int32_t lust_sys_symlink(const uint8_t *a, uint64_t alen, const uint8_t *b, uint
        (1) needs the target kind; std's symlink_dir sets it. This
        intrinsic serves fs::symlink's Unix form, which std on Windows
        splits into symlink_file/dir: file form here (gap noted). */
-    int r = CreateSymbolicLinkW(y, x, 2) ? 0 : (int)GetLastError();
+    typedef BOOL (WINAPI *lust_symlink_fn)(LPCWSTR, LPCWSTR, DWORD);
+    static lust_symlink_fn fn;
+    static int ready;
+    if (!ready) {
+        fn = (lust_symlink_fn)lust_win_proc("kernel32.dll", "CreateSymbolicLinkW");
+        ready = 1;
+    }
+    if (!fn) { SetLastError(120); free(x); free(y); return 120; }
+    int r = fn(y, x, 2) ? 0 : (int)GetLastError();
     free(x);
     free(y);
     return r;
@@ -188,15 +206,42 @@ int32_t lust_sys_symlink(const uint8_t *a, uint64_t alen, const uint8_t *b, uint
    std's canonicalize keeps (goport strips it itself). */
 static int32_t lust_sys_final_path(HANDLE h, lust_Vec *out) {
     WCHAR buf[1024];
-    DWORD n = GetFinalPathNameByHandleW(h, buf, 1024, 0);
+    typedef DWORD (WINAPI *lust_final_fn)(HANDLE, LPWSTR, DWORD, DWORD);
+    static lust_final_fn fn;
+    static int ready;
+    if (!ready) {
+        fn = (lust_final_fn)lust_win_proc("kernel32.dll", "GetFinalPathNameByHandleW");
+        ready = 1;
+    }
+    if (!fn) return 120; /* ERROR_CALL_NOT_IMPLEMENTED */
+    DWORD n = fn(h, buf, 1024, 0);
     if (n == 0) return (int32_t)GetLastError();
     if (n < 1024) { lust_sys_push_wide(out, buf, (int)n); return 0; }
     WCHAR *big = malloc(sizeof(WCHAR) * (n + 1));
     if (!big) lust_oom();
-    n = GetFinalPathNameByHandleW(h, big, n + 1, 0);
+    n = fn(h, big, n + 1, 0);
     if (n == 0) { int32_t e = (int32_t)GetLastError(); free(big); return e; }
     lust_sys_push_wide(out, big, (int)n);
     free(big);
+    return 0;
+}
+
+/* `env::current_exe`: GetModuleFileNameW, UTF-8, no trailing NUL.
+   std does not add the `\\?\` prefix here. */
+int32_t lust_sys_current_exe(lust_Vec *out) {
+    WCHAR buf[1024];
+    DWORD n = GetModuleFileNameW(0, buf, 1024);
+    if (n == 0) return (int32_t)GetLastError();
+    if (n >= 1024) {
+        WCHAR *big = malloc(sizeof(WCHAR) * 32768);
+        if (!big) lust_oom();
+        n = GetModuleFileNameW(0, big, 32768);
+        if (n == 0 || n >= 32768) { int32_t e = (int32_t)GetLastError(); free(big); return e ? e : 122; }
+        lust_sys_push_wide(out, big, (int)n);
+        free(big);
+        return 0;
+    }
+    lust_sys_push_wide(out, buf, (int)n);
     return 0;
 }
 

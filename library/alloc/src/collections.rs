@@ -2076,9 +2076,11 @@ pub mod binary_heap {
         }
     }
 
-    // No `Clone` impl yet: with one, any `BinaryHeap<Reverse<_>>` is rejected even when
-    // nothing clones it (`Vec<Reverse<_>>::clone` is not found; `VecDeque<Reverse<_>>`
-    // has the same issue today). A clone of a heap is rejected instead (a missing method).
+    impl<T: Clone> Clone for BinaryHeap<T> {
+        fn clone(&self) -> BinaryHeap<T> {
+            BinaryHeap { data: self.data.clone() }
+        }
+    }
 
     impl<T: core::fmt::Debug> core::fmt::Debug for BinaryHeap<T> {
         fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {

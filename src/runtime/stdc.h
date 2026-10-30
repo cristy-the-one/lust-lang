@@ -12,6 +12,8 @@
    is tv_nsec. A clock_gettime failure aborts, as std's unwrap panics. */
 lust_u128 lust_clock_now_raw(void);
 lust_u128 lust_system_time_raw(void);
+/* QueryPerformanceFrequency, or 0 off Windows. Instant's epsilon is one tick. */
+uint64_t lust_qpc_freq(void);
 
 /* `Formatter`'s alignment as `rt::Alignment` encodes it: 0 left,
    1 right, 2 center, 3 unknown (none written). */

@@ -326,7 +326,14 @@ static void lust_futex_wake(uint32_t *p, int n) {
    nanoseconds (callers recompute what is left and loop, so a capped
    or early return is fine). */
 static void lust_futex_wait_for(uint32_t *p, uint32_t v, long rs, long rn) {
-#ifdef LUST_SYS_FUTEX
+#ifdef _WIN32
+    pthread_once(&lust_woa_once, lust_woa_init);
+    uint64_t ms = (uint64_t)rs * 1000ull + (uint64_t)rn / 1000000ull;
+    if (ms == 0) ms = 1;
+    if (ms > 0xffffffffull) ms = 0xffffffffull;
+    if (lust_woa) lust_woa(p, &v, sizeof v, (uint32_t)ms);
+    else SwitchToThread();
+#elif defined(LUST_SYS_FUTEX)
     long rel[2];
     rel[0] = rs;
     rel[1] = rn;

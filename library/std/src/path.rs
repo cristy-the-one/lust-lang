@@ -16,14 +16,24 @@ use core::cmp::Ordering;
 use core::fmt;
 use core::ops::Deref;
 
-/// The separator of path components on Unix.
-pub const MAIN_SEPARATOR: char = '/';
+/// The separator of path components: `/` on Unix, `\` on Windows.
+pub const MAIN_SEPARATOR: char = if cfg!(windows) { '\\' } else { '/' };
 /// `MAIN_SEPARATOR` as a string.
-pub const MAIN_SEPARATOR_STR: &str = "/";
+pub const MAIN_SEPARATOR_STR: &str = if cfg!(windows) { "\\" } else { "/" };
 
-/// True for the separator byte (`/` on Unix).
+/// True for a separator byte (`/` on Unix; `/` and `\` on Windows).
+fn is_sep_byte(b: u8) -> bool {
+    b == b'/' || (cfg!(windows) && b == b'\\')
+}
+
+/// True for the separator character (`/` on Unix; `/` and `\` on Windows).
 pub fn is_separator(c: char) -> bool {
-    c == '/'
+    c == '/' || (cfg!(windows) && c == '\\')
+}
+
+/// Bytes of a disk prefix (`C:`), else 0. Windows only; Unix paths have none.
+fn disk_prefix_len(path: &[u8]) -> usize {
+    if cfg!(windows) && path.len() >= 2 && path[0].is_ascii_alphabetic() && path[1] == b':' { 2 } else { 0 }
 }
 
 /// A slice of a path: an unsized type, always behind a reference.
@@ -71,7 +81,7 @@ impl<'a> Component<'a> {
     pub fn as_os_str(self) -> &'a OsStr {
         match self {
             Component::Prefix(p) => p.as_os_str(),
-            Component::RootDir => OsStr::new("/"),
+            Component::RootDir => OsStr::new(if cfg!(windows) { "\\" } else { "/" }),
             Component::CurDir => OsStr::new("."),
             Component::ParentDir => OsStr::new(".."),
             Component::Normal(path) => path,
@@ -128,7 +138,7 @@ impl<'a> Components<'a> {
             path,
             start: 0,
             end: path.len(),
-            has_physical_root: !path.is_empty() && path[0] == b'/',
+            has_physical_root: path.len() > disk_prefix_len(path) && is_sep_byte(path[disk_prefix_len(path)]),
             front: State::Prefix,
             back: State::Body,
         }
@@ -148,7 +158,7 @@ impl<'a> Components<'a> {
             return false;
         }
         let rest = self.rest();
-        !rest.is_empty() && rest[0] == b'.' && (rest.len() == 1 || rest[1] == b'/')
+        !rest.is_empty() && rest[0] == b'.' && (rest.len() == 1 || is_sep_byte(rest[1]))
     }
 
     /// Bytes before the body: the root and a leading `.`, while the
@@ -175,7 +185,7 @@ impl<'a> Components<'a> {
     fn parse_next(&self) -> (usize, Option<Piece>, usize) {
         let rest = self.rest();
         let mut i = 0;
-        while i < rest.len() && rest[i] != b'/' {
+        while i < rest.len() && !is_sep_byte(rest[i]) {
             i += 1;
         }
         let extra = if i < rest.len() { 1 } else { 0 };
@@ -187,7 +197,7 @@ impl<'a> Components<'a> {
     fn parse_next_back(&self) -> (usize, Option<Piece>, usize) {
         let lo = self.start + self.len_before_body();
         let mut i = self.end;
-        while i > lo && self.path[i - 1] != b'/' {
+        while i > lo && !is_sep_byte(self.path[i - 1]) {
             i -= 1;
         }
         let extra = if i > lo { 1 } else { 0 };
@@ -273,7 +283,7 @@ impl<'a> Components<'a> {
     /// The length of the body component that starts at `at`.
     fn comp_len(&self, at: usize) -> usize {
         let mut i = at;
-        while i < self.path.len() && self.path[i] != b'/' {
+        while i < self.path.len() && !is_sep_byte(self.path[i]) {
             i += 1;
         }
         i - at
@@ -605,9 +615,33 @@ impl Path {
         PathBuf { inner: self.inner.to_os_string() }
     }
 
-    /// True for a path with a root (it starts with `/`).
+    /// True when the path does not depend on the current directory.
+    /// Unix: it starts with `/`. Windows: a drive root (`C:\`) or a UNC
+    /// share (`\\server\share`); a root with no prefix (`\foo`, `/foo`) is not.
     pub fn is_absolute(&self) -> bool {
-        self.has_root()
+        let bytes = self.bytes();
+        if !cfg!(windows) {
+            return self.has_root();
+        }
+        let pref = disk_prefix_len(bytes);
+        if pref == 2 {
+            return bytes.len() > 2 && is_sep_byte(bytes[2]);
+        }
+        if bytes.len() < 5 || !is_sep_byte(bytes[0]) || !is_sep_byte(bytes[1]) {
+            return false;
+        }
+        let mut i = 2;
+        while i < bytes.len() && !is_sep_byte(bytes[i]) {
+            i += 1;
+        }
+        if i == 2 || i >= bytes.len() {
+            return false;
+        }
+        let mut j = i + 1;
+        while j < bytes.len() && !is_sep_byte(bytes[j]) {
+            j += 1;
+        }
+        j > i + 1
     }
 
     /// True for a path without a root.
@@ -850,11 +884,17 @@ impl PathBuf {
     pub fn push<P: AsRef<Path>>(&mut self, path: P) {
         let path = path.as_ref();
         let bytes = self.inner.as_encoded_bytes();
-        let need_sep = !bytes.is_empty() && bytes[bytes.len() - 1] != b'/';
+        let mut need_sep = !bytes.is_empty() && !is_sep_byte(*bytes.last().unwrap());
+        // `C:` plus a relative path stays `C:foo`, with no separator.
+        if disk_prefix_len(bytes) == bytes.len() {
+            need_sep = false;
+        }
         if path.is_absolute() {
             self.inner.clear();
+        } else if cfg!(windows) && path.has_root() {
+            self.inner.truncate(disk_prefix_len(bytes));
         } else if need_sep {
-            self.inner.push("/");
+            self.inner.push(MAIN_SEPARATOR_STR);
         }
         self.inner.push(path.as_os_str());
     }
@@ -884,7 +924,7 @@ impl PathBuf {
     pub fn set_extension<S: AsRef<OsStr>>(&mut self, extension: S) -> bool {
         let extension = extension.as_ref();
         for &b in extension.as_encoded_bytes() {
-            if b == b'/' {
+            if is_sep_byte(b) {
                 panic!("extension cannot contain path separators: {:?}", extension); //@ std/src/path.rs:385:13
             }
         }

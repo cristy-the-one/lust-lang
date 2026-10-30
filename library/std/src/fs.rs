@@ -17,7 +17,10 @@ use core::fmt;
 pub(crate) fn status(code: i32) -> io::Result<()> {
     match code {
         0 => Ok(()),
-        -1 => Err(io::Error::simple_message(io::ErrorKind::InvalidInput, "file name contained an unexpected NUL byte")),
+        -1 => Err(io::Error::simple_message(
+            io::ErrorKind::InvalidInput,
+            if cfg!(windows) { "strings passed to WinAPI cannot contain NULs" } else { "file name contained an unexpected NUL byte" },
+        )),
         -2 => Err(io::Error::simple_message(io::ErrorKind::WriteZero, "failed to write whole buffer")),
         code => Err(io::Error::from_raw_os_error(code)),
     }
@@ -596,10 +599,13 @@ impl fmt::Debug for FileType {
     }
 }
 
-/// The permission bits of a file.
+/// The permission bits of a file. On Windows `attrs` is the raw
+/// `dwFileAttributes` (`FILE_ATTRIBUTE_ARCHIVE` is 32).
 #[derive(Clone, PartialEq, Eq)]
 pub struct Permissions {
     pub(crate) mode: u64,
+    #[cfg(windows)]
+    attrs: u32,
 }
 
 impl Permissions {
@@ -609,14 +615,20 @@ impl Permissions {
     }
 }
 
+/// Unix: `Permissions(FilePermissions { mode: 0o100644 (-rw-r--r--) })`.
+/// Windows: `Permissions(FilePermissions { attrs: 32 })`.
+#[cfg(not(windows))]
 impl fmt::Debug for Permissions {
-    /// As std: `Permissions(FilePermissions { mode: 0o100644 (-rw-r--r--) })`.
-    /// std's `Mode` Debug: the octal value, then the `ls` form only for a
-    /// directory, block or char device, symlink, fifo, or regular file;
-    /// the sticky bit shows (`t`, `T`) only on a directory.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mode = PermModeText(mode_text(self.mode));
         f.debug_tuple("Permissions").field(&FilePerm { mode }).finish()
+    }
+}
+
+#[cfg(windows)]
+impl fmt::Debug for Permissions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Permissions").field(&FilePerm { attrs: self.attrs }).finish()
     }
 }
 
@@ -671,12 +683,23 @@ impl fmt::Debug for PermModeText {
 /// The inner value of `Permissions` debug output, built with
 /// `debug_struct` so the alternate (`{:#?}`) form expands as std's does.
 struct FilePerm {
+    #[cfg(not(windows))]
     mode: PermModeText,
+    #[cfg(windows)]
+    attrs: u32,
 }
 
+#[cfg(not(windows))]
 impl fmt::Debug for FilePerm {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FilePermissions").field("mode", &self.mode).finish()
+    }
+}
+
+#[cfg(windows)]
+impl fmt::Debug for FilePerm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FilePermissions").field("attrs", &self.attrs).finish()
     }
 }
 
@@ -734,7 +757,11 @@ impl Metadata {
 
     /// The permissions.
     pub fn permissions(&self) -> Permissions {
-        Permissions { mode: self.mode }
+        Permissions {
+            mode: self.mode,
+            #[cfg(windows)]
+            attrs: self.uid as u32,
+        }
     }
 
     /// The birth time fields, for the std splice's `created()`

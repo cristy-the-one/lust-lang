@@ -358,7 +358,7 @@ pass_case() {
   rs=$(cat rustc.rs)
   run_to "./$name.lust" >"$name.lust.out" 2>"$name.lust.stderr"; ls=$?
   if [ $rs -ne $ls ]; then
-    report bad "$name" "exit status rustc=$rs lust=$ls"
+    report bad "$name" "exit status rustc=$rs lust=$ls: $(head -3 "$name.lust.stderr" | tr '\n' ' ')"
   elif ! cmp -s rustc.out <(mask_stdout "$f" "$name.lust.out"); then
     report bad "$name" "stdout differs:"; diff rustc.out <(mask_stdout "$f" "$name.lust.out") | head -10
   elif ! cmp -s <(mask_stderr rustc.stderr | no_frames) <(lust_stderr "$f" "$name.lust.stderr" | no_frames); then

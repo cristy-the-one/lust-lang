@@ -1159,7 +1159,11 @@ fn compute(
                     BuiltinTy::Iter(IterKind::CharIndices) => vec![usize_l(), ptr_layout(), raw_ptr_layout()],
                     // { buf: NonNull<T>, cap, ptr: NonNull<T>, end }.
                     BuiltinTy::Iter(IterKind::VecIntoIter) => vec![ptr_layout(), usize_l(), ptr_layout(), raw_ptr_layout()],
-                    BuiltinTy::ExitCode => return Ok(int_layout(IntTy::U8)),
+                    // Unix `ExitCode` is a `u8`. Windows stores a `u32`
+                    // (`ExitCode(ExitCode(n))`, size 4, align 4).
+                    BuiltinTy::ExitCode => {
+                        return Ok(int_layout(if cfg!(windows) { IntTy::U32 } else { IntTy::U8 }));
+                    }
                     _ => return Err(()),
                 };
                 let mut l = struct_layout(&fields, Repr::default())?;

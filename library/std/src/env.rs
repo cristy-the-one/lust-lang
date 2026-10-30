@@ -160,7 +160,10 @@ pub fn args_os() -> ArgsOs {
 
 /// The error of a path argument that holds a NUL byte.
 fn nul_error() -> io::Error {
-    io::Error::simple_message(io::ErrorKind::InvalidInput, "file name contained an unexpected NUL byte")
+    io::Error::simple_message(
+        io::ErrorKind::InvalidInput,
+        if cfg!(windows) { "strings passed to WinAPI cannot contain NULs" } else { "file name contained an unexpected NUL byte" },
+    )
 }
 
 /// The current working directory.

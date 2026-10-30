@@ -194,7 +194,7 @@ static int32_t lust_win_open(const uint8_t *p, uint64_t len, int32_t flags) {
     else if (flags & 4) disp = 4; /* OPEN_ALWAYS */
     else if (flags & 8) disp = 5; /* TRUNCATE_EXISTING */
     else disp = 3; /* OPEN_EXISTING */
-    HANDLE h = CreateFileW(w, access, 7, 0, disp, 0x200000 /* BACKUP_SEMANTICS */, 0);
+    HANDLE h = CreateFileW(w, access, 7, 0, disp, 0x02000000u /* FILE_FLAG_BACKUP_SEMANTICS */, 0);
     free(w);
     if (h == INVALID_HANDLE_VALUE) return -(int32_t)GetLastError();
     return lust_win_fd_new(h, (flags & 16) != 0);
@@ -324,14 +324,122 @@ static void lust_win_quote_arg(lust_Vec *cmd, const WCHAR *a, int n) {
     }
 }
 
+/* Rust's `resolve_exe`: a bare name is looked up as `name.exe` in the
+   executable's directory, System32, the Windows directory, then PATH.
+   A path is used as given, after trying a `.exe` suffix when it has none. */
+static int lust_win_exists(const WCHAR *path) {
+    return GetFileAttributesW(path) != 0xFFFFFFFFu;
+}
+static WCHAR *lust_win_join3(const WCHAR *dir, const WCHAR *name, const WCHAR *ext) {
+    size_t nd = 0, nn = 0, ne = 0;
+    while (dir[nd]) nd++;
+    while (name[nn]) nn++;
+    while (ext[ne]) ne++;
+    int sep = nd && dir[nd - 1] != L'\\' && dir[nd - 1] != L'/';
+    WCHAR *o = malloc(sizeof(WCHAR) * (nd + sep + nn + ne + 1));
+    if (!o) lust_oom();
+    size_t k = 0;
+    for (size_t i = 0; i < nd; i++) o[k++] = dir[i];
+    if (sep) o[k++] = L'\\';
+    for (size_t i = 0; i < nn; i++) o[k++] = name[i];
+    for (size_t i = 0; i < ne; i++) o[k++] = ext[i];
+    o[k] = 0;
+    return o;
+}
+static WCHAR *lust_win_dup(const WCHAR *s) {
+    size_t n = 0;
+    while (s[n]) n++;
+    WCHAR *o = malloc(sizeof(WCHAR) * (n + 1));
+    if (!o) lust_oom();
+    for (size_t i = 0; i <= n; i++) o[i] = s[i];
+    return o;
+}
+static int lust_win_ends_exe(const WCHAR *s) {
+    size_t n = 0;
+    while (s[n]) n++;
+    if (n < 4) return 0;
+    const WCHAR *e = s + n - 4;
+    return e[0] == L'.' && (e[1] == L'e' || e[1] == L'E') && (e[2] == L'x' || e[2] == L'X') && (e[3] == L'e' || e[3] == L'E');
+}
+static int lust_win_has_dot(const WCHAR *s) {
+    for (; *s; s++) if (*s == L'.') return 1;
+    return 0;
+}
+static int lust_win_is_bare(const WCHAR *s) {
+    for (; *s; s++) if (*s == L'\\' || *s == L'/' || *s == L':') return 0;
+    return 1;
+}
+static WCHAR *lust_win_try_dir(const WCHAR *dir, const WCHAR *name, int add_exe) {
+    const WCHAR *ext = add_exe ? L".exe" : L"";
+    WCHAR *p = lust_win_join3(dir, name, ext);
+    if (lust_win_exists(p)) return p;
+    free(p);
+    return 0;
+}
+static WCHAR *lust_win_resolve_prog(const WCHAR *prog) {
+    if (!lust_win_is_bare(prog)) {
+        if (lust_win_ends_exe(prog)) return lust_win_dup(prog);
+        WCHAR *with = lust_win_join3(L"", prog, L".exe");
+        if (lust_win_exists(with)) return with;
+        free(with);
+        return lust_win_dup(prog);
+    }
+    int add_exe = !lust_win_has_dot(prog);
+    WCHAR exe[1024];
+    DWORD n = GetModuleFileNameW(0, exe, 1024);
+    if (n && n < 1024) {
+        WCHAR *slash = exe;
+        for (WCHAR *p = exe; *p; p++) if (*p == L'\\' || *p == L'/') slash = p;
+        *slash = 0;
+        WCHAR *hit = lust_win_try_dir(exe, prog, add_exe);
+        if (hit) return hit;
+    }
+    WCHAR sys[512];
+    n = GetSystemDirectoryW(sys, 512);
+    if (n && n < 512) {
+        WCHAR *hit = lust_win_try_dir(sys, prog, add_exe);
+        if (hit) return hit;
+    }
+    n = GetWindowsDirectoryW(sys, 512);
+    if (n && n < 512) {
+        WCHAR *hit = lust_win_try_dir(sys, prog, add_exe);
+        if (hit) return hit;
+    }
+    DWORD need = GetEnvironmentVariableW(L"PATH", 0, 0);
+    if (need) {
+        WCHAR *path = malloc(sizeof(WCHAR) * need);
+        if (!path) lust_oom();
+        if (GetEnvironmentVariableW(L"PATH", path, need)) {
+            WCHAR *cur = path;
+            while (*cur) {
+                WCHAR *semi = cur;
+                while (*semi && *semi != L';') semi++;
+                WCHAR saved = *semi;
+                *semi = 0;
+                if (cur[0]) {
+                    WCHAR *hit = lust_win_try_dir(cur, prog, add_exe);
+                    if (hit) { free(path); return hit; }
+                }
+                if (!saved) break;
+                cur = semi + 1;
+            }
+        }
+        free(path);
+    }
+    return 0;
+}
+
 int32_t lust_sys_proc_spawn(const uint8_t *prog, uint64_t proglen, const uint8_t *args, uint64_t argslen,
                             const uint8_t *env, uint64_t envlen, const uint8_t *cwd, uint64_t cwdlen, uint32_t stdio,
                             const uint8_t *fds, uint64_t fdslen, lust_Vec *out) {
     if (argslen == 0 || envlen == 0) return 87;
     /* Command line: the program, then each packed arg, quoted. */
     lust_Vec cmd = {0, 0, 0};
-    WCHAR *pw = lust_sys_wide(prog, proglen);
-    if (!pw) return -1;
+    WCHAR *given = lust_sys_wide(prog, proglen);
+    if (!given) return -1;
+    WCHAR *pw = lust_win_resolve_prog(given);
+    free(given);
+    if (!pw) return 2; /* ERROR_FILE_NOT_FOUND */
     int pn = 0;
     while (pw[pn]) pn++;
     lust_win_quote_arg(&cmd, pw, pn);

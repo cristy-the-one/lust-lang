@@ -122,7 +122,7 @@ pub enum CTy {
     /// A `core::fmt` struct (W-STD-B): the runtime's `lust_Formatter`
     /// or Debug builder (src/runtime/fmt.h).
     Fmt(crate::ty::fmt::FmtTy),
-    /// A `process::ExitCode`: its status byte as a `uint8_t`.
+    /// A `process::ExitCode`: a `uint8_t` on Unix, a `uint32_t` on Windows.
     ExitCode,
     /// A `Box<[T]>`: the slice's fat `{ptr, len}` struct, owning its
     /// elements and buffer; a deref is the slice place itself.
@@ -589,7 +589,7 @@ pub fn ctype(t: &CTy) -> String {
         CTy::Adt(a) => names::adt(*a),
         CTy::Option(_) => format!("O_{}", mangle(t)),
         CTy::Result(..) => format!("R_{}", mangle(t)),
-        CTy::ExitCode => "uint8_t".into(),
+        CTy::ExitCode => if cfg!(windows) { "uint32_t".into() } else { "uint8_t".into() },
         CTy::AccessError => "lust_Unit".into(),
         CTy::BoxSlice(e) => ctype(&CTy::Slice(e.clone())),
         CTy::Own(_, x) | CTy::WeakOwn(_, x) => ctype(x),
@@ -1610,7 +1610,7 @@ fn c_layout_walk(p: &Program, t: &CTy) -> Option<Layout> {
                     HashTy::DrainPairs | HashTy::DrainKeys => Some(plain_layout(112, 8)),
                 }
             }
-            CTy::ExitCode => Some(plain_layout(1, 1)),
+            CTy::ExitCode => Some(if cfg!(windows) { plain_layout(4, 4) } else { plain_layout(1, 1) }),
             // A lock: its words, the poison flag, then the value (no
             // niche: `UnsafeCell`). `PoisonError<T>` is laid out as `T`.
             CTy::Sync(k, e) if k.is_cell_struct() => {
@@ -1945,7 +1945,7 @@ fn c_size_align_legacy(p: &Program, t: &CTy) -> (u64, u64) {
                 (align_up(align_up(8, ea) + es, align), align)
             }
             CTy::Fmt(k) => fmt_size_align(*k),
-            CTy::ExitCode => (1, 1),
+            CTy::ExitCode => if cfg!(windows) { (4, 4) } else { (1, 1) },
             CTy::Sync(k, e) if k.is_cell_struct() => {
                 let (es, ea) = go(p, e, seen);
                 let at = sync::cell_words(*k).iter().map(|i| i.bits() as u64 / 8).sum::<u64>();
@@ -6503,7 +6503,7 @@ impl FnGen<'_, '_> {
                 if b == B::RcStrongCount { format!("{h}[0]") } else { format!("({h}[1] - 1)") }
             }
             B::RcStrongCount => format!("(*{})->strong", vals[0]),
-            B::ExitCodeFrom => format!("((uint8_t){})", vals[0]),
+            B::ExitCodeFrom => format!("(({}){})", if cfg!(windows) { "uint32_t" } else { "uint8_t" }, vals[0]),
             // The slice over the buffer, which is never freed.
             B::VecLeak => {
                 let CTy::Vec(e) = &tys[0] else { unreachable!("leak on a Vec") };

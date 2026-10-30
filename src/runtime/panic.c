@@ -1121,7 +1121,65 @@ static void lust_stack_guard_init(void) {
     sigaction(SIGBUS, &sa, NULL);
 }
 #elif defined(LUST_IMPL)
+#ifdef _WIN32
+/* Windows has no SIGSEGV guard page we can catch with sigaltstack.
+   A vectored handler sees STATUS_STACK_OVERFLOW, prints Rust's line,
+   and lets the default action terminate so the process status stays
+   the one bash already reports for that exception. */
+static LONG CALLBACK lust_win_overflow(EXCEPTION_POINTERS *ep) {
+    if (!ep || !ep->ExceptionRecord) return 0; /* EXCEPTION_CONTINUE_SEARCH */
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code == 0xC0000005u) {
+        /* An access violation is a lust bug. One line on stderr so the
+           difftest failure names the faulting address. */
+        char msg[80];
+        uintptr_t a = ep->ExceptionRecord->ExceptionInformation && ep->ExceptionRecord->NumberParameters > 1
+            ? (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1] : 0;
+        int m = 0;
+        const char *head = "access violation at 0x";
+        while (*head) msg[m++] = *head++;
+        for (int s = (int)(sizeof(uintptr_t) * 2 - 1); s >= 0; s--) msg[m++] = "0123456789abcdef"[(a >> (s * 4)) & 0xf];
+        msg[m++] = '\n';
+        HANDLE err = GetStdHandle((DWORD)-12);
+        DWORD wrote = 0;
+        WriteFile(err, msg, (DWORD)m, &wrote, 0);
+        return 0;
+    }
+    if (code != 0xC00000FDu) return 0;
+    const uint8_t *name = (const uint8_t *)"main";
+    uint64_t name_len = 4;
+    const uint8_t *got;
+    uint64_t got_len;
+    lust_cur_thread_name(&got, &got_len);
+    if (got && got_len && !(got_len == 9 && got[0] == '<')) {
+        name = got;
+        name_len = got_len;
+    }
+    char msg[160];
+    int m = 0;
+    const char *head = "\nthread '", *mid = "' (", *tail = ") has overflowed its stack\n";
+    while (*head && m < (int)sizeof msg - 1) msg[m++] = *head++;
+    for (uint64_t i = 0; i < name_len && m < (int)sizeof msg - 1; i++) msg[m++] = (char)name[i];
+    while (*mid && m < (int)sizeof msg - 1) msg[m++] = *mid++;
+    char tid[24];
+    int n = 0;
+    unsigned long t = (unsigned long)GetCurrentThreadId();
+    do { tid[n++] = (char)('0' + t % 10); t /= 10; } while (t && n < (int)sizeof tid);
+    while (n && m < (int)sizeof msg - 1) msg[m++] = tid[--n];
+    while (*tail && m < (int)sizeof msg - 1) msg[m++] = *tail++;
+    HANDLE err = GetStdHandle((DWORD)-12);
+    DWORD wrote = 0;
+    WriteFile(err, msg, (DWORD)m, &wrote, 0);
+    return 0;
+}
+static void lust_stack_guard_init(void) {
+    typedef PVOID (WINAPI *add_fn)(ULONG, LONG (CALLBACK *)(EXCEPTION_POINTERS *));
+    add_fn add = (add_fn)GetProcAddress(GetModuleHandleA("kernel32.dll"), "AddVectoredExceptionHandler");
+    if (add) add(1, lust_win_overflow);
+}
+#else
 static void lust_stack_guard_init(void) {}
+#endif
 static void lust_thread_guard_init(uintptr_t *lo, uintptr_t *hi, void **alt) { (void)lo; (void)hi; (void)alt; }
 static void lust_thread_guard_fini(void *alt) { (void)alt; }
 #endif

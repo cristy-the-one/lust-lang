@@ -39,7 +39,9 @@ void lust_sys_os_error_text(int32_t code, lust_String *out) {
     WCHAR buf[512];
     DWORD n = FormatMessageW(0x1000 /* FROM_SYSTEM */ | 0x200 /* IGNORE_INSERTS */, 0, (DWORD)code, 0x409, buf, 512, 0);
     if (n == 0) n = FormatMessageW(0x1000 | 0x200, 0, (DWORD)code, 0, buf, 512, 0);
-    while (n > 0 && (buf[n - 1] == L'\r' || buf[n - 1] == L'\n' || buf[n - 1] == L'.')) n--;
+    /* rustc keeps the trailing period FormatMessage puts on system
+       messages and drops only the CR/LF. */
+    while (n > 0 && (buf[n - 1] == L'\r' || buf[n - 1] == L'\n')) n--;
     if (n == 0) {
         lust_string_push_cstr(out, "Unknown error");
         return;
@@ -256,7 +258,9 @@ int32_t lust_sys_readlink(const uint8_t *p, uint64_t len, lust_Vec *out) {
     }
     WCHAR *w = lust_sys_wide(p, len);
     if (!w) return -1;
-    HANDLE h = CreateFileW(w, 0, 7, 0, 3 /* OPEN_EXISTING */, 0x200000 /* BACKUP_SEMANTICS */ | 0x2000000 /* OPEN_REPARSE_POINT */, 0);
+    /* FILE_FLAG_BACKUP_SEMANTICS opens directories; OPEN_REPARSE_POINT
+       reads the link itself. */
+    HANDLE h = CreateFileW(w, 0, 7, 0, 3 /* OPEN_EXISTING */, 0x02000000u | 0x00200000u, 0);
     free(w);
     if (h == INVALID_HANDLE_VALUE) return (int32_t)GetLastError();
     int32_t r = lust_sys_final_path(h, out);
@@ -267,9 +271,21 @@ int32_t lust_sys_readlink(const uint8_t *p, uint64_t len, lust_Vec *out) {
 int32_t lust_sys_read_file(const uint8_t *p, uint64_t len, lust_Vec *out) {
     WCHAR *w = lust_sys_wide(p, len);
     if (!w) return -1;
-    HANDLE h = CreateFileW(w, 0x80000000u /* GENERIC_READ */, 7, 0, 3, 0x200000, 0);
+    HANDLE h = CreateFileW(w, 0x80000000u /* GENERIC_READ */, 7, 0, 3, 0x02000000u /* FILE_FLAG_BACKUP_SEMANTICS */, 0);
     free(w);
     if (h == INVALID_HANDLE_VALUE) return (int32_t)GetLastError();
+    /* std's `fs::read` reserves the size the file reports, so the Vec's
+       capacity equals its length. */
+    DWORD hi = 0;
+    DWORD lo = GetFileSize(h, &hi);
+    if (!(lo == 0xFFFFFFFFu && GetLastError() != 0)) {
+        uint64_t n = ((uint64_t)hi << 32) | lo;
+        if (n) {
+            out->ptr = lust_alloc(n, 1);
+            out->cap = n;
+            out->len = 0;
+        }
+    }
     uint8_t buf[65536];
     for (;;) {
         DWORD n = 0;
@@ -284,7 +300,7 @@ int32_t lust_sys_read_file(const uint8_t *p, uint64_t len, lust_Vec *out) {
 int32_t lust_sys_write_file(const uint8_t *p, uint64_t len, const uint8_t *d, uint64_t dlen) {
     WCHAR *w = lust_sys_wide(p, len);
     if (!w) return -1;
-    HANDLE h = CreateFileW(w, 0x40000000u /* GENERIC_WRITE */, 0, 0, 2 /* CREATE_ALWAYS */, 0x200000, 0);
+    HANDLE h = CreateFileW(w, 0x40000000u /* GENERIC_WRITE */, 0, 0, 2 /* CREATE_ALWAYS */, 0x02000000u /* FILE_FLAG_BACKUP_SEMANTICS */, 0);
     free(w);
     if (h == INVALID_HANDLE_VALUE) return (int32_t)GetLastError();
     while (dlen > 0) {
@@ -370,8 +386,8 @@ void lust_sys_stat_fields(lust_Vec *out, DWORD attrs, uint64_t size, FILETIME ct
 int32_t lust_sys_stat(const uint8_t *p, uint64_t len, uint8_t follow, lust_Vec *out) {
     WCHAR *w = lust_sys_wide(p, len);
     if (!w) return -1;
-    DWORD flags = 0x200000; /* BACKUP_SEMANTICS: dirs open too */
-    if (!follow) flags |= 0x2000000; /* OPEN_REPARSE_POINT */
+    DWORD flags = 0x02000000u; /* FILE_FLAG_BACKUP_SEMANTICS: directories open too */
+    if (!follow) flags |= 0x00200000u; /* FILE_FLAG_OPEN_REPARSE_POINT */
     HANDLE h = CreateFileW(w, 0, 7, 0, 3, flags, 0);
     free(w);
     if (h == INVALID_HANDLE_VALUE) return (int32_t)GetLastError();
@@ -387,7 +403,7 @@ int32_t lust_sys_stat(const uint8_t *p, uint64_t len, uint8_t follow, lust_Vec *
 int32_t lust_sys_realpath(const uint8_t *p, uint64_t len, lust_Vec *out) {
     WCHAR *w = lust_sys_wide(p, len);
     if (!w) return -1;
-    HANDLE h = CreateFileW(w, 0, 7, 0, 3, 0x200000, 0);
+    HANDLE h = CreateFileW(w, 0, 7, 0, 3, 0x02000000u /* FILE_FLAG_BACKUP_SEMANTICS */, 0);
     free(w);
     if (h == INVALID_HANDLE_VALUE) return (int32_t)GetLastError();
     int32_t r = lust_sys_final_path(h, out);

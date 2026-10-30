@@ -412,7 +412,11 @@ pub mod unix {
                 self.mode = mode as u64;
             }
             fn from_mode(mode: u32) -> crate::fs::Permissions {
-                crate::fs::Permissions { mode: mode as u64 }
+                crate::fs::Permissions {
+                    mode: mode as u64,
+                    #[cfg(windows)]
+                    attrs: 0,
+                }
             }
         }
 

@@ -947,6 +947,7 @@ fn compile_guarded(entry: &mut Entry, req: &Request, jobs: &mut GuardJobs) -> Re
             eprintln!("lust daemon: session fn count mismatch for {}; recomputed in a fresh session", req.file.display());
             compile_fresh(entry, req).0
         }
+        Ok(r) if !guard_enabled() => r,
         Ok(r) => {
             // An error answer: hand it out now, verify it in the background.
             let inputs = session_inputs(&entry.session, req);
@@ -974,6 +975,17 @@ fn compile_guarded(entry: &mut Entry, req: &Request, jobs: &mut GuardJobs) -> Re
             r
         }
     }
+}
+
+/// Whether an error answer is re-checked in a fresh session in the background
+/// (`LUST_GUARD`, default on). `LUST_GUARD=0` turns the guard off for batch
+/// loops that judge every accepted candidate with another oracle anyway (for
+/// example a later rustc build): with a high reject rate the background fresh
+/// compiles compete with the next checks for CPU. Read once, when the daemon
+/// starts, from the environment of the client that started it.
+fn guard_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("LUST_GUARD").as_deref().map(str::trim), Ok("0") | Ok("off") | Ok("false")))
 }
 
 /// How many warm sessions the daemon keeps (`LUST_DAEMON_SESSIONS`,

@@ -159,7 +159,7 @@ pub const STD_MODULES: &[StdModule] = &[
         krate: ShippedCrate::Alloc,
         paths: &[("alloc", "collections"), ("std", "collections")],
         full: false,
-        triggers: &["BTreeMap", "BTreeSet", "VecDeque", "btree_map", "btree_set", "vec_deque"],
+        triggers: &["BTreeMap", "BTreeSet", "VecDeque", "BinaryHeap", "btree_map", "btree_set", "vec_deque", "binary_heap"],
     },
     StdModule {
         name: "__lust_core_iter",

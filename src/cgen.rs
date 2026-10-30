@@ -2316,17 +2316,18 @@ fn overaligned_local(out: &mut String, i: usize, ct: &str, decl: &str, align: u6
 }
 
 /// Windows dev C cannot put a value aligned past 16 in tcc's frame: the
-/// slot is only 16-aligned, and the mis-sized frame is what
-/// `overaligned_locals` / `overaligned_by_value` die on (exit 127, no
-/// stderr). Release C compilers realign the frame themselves.
+/// slot is only 16-aligned. Release C compilers realign the frame
+/// themselves. The block is not registered with tcc's cleanup attribute:
+/// that attribute fail-fasts under PE (`overaligned_local`).
 fn win_heap_align(align: u64) -> bool {
     cfg!(windows) && align > 16 && !names::release()
 }
 
 /// Declaration of a heap temporary `name` (the value is `(*name_p)`).
+/// The block is left to the process, same as an over-aligned local.
 fn win_heap_slot(name: &str, ct: &str, align: u64) -> String {
     format!(
-        "void *{name}_b __attribute__((cleanup(lust_overaligned_free))) = lust_overaligned_alloc(sizeof({ct}), {align}ull); {ct} *{name}_p = {name}_b"
+        "void *{name}_b = lust_overaligned_alloc(sizeof({ct}), {align}ull); {ct} *{name}_p = {name}_b"
     )
 }
 

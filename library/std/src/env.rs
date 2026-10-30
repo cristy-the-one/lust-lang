@@ -185,8 +185,28 @@ pub fn set_current_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
     }
 }
 
-/// The directory for temporary files: `TMPDIR`, else `/tmp`.
+/// The directory for temporary files.
+/// Unix: `TMPDIR`, else `/tmp`.
+/// Windows: `GetTempPath` — `TMP`, then `TEMP`, then `USERPROFILE`,
+/// then the Windows directory — made absolute, with a trailing separator.
 pub fn temp_dir() -> PathBuf {
+    if cfg!(windows) {
+        let raw = var_os("TMP").or_else(|| var_os("TEMP")).or_else(|| var_os("USERPROFILE"));
+        let mut path = match raw {
+            Some(dir) => PathBuf::from_os_string(dir),
+            None => PathBuf::from_os_string(OsString::__from_vec(b"C:\\Windows".to_vec())),
+        };
+        if !path.is_absolute() {
+            if let Ok(cwd) = current_dir() {
+                path = cwd.join(path);
+            }
+        }
+        let mut bytes = path.into_os_string().into_encoded_bytes();
+        if bytes.last() != Some(&b'\\') && bytes.last() != Some(&b'/') {
+            bytes.push(b'\\');
+        }
+        return PathBuf::from_os_string(OsString::__from_vec(bytes));
+    }
     match var_os("TMPDIR") {
         Some(dir) => PathBuf::from_os_string(dir),
         None => PathBuf::from_os_string(OsString::__from_vec(b"/tmp".to_vec())),

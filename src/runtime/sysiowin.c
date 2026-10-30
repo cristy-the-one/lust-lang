@@ -282,7 +282,9 @@ int64_t lust_sys_proc_wait(uint32_t pid, uint8_t block) {
     if (r != 0) return -(int64_t)GetLastError();
     DWORD code = 0;
     GetExitCodeProcess(h, &code);
-    return (int64_t)(((uint64_t)code & 0xff) << 8);
+    /* The process exit code itself. A Unix wait status only has 8 bits
+       for it, so `kill -TERM` under Git bash (exit 3840) came back as 0. */
+    return (int64_t)code;
 }
 
 int32_t lust_sys_proc_kill(uint32_t pid) {

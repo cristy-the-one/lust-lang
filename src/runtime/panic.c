@@ -16,6 +16,19 @@
 #include <sys/syscall.h>
 #endif
 
+#ifdef _WIN32
+/* rustc 1.99 abort_internal: __fastfail(FAST_FAIL_FATAL_APP_EXIT).
+   msvcrt abort() is exit code 3. Git bash reports this fail-fast
+   (STATUS_STACK_BUFFER_OVERRUN) as 127, which is rustc's status for a
+   nested panic, a thread-local drop panic, and an allocation failure.
+   An uncaught unwind panic still returns 101 from main; it does not
+   come through here. */
+__attribute__((noreturn)) void lust_fast_abort(void) {
+    __asm__ __volatile__("movl $7, %ecx\n\tint $0x29");
+    for (;;) {}
+}
+#endif
+
 /* The OS thread id Rust's default hook prints (`thread::current_os_id`). */
 static unsigned long long lust_os_tid(void) {
 #ifdef _WIN32

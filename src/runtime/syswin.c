@@ -43,7 +43,11 @@ void lust_sys_os_error_text(int32_t code, lust_String *out) {
        messages and drops only the CR/LF. */
     while (n > 0 && (buf[n - 1] == L'\r' || buf[n - 1] == L'\n')) n--;
     if (n == 0) {
-        lust_string_push_cstr(out, "Unknown error");
+        /* rustc's os::error_string when FormatMessageW fails. */
+        DWORD fe = GetLastError();
+        char b[96];
+        snprintf(b, sizeof b, "OS Error %d (FormatMessageW() returned error %lu)", (int)code, (unsigned long)fe);
+        lust_string_push_cstr(out, b);
         return;
     }
     int need = WideCharToMultiByte(65001 /* UTF-8 */, 0, buf, (int)n, 0, 0, 0, 0);
@@ -271,7 +275,10 @@ int32_t lust_sys_readlink(const uint8_t *p, uint64_t len, lust_Vec *out) {
 int32_t lust_sys_read_file(const uint8_t *p, uint64_t len, lust_Vec *out) {
     WCHAR *w = lust_sys_wide(p, len);
     if (!w) return -1;
-    HANDLE h = CreateFileW(w, 0x80000000u /* GENERIC_READ */, 7, 0, 3, 0x02000000u /* FILE_FLAG_BACKUP_SEMANTICS */, 0);
+    /* No backup semantics: opening a directory for reading fails with
+       access denied, as File::open does. Backup semantics would open it
+       and ReadFile would then fail with "Incorrect function". */
+    HANDLE h = CreateFileW(w, 0x80000000u /* GENERIC_READ */, 7, 0, 3, 0, 0);
     free(w);
     if (h == INVALID_HANDLE_VALUE) return (int32_t)GetLastError();
     /* std's `fs::read` reserves the size the file reports, so the Vec's
@@ -446,10 +453,17 @@ int32_t lust_sys_remove_dir_all(const uint8_t *p, uint64_t len) {
        A simple recursive walk here: delete children, then the dir. */
     DWORD at = GetFileAttributesW(w);
     if (at == 0xFFFFFFFFu) { int32_t e = (int32_t)GetLastError(); free(w); return e; }
-    if (!(at & 0x10) || (at & 0x400)) {
+    if (!(at & 0x10)) {
+        /* A file is not a directory. std returns ERROR_DIRECTORY and
+           leaves the file in place. Deleting it made a later is_file false. */
+        free(w);
+        return 267;
+    }
+    if (at & 0x400) {
+        /* A directory reparse point: remove the link, not the target. */
         int r = DeleteFileW(w) ? 0 : (int)GetLastError();
         free(w);
-        return r == 0 && (at & 0x400) ? 0 : (at & 0x10) ? r : 267 /* ENOTDIR as std maps it */;
+        return r;
     }
     size_t wl = 0;
     while (w[wl]) wl++;

@@ -306,3 +306,11 @@ const char *lust_file;
 const uint32_t *lust_fn_line;
 #endif
 
+/* rustc's Windows abort is __fastfail, not msvcrt abort() (exit 3).
+   The macro is after <windows.h>, so it does not rewrite the headers
+   included above. Linux keeps SIGABRT. */
+#ifdef _WIN32
+__attribute__((noreturn)) void lust_fast_abort(void);
+#define abort lust_fast_abort
+#endif
+

@@ -107,8 +107,8 @@ fn signal_name(sig: i32) -> Option<&'static str> {
     })
 }
 
-/// The exit status of a finished child process: the raw wait status
-/// the OS reported.
+/// The exit status of a finished child process. Unix: the raw wait
+/// status. Windows: the process exit code from `GetExitCodeProcess`.
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub struct ExitStatus {
     raw: i32,
@@ -125,12 +125,19 @@ impl ExitStatus {
     }
 
     /// The exit code, when the process exited normally.
+    /// Windows stores the process exit code and always returns it.
+    #[cfg(not(target_os = "windows"))]
     pub fn code(&self) -> Option<i32> {
         if self.raw & 0x7f == 0 {
             Some((self.raw >> 8) & 0xff)
         } else {
             None
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn code(&self) -> Option<i32> {
+        Some(self.raw)
     }
 
     /// The raw wait status (`ExitStatusExt::into_raw`).
@@ -153,18 +160,29 @@ impl ExitStatus {
 #[cfg(target_os = "windows")]
 impl fmt::Display for ExitStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // The runtime packs the process exit code the Unix way (the
-        // next byte of the wait status). rustc prints that code.
-        let code = (self.raw >> 8) & 0xff;
-        write!(f, "exit code: {code}")
+        // rustc prints the DWORD from GetExitCodeProcess.
+        write!(f, "exit code: {}", self.raw as u32)
+    }
+}
+
+/// The inner `ExitStatus(N)` of std's Windows `ExitStatus` Debug.
+#[cfg(target_os = "windows")]
+struct WinExitCode(i32);
+
+#[cfg(target_os = "windows")]
+impl fmt::Debug for WinExitCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let code = self.0 as u32;
+        f.debug_tuple("ExitStatus").field(&code).finish()
     }
 }
 
 #[cfg(target_os = "windows")]
 impl fmt::Debug for ExitStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let code = (self.raw >> 8) & 0xff;
-        write!(f, "ExitStatus(ExitStatus({code}))")
+        // Two layers, so `{:#?}` and a width reach the code the way
+        // std's derived Debug of the newtype does.
+        f.debug_tuple("ExitStatus").field(&WinExitCode(self.raw)).finish()
     }
 }
 

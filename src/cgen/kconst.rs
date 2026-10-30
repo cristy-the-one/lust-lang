@@ -618,13 +618,16 @@ fn init_key(cx: &StaticCx, c: &str, init: &str) -> Vec<u8> {
 /// bytes, unless it is a C string (all init, one zero byte, at the end;
 /// LLVM puts it in a string section); any other is its bytes and init
 /// classes, where more than 16 init and uninit chunks make all of it init.
+/// On Windows the byte-only key is not used: link.exe does not merge
+/// `.rdata` the way lld merges `.rodata.cstN`, so an uninit byte stays
+/// in the key. Equal C strings still share one key.
 fn image_key(b: Vec<u8>, mut cls: Vec<u8>) -> Vec<u8> {
     let n = b.len();
     let cstr = cls.iter().all(|&c| c == 1) && b.iter().position(|&x| x == 0) == Some(n - 1);
     let mut key = vec![b'B'];
     key.extend((n as u64).to_le_bytes());
     key.extend(&b);
-    if matches!(n, 4 | 8 | 16 | 32) && !cstr {
+    if !cfg!(windows) && matches!(n, 4 | 8 | 16 | 32) && !cstr {
         return key;
     }
     let chunks = 1 + cls.windows(2).filter(|w| w[0] != w[1]).count();

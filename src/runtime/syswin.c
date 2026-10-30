@@ -251,6 +251,60 @@ int32_t lust_sys_current_exe(lust_Vec *out) {
     return 0;
 }
 
+/* The substitute name of a reparse point, in rustc's shape: a relative
+   link is the relative text; `\??\C:\...` becomes `C:\...` when that
+   is already the full path. */
+static void lust_sys_push_link_target(lust_Vec *out, const WCHAR *ws, int nw, int relative) {
+    if (relative || nw < 4 || ws[0] != L'\\' || ws[1] != L'?' || ws[2] != L'?' || ws[3] != L'\\') {
+        lust_sys_push_wide(out, ws, nw);
+        return;
+    }
+    const WCHAR *rest = ws + 4;
+    int rn = nw - 4;
+    if ((size_t)nw + 1 > 260) {
+        WCHAR *verb = malloc(sizeof(WCHAR) * ((size_t)rn + 4));
+        if (!verb) lust_oom();
+        verb[0] = L'\\'; verb[1] = L'\\'; verb[2] = L'?'; verb[3] = L'\\';
+        memcpy(verb + 4, rest, sizeof(WCHAR) * (size_t)rn);
+        lust_sys_push_wide(out, verb, rn + 4);
+        free(verb);
+        return;
+    }
+    if (rn >= 4 && (rest[0] == L'U' || rest[0] == L'u') && (rest[1] == L'N' || rest[1] == L'n')
+        && (rest[2] == L'C' || rest[2] == L'c') && rest[3] == L'\\') {
+        WCHAR *unc = malloc(sizeof(WCHAR) * ((size_t)rn));
+        if (!unc) lust_oom();
+        unc[0] = L'\\';
+        unc[1] = L'\\';
+        memcpy(unc + 2, rest + 4, sizeof(WCHAR) * (size_t)(rn - 4));
+        lust_sys_push_wide(out, unc, rn - 2);
+        free(unc);
+        return;
+    }
+    WCHAR *in = malloc(sizeof(WCHAR) * ((size_t)rn + 1));
+    if (!in) lust_oom();
+    memcpy(in, rest, sizeof(WCHAR) * (size_t)rn);
+    in[rn] = 0;
+    WCHAR *full = malloc(sizeof(WCHAR) * 512);
+    if (!full) lust_oom();
+    DWORD n = GetFullPathNameW(in, 512, full, 0);
+    if (n > 0 && n < 512 && n == (DWORD)rn && memcmp(full, rest, sizeof(WCHAR) * (size_t)rn) == 0)
+        lust_sys_push_wide(out, full, (int)n);
+    else {
+        WCHAR *verb = malloc(sizeof(WCHAR) * ((size_t)rn + 4));
+        if (!verb) lust_oom();
+        verb[0] = L'\\'; verb[1] = L'\\'; verb[2] = L'?'; verb[3] = L'\\';
+        memcpy(verb + 4, rest, sizeof(WCHAR) * (size_t)rn);
+        lust_sys_push_wide(out, verb, rn + 4);
+        free(verb);
+    }
+    free(in);
+    free(full);
+}
+
+/* Defined later in this unit, in sysiowin.c. */
+HANDLE lust_win_fd_os_handle(int32_t fd);
+
 int32_t lust_sys_readlink(const uint8_t *p, uint64_t len, lust_Vec *out) {
     /* env::current_exe reads /proc/self/exe through this intrinsic. */
     if (len == 14 && memcmp(p, "/proc/self/exe", 14) == 0) {
@@ -260,16 +314,62 @@ int32_t lust_sys_readlink(const uint8_t *p, uint64_t len, lust_Vec *out) {
         lust_sys_push_wide(out, buf, (int)n);
         return 0;
     }
+    /* File's Debug reads `/proc/self/fd/N`. The substitute name is the
+       open handle's final path (`\\?\C:\...\a.txt`), not a reparse point. */
+    if (len >= 14 && memcmp(p, "/proc/self/fd/", 14) == 0) {
+        int32_t fd = 0;
+        int any = 0;
+        for (uint64_t i = 14; i < len; i++) {
+            if (p[i] < '0' || p[i] > '9') return 123; /* ERROR_INVALID_NAME */
+            any = 1;
+            fd = fd * 10 + (p[i] - '0');
+        }
+        if (!any) return 123;
+        HANDLE h = lust_win_fd_os_handle(fd);
+        if (h == INVALID_HANDLE_VALUE || h == 0) return 6; /* ERROR_INVALID_HANDLE */
+        return lust_sys_final_path(h, out);
+    }
     WCHAR *w = lust_sys_wide(p, len);
     if (!w) return -1;
-    /* FILE_FLAG_BACKUP_SEMANTICS opens directories; OPEN_REPARSE_POINT
-       reads the link itself. */
+    /* Access 0 plus OPEN_REPARSE_POINT, as rustc's read_link. A regular
+       file opens, then FSCTL_GET_REPARSE_POINT fails with 4390
+       (ERROR_NOT_A_REPARSE_POINT). GetFinalPathNameByHandle would
+       succeed and return the file's own path. */
     HANDLE h = CreateFileW(w, 0, 7, 0, 3 /* OPEN_EXISTING */, 0x02000000u | 0x00200000u, 0);
     free(w);
     if (h == INVALID_HANDLE_VALUE) return (int32_t)GetLastError();
-    int32_t r = lust_sys_final_path(h, out);
+    uint8_t *raw = malloc(16384 + 8);
+    if (!raw) lust_oom();
+    uint8_t *buf = (uint8_t *)(((uintptr_t)raw + 7u) & ~(uintptr_t)7u);
+    DWORD got = 0;
+    if (!DeviceIoControl(h, 0x000900A8u /* FSCTL_GET_REPARSE_POINT */, 0, 0, buf, 16384, &got, 0)) {
+        int32_t e = (int32_t)GetLastError();
+        free(raw);
+        CloseHandle(h);
+        return e;
+    }
     CloseHandle(h);
-    return r;
+    if (got < 8) { free(raw); return 13; }
+    uint32_t tag = (uint32_t)buf[0] | ((uint32_t)buf[1] << 8) | ((uint32_t)buf[2] << 16) | ((uint32_t)buf[3] << 24);
+    uint32_t path_at;
+    int relative = 0;
+    if (tag == 0xA000000Cu) { /* IO_REPARSE_TAG_SYMLINK */
+        path_at = 20;
+        relative = (buf[16] & 1) != 0;
+    } else if (tag == 0xA0000003u) { /* IO_REPARSE_TAG_MOUNT_POINT */
+        path_at = 16;
+    } else {
+        free(raw);
+        return 50;
+    }
+    if (got < path_at + 4) { free(raw); return 13; }
+    uint16_t off = (uint16_t)buf[8] | ((uint16_t)buf[9] << 8);
+    uint16_t nlen = (uint16_t)buf[10] | ((uint16_t)buf[11] << 8);
+    if ((off & 1) || (nlen & 1) || (uint32_t)off + nlen > got - path_at) { free(raw); return 13; }
+    const WCHAR *ws = (const WCHAR *)(buf + path_at + off);
+    lust_sys_push_link_target(out, ws, (int)(nlen / 2), relative);
+    free(raw);
+    return 0;
 }
 
 int32_t lust_sys_read_file(const uint8_t *p, uint64_t len, lust_Vec *out) {

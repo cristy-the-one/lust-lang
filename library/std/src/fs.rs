@@ -173,16 +173,29 @@ struct OpenOptionsInner<'a>(&'a OpenOptions);
 
 impl fmt::Debug for OpenOptionsInner<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("OpenOptions")
-            .field("read", &self.0.read)
+        let mut d = f.debug_struct("OpenOptions");
+        d.field("read", &self.0.read)
             .field("write", &self.0.write)
             .field("append", &self.0.append)
             .field("truncate", &self.0.truncate)
             .field("create", &self.0.create)
             .field("create_new", &self.0.create_new)
-            .field("custom_flags", &self.0.custom_flags)
-            .field("mode", &PermModeText(mode_text(self.0.mode as u64)))
-            .finish()
+            .field("custom_flags", &self.0.custom_flags);
+        if cfg!(windows) {
+            // rustc's Windows OpenOptions: the fields std prints, with its
+            // defaults (share read|write|delete, no access mode, no inherit).
+            let access_mode: Option<i32> = None;
+            d.field("access_mode", &access_mode)
+                .field("attributes", &0u32)
+                .field("share_mode", &7u32)
+                .field("security_qos_flags", &0u32)
+                .field("inherit_handle", &false)
+                .field("freeze_last_access_time", &false)
+                .field("freeze_last_write_time", &false);
+        } else {
+            d.field("mode", &PermModeText(mode_text(self.0.mode as u64)));
+        }
+        d.finish()
     }
 }
 
@@ -286,12 +299,15 @@ impl fmt::Debug for File {
         let link = format!("/proc/self/fd/{}", self.fd);
         let mut raw: Vec<u8> = Vec::new();
         let _ = core::intrinsics::sys_readlink(core::intrinsics::sys_str_as_bytes(&link), &mut raw);
-        f.debug_struct("File")
-            .field("fd", &self.fd)
-            .field("path", &PathBuf::from_os_string(OsString::__from_vec(raw)))
-            .field("read", &self.read)
-            .field("write", &self.write)
-            .finish()
+        let path = PathBuf::from_os_string(OsString::__from_vec(raw));
+        let mut d = f.debug_struct("File");
+        d.field("fd", &self.fd).field("path", &path);
+        // rustc's Windows File Debug is the handle and the path. It has
+        // no `read` field, so "read: true" must not appear.
+        if !cfg!(windows) {
+            d.field("read", &self.read).field("write", &self.write);
+        }
+        d.finish()
     }
 }
 

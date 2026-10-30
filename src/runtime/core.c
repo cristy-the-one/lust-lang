@@ -76,6 +76,25 @@ void *lust_alloc(uint64_t size, uint64_t align) LUST_BODY({
     return p;
 })
 
+/* A dev-C local whose alignment is over 16 (cgen `overaligned_local`).
+   tcc's frame is only 16-aligned, and a char buffer big enough to
+   realign a 128-byte local inside it faults on PE. The value lives in
+   an _aligned_malloc block; tcc's cleanup calls the free when the
+   function returns. `pp` points at the void* slot. */
+#ifdef _WIN32
+void *lust_overaligned_alloc(uint64_t size, uint64_t align) LUST_BODY({
+    if (!size) size = 1;
+    if (align < sizeof(void *)) align = sizeof(void *);
+    void *p = _aligned_malloc((size_t)size, (size_t)align);
+    if (!p) lust_oom_size(size);
+    return p;
+})
+void lust_overaligned_free(void *pp) LUST_BODY({
+    void *p = *(void **)pp;
+    if (p) _aligned_free(p);
+})
+#endif
+
 /* std's System::alloc_zeroed: calloc when malloc's alignment is enough,
    so the pages stay untouched until used (`vec![0u8; n]` for a large n
    returns at once, as in Rust). */

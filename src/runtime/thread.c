@@ -97,6 +97,8 @@ static void lust_tls_run(lust_tls_block *b) {
         }
         if (panicked) {
             fputs("fatal runtime error: thread local panicked on drop, aborting\n", stderr);
+            /* __fastfail does not flush, and a pipe buffers stderr. */
+            fflush(stderr);
             abort();
         }
     }

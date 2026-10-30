@@ -2275,18 +2275,28 @@ fn param_ctype(p: &Program, t: &CTy) -> String {
 
 /// Declares local `l{i}` of C type `ct` whose alignment is over 16, with
 /// `decl` its declarator (`l{i}` or `l{i} = init`). tcc never realigns
-/// the stack, so a frame slot is only 16-aligned: the value lives at the
-/// first aligned address in a char buffer, and `l{i}` is a macro for it
-/// up to the `#undef` after the function (fx-overalign). Dev C only: the
-/// release C compilers (clang, gcc, zig cc) realign the frame, and a plain
-/// local stays visible to their copy and scalar optimizations, which a
-/// local behind integer pointer arithmetic is not (every copy of a
-/// `#[repr(align(64))]` struct was a real copy).
-fn overaligned_local(out: &mut String, i: usize, ct: &str, decl: &str) {
-    let _ = writeln!(
-        out,
-        "  char l{i}_b[sizeof({ct}) + _Alignof({ct})]; {ct} *l{i}_p = ({ct} *)(((uintptr_t)l{i}_b + _Alignof({ct}) - 1) & ~(uintptr_t)(_Alignof({ct}) - 1));\n#define l{i} (*l{i}_p)"
-    );
+/// the stack, so a frame slot is only 16-aligned: on Linux the value
+/// lives at the first aligned address in a char buffer. On Windows that
+/// buffer faults for the large 128-byte frames, so the value is an
+/// `_aligned_malloc` block freed by tcc's cleanup when the function
+/// returns. `l{i}` is a macro for it up to the `#undef` after the
+/// function (fx-overalign). Dev C only: the release C compilers (clang,
+/// gcc, zig cc) realign the frame, and a plain local stays visible to
+/// their copy and scalar optimizations, which a local behind integer
+/// pointer arithmetic is not (every copy of a `#[repr(align(64))]`
+/// struct was a real copy).
+fn overaligned_local(out: &mut String, i: usize, ct: &str, decl: &str, align: u64) {
+    if cfg!(windows) {
+        let _ = writeln!(
+            out,
+            "  void *l{i}_b __attribute__((cleanup(lust_overaligned_free))) = lust_overaligned_alloc(sizeof({ct}), {align}); {ct} *l{i}_p = l{i}_b;\n#define l{i} (*l{i}_p)"
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "  char l{i}_b[sizeof({ct}) + _Alignof({ct})]; {ct} *l{i}_p = ({ct} *)(((uintptr_t)l{i}_b + _Alignof({ct}) - 1) & ~(uintptr_t)(_Alignof({ct}) - 1));\n#define l{i} (*l{i}_p)"
+        );
+    }
     if decl.contains('=') {
         let _ = writeln!(out, "  {decl};");
     }
@@ -2894,7 +2904,7 @@ impl FnGen<'_, '_> {
         let mut by_type: Vec<(String, Vec<String>)> = Vec::new();
         let mut flags = Vec::new();
         // Dev C's locals with alignment over 16 (see `overaligned_local`).
-        let mut high: Vec<(usize, String, String)> = Vec::new();
+        let mut high: Vec<(usize, String, String, u64)> = Vec::new();
         let mut frame_init: Vec<String> = Vec::new();
         // A `kdata` fn's constants are named data with no local (`kdata_local`); else the
         // compile-time promoted values' decls (`kstatic_decl`; both need `self` mutably,
@@ -2962,7 +2972,7 @@ impl FnGen<'_, '_> {
                     self.out.push_str(&d);
                 }
             } else if c_size_align(p, t).1 > 16 && !names::release() {
-                high.push((i, ct, decl));
+                high.push((i, ct, decl, c_size_align(p, t).1));
             } else {
                 match by_type.iter_mut().find(|(c, _)| *c == ct) {
                     Some((_, v)) => v.push(decl),
@@ -2989,8 +2999,8 @@ impl FnGen<'_, '_> {
             let decls: Vec<String> = names.iter().map(|n| format!("{stars}{n}")).collect();
             let _ = writeln!(self.out, "  {base} {};", decls.join(", "));
         }
-        for (i, ct, decl) in &high {
-            overaligned_local(&mut self.out, *i, ct, decl);
+        for (i, ct, decl, align) in &high {
+            overaligned_local(&mut self.out, *i, ct, decl, *align);
         }
         // Byte string temps: static storage, initialized once, never
         // assigned (the matching assignments are skipped in `stmt`).
@@ -14491,7 +14501,8 @@ mod tests {
     }
 
     /// A local with alignment over 16 is a plain declaration in release C (the C compiler
-    /// realigns the frame) and an aligned spot in a char buffer in dev C (tcc does not).
+    /// realigns the frame). Dev C keeps it aligned: a char buffer on Linux, a heap
+    /// block on Windows, where that buffer faults under PE tcc.
     #[test]
     fn overaligned_local_is_plain_in_release_c() {
         let src = "#[derive(Clone, Copy)]\n#[repr(align(64))]\nstruct Wide { a: u64, b: u64 }\n\
@@ -14521,7 +14532,11 @@ mod tests {
         let release = names::with(Some(&names), code);
         assert!(!release.contains("_b[sizeof(") && !release.contains("#define l"), "release C declares it plainly:\n{release}");
         let dev = names::with(None, code);
-        assert!(dev.contains("_b[sizeof(") && dev.contains("#undef l"), "dev C keeps the aligned buffer:\n{dev}");
+        if cfg!(windows) {
+            assert!(dev.contains("lust_overaligned_alloc") && dev.contains("#undef l"), "dev C keeps the aligned heap local:\n{dev}");
+        } else {
+            assert!(dev.contains("_b[sizeof(") && dev.contains("#undef l"), "dev C keeps the aligned buffer:\n{dev}");
+        }
     }
 
     /// Release C: a fn whose constants all have compile-time values names them by content

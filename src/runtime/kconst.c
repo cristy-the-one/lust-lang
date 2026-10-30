@@ -6,9 +6,12 @@
    bytes, the same uninit runs, and pointers at the same places. The
    linker also merges 4, 8, 16 and 32 byte constants that hold no
    pointer by their bytes (an uninit byte is 0 in the object file), in
-   any unit (LLVM's .rodata.cstN). A fully init constant whose only zero
-   byte is its last one is a C string to LLVM (.rodata.str1.A), so it is
-   not in that set. lust gives every constant of the program that address:
+   any unit (LLVM's .rodata.cstN). Windows link.exe does not merge those
+   sections, so an uninit byte stays in the key there and does not share
+   with a fully init constant of the same bytes. A fully init constant
+   whose only zero byte is its last one is a C string to LLVM
+   (.rodata.str1.A), so it is not in that set; equal C strings still
+   share one address, including on Windows (`/GF`). lust gives every constant of the program that address:
    each site interns its bytes here at its first run and keeps the
    canonical address in a slot of its own (cgen/kconst.rs), and the glue
    unit registers the pointees of statics at startup (lust_kreg, or
@@ -194,7 +197,15 @@ static uint8_t lust_kkey(const void *p, uint64_t n, const uint64_t *desc, uint8_
         zeros += !key[i];
     }
     int cstr = !uninit && !reloc && zeros == 1 && !key[n - 1];
+    /* Kind 1 is the linker's byte merge (.rodata.cstN): an uninit byte
+       is 0 in the object file. link.exe does not do that merge, so on
+       Windows an uninit byte keeps kind 0 and the class bytes. A fully
+       init constant is still kind 1, and a C string stays kind 0. */
+#ifdef _WIN32
+    if (!uninit && !reloc && !cstr && (n == 4 || n == 8 || n == 16 || n == 32)) return 1;
+#else
     if (!reloc && !cstr && (n == 4 || n == 8 || n == 16 || n == 32)) return 1;
+#endif
     for (uint64_t s = 0; s < n;) {
         if (cls[s] == 2) {
             s++;

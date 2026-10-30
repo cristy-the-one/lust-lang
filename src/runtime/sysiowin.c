@@ -2,12 +2,12 @@
    Windows (rel-win). Spliced instead of sysio.c under _WIN32.
    The Rust side speaks small integer fds; a table maps them to
    HANDLEs (0, 1, 2 are the standard handles; a spawned child's pid
-   maps to its process handle the same way). Errors return as
-   GetLastError codes. Process spawn is CreateProcessW with std's
-   argument quoting; the wait status word the Rust side reads is
-   the Unix shape lust's std uses on every target, so an exit code
-   travels as (code & 0xff) << 8 (codes over 255 truncate: a gap
-   until lust's std grows a Windows ExitStatus). */
+   maps to its process handle the same way). A socket fd stores the
+   SOCKET in that HANDLE slot and sets `socket`, because ReadFile on
+   an overlapped socket is not recv and DuplicateHandle is not
+   WSADuplicateSocketW. Errors return as GetLastError codes. Process
+   spawn is CreateProcessW with std's argument quoting; the wait
+   status word is the process exit code from GetExitCodeProcess. */
 
 static void lust_sysio_push(lust_Vec *out, const void *p, uint64_t n) {
     if (n == 0) return;
@@ -16,9 +16,15 @@ static void lust_sysio_push(lust_Vec *out, const void *p, uint64_t n) {
     out->len += n;
 }
 
-typedef struct { HANDLE h; int append; } lust_win_fd;
+typedef struct { HANDLE h; int append; int socket; int nonblock; } lust_win_fd;
 static lust_win_fd *lust_win_fds;
 static uint64_t lust_win_fds_len, lust_win_fds_cap;
+
+/* Defined later in this unit, in sysnetwin.c. */
+int64_t lust_win_socket_recv(uintptr_t sock, uint8_t *buf, uint32_t n);
+int64_t lust_win_socket_send(uintptr_t sock, const uint8_t *buf, uint32_t n);
+int32_t lust_win_socket_close(uintptr_t sock);
+int32_t lust_win_socket_dup(uintptr_t sock);
 
 static HANDLE lust_win_handle(int32_t fd) {
     if (fd == 0) return GetStdHandle((DWORD)-10);
@@ -28,11 +34,31 @@ static HANDLE lust_win_handle(int32_t fd) {
     return lust_win_fds[fd - 3].h;
 }
 
-static int32_t lust_win_fd_new(HANDLE h, int append) {
+/* syswin.c's read_link of `/proc/self/fd/N` (File's Debug path). */
+HANDLE lust_win_fd_os_handle(int32_t fd) {
+    return lust_win_handle(fd);
+}
+
+static int lust_win_fd_is_socket(int32_t fd) {
+    return fd >= 3 && (uint64_t)fd < lust_win_fds_len + 3 && lust_win_fds[fd - 3].socket;
+}
+
+static void lust_win_fd_set_nonblock(int32_t fd, int on) {
+    if (fd >= 3 && (uint64_t)fd < lust_win_fds_len + 3) lust_win_fds[fd - 3].nonblock = on ? 1 : 0;
+}
+
+static int lust_win_fd_nonblock(int32_t fd) {
+    if (fd < 3 || (uint64_t)fd >= lust_win_fds_len + 3) return 0;
+    return lust_win_fds[fd - 3].nonblock;
+}
+
+static int32_t lust_win_fd_insert(HANDLE h, int append, int socket) {
     for (uint64_t i = 0; i < lust_win_fds_len; i++) {
         if (lust_win_fds[i].h == INVALID_HANDLE_VALUE) {
             lust_win_fds[i].h = h;
             lust_win_fds[i].append = append;
+            lust_win_fds[i].socket = socket;
+            lust_win_fds[i].nonblock = 0;
             return (int32_t)(i + 3);
         }
     }
@@ -43,18 +69,36 @@ static int32_t lust_win_fd_new(HANDLE h, int append) {
     }
     lust_win_fds[lust_win_fds_len].h = h;
     lust_win_fds[lust_win_fds_len].append = append;
+    lust_win_fds[lust_win_fds_len].socket = socket;
+    lust_win_fds[lust_win_fds_len].nonblock = 0;
     return (int32_t)(lust_win_fds_len++ + 3);
+}
+
+static int32_t lust_win_fd_new(HANDLE h, int append) {
+    return lust_win_fd_insert(h, append, 0);
+}
+
+static int32_t lust_win_fd_new_socket(uintptr_t sock) {
+    return lust_win_fd_insert((HANDLE)sock, 0, 1);
 }
 
 int64_t lust_sys_fd_read(int32_t fd, uint64_t max, lust_Vec *out) {
     HANDLE h = lust_win_handle(fd);
     if (h == INVALID_HANDLE_VALUE) return -(int64_t)6; /* ERROR_INVALID_HANDLE */
     if (max == 0) return 0;
-    uint8_t *tmp = malloc((size_t)max);
+    uint32_t want = (uint32_t)(max > 0x7fffffff ? 0x7fffffff : max);
+    uint8_t *tmp = malloc((size_t)want);
     if (!tmp) lust_oom();
+    /* A shut-down socket reads as EOF, the same as a Unix fd. ReadFile
+       on an overlapped SOCKET does not. */
+    if (lust_win_fd_is_socket(fd)) {
+        int64_t n = lust_win_socket_recv((uintptr_t)h, tmp, want);
+        if (n > 0) lust_sysio_push(out, tmp, (uint64_t)n);
+        free(tmp);
+        return n;
+    }
     DWORD n = 0;
-    DWORD want = (DWORD)(max > 0x7fffffff ? 0x7fffffff : max);
-    if (!ReadFile(h, tmp, want, &n, 0)) {
+    if (!ReadFile(h, tmp, (DWORD)want, &n, 0)) {
         DWORD e = GetLastError();
         free(tmp);
         if (e == 109 /* ERROR_BROKEN_PIPE: EOF on a pipe */) return 0;
@@ -68,6 +112,11 @@ int64_t lust_sys_fd_read(int32_t fd, uint64_t max, lust_Vec *out) {
 int64_t lust_sys_fd_write(int32_t fd, const uint8_t *p, uint64_t len) {
     HANDLE h = lust_win_handle(fd);
     if (h == INVALID_HANDLE_VALUE) return -(int64_t)6;
+    if (lust_win_fd_is_socket(fd)) {
+        if (len == 0) return 0;
+        uint32_t want = (uint32_t)(len > 0x7fffffff ? 0x7fffffff : len);
+        return lust_win_socket_send((uintptr_t)h, p, want);
+    }
     if (fd >= 3 && lust_win_fds[fd - 3].append && GetFileType(h) == 1 /* DISK */) {
         LARGE_INTEGER z = {0};
         SetFilePointerEx(h, z, 0, 2 /* FILE_END */);
@@ -82,13 +131,19 @@ int32_t lust_sys_fd_close(int32_t fd) {
     if (fd < 3) return 0;
     HANDLE h = lust_win_handle(fd);
     if (h == INVALID_HANDLE_VALUE) return 6;
+    int socket = lust_win_fds[fd - 3].socket;
     lust_win_fds[fd - 3].h = INVALID_HANDLE_VALUE;
+    lust_win_fds[fd - 3].socket = 0;
+    lust_win_fds[fd - 3].append = 0;
+    lust_win_fds[fd - 3].nonblock = 0;
+    if (socket) return lust_win_socket_close((uintptr_t)h);
     return CloseHandle(h) ? 0 : (int32_t)GetLastError();
 }
 
 int32_t lust_sys_fd_dup(int32_t fd) {
     HANDLE h = lust_win_handle(fd);
     if (h == INVALID_HANDLE_VALUE) return -6;
+    if (lust_win_fd_is_socket(fd)) return lust_win_socket_dup((uintptr_t)h);
     HANDLE copy = INVALID_HANDLE_VALUE;
     if (!DuplicateHandle(GetCurrentProcess(), h, GetCurrentProcess(), &copy, 0, 0, 2 /* SAME_ACCESS */))
         return -(int32_t)GetLastError();

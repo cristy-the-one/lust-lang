@@ -282,6 +282,16 @@ fn link_objects(tcc: &Tcc, objs: &[PathBuf], out: &Path) -> Result<(), String> {
                 return Err(tcc.fail("load libm"));
             }
         }
+        // Socket calls (WSASocketW, getaddrinfo, recv) live in ws2_32.
+        // tcc does not link that import library unless asked; its
+        // ws2_32.def is next to libtcc1.a.
+        #[cfg(windows)]
+        {
+            let ws2 = CString::new("ws2_32").unwrap();
+            if tcc_add_library(tcc.s, ws2.as_ptr()) != 0 {
+                return Err(tcc.fail("load ws2_32"));
+            }
+        }
         for o in objs {
             if tcc_add_file(tcc.s, cstr(o).as_ptr()) != 0 {
                 return Err(tcc.fail("load an object file"));

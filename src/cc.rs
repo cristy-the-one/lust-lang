@@ -136,11 +136,10 @@ fn cxx_for(cmd: &[String]) -> Vec<String> {
 
 /// True when `prog` is an executable on PATH.
 fn on_path(prog: &str) -> bool {
-    let exists = |p: &Path| p.is_file() || (cfg!(windows) && !prog.contains('.') && p.with_extension("exe").is_file());
-    if prog.contains('/') || (cfg!(windows) && prog.contains('\\')) {
-        return exists(Path::new(prog));
+    if prog.contains('/') {
+        return Path::new(prog).exists();
     }
-    std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| exists(&d.join(prog))))
+    std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(prog).exists()))
 }
 
 /// The compiler spec for one Rust triple. `LUST_CC` (words split on
@@ -173,9 +172,7 @@ pub fn spec_for(triple: &str) -> Result<CcSpec, String> {
     }
     let (arch, os) = (triple.split('-').next().unwrap_or(""), triple);
     let host_like = arch == std::env::consts::ARCH
-        && ((os.contains("linux") && std::env::consts::OS == "linux")
-            || (os.contains("darwin") && std::env::consts::OS == "macos")
-            || (os.contains("windows") && std::env::consts::OS == "windows"));
+        && ((os.contains("linux") && std::env::consts::OS == "linux") || (os.contains("darwin") && std::env::consts::OS == "macos"));
     if host_like && on_path("cc") {
         // A host clang/gcc reaches this target as far as this driver
         // checks (same arch and OS; a musl static link still needs the

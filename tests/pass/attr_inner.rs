@@ -1,4 +1,3 @@
-// only: unix
 #![cfg(unix)]
 
 fn main() {

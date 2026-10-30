@@ -1,4 +1,3 @@
-// only: unix
 // `std::fs::DirBuilder` with `os::unix::fs::DirBuilderExt::mode` (ts-rust
 // os_mkdir_all): plain and recursive creates, the mode, and the errors.
 use std::fs;

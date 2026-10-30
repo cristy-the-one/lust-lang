@@ -647,16 +647,6 @@ fn record_base_user(base_dir: &Path, soname: &str, out: &Path) {
     }
 }
 
-/// Shared-library suffix: `.so` on Unix, `.dll` on Windows. tcc's PE linker
-/// records the dll name, and the loader finds it beside the executable.
-fn base_suffix() -> &'static str {
-    if cfg!(windows) { "dll" } else { "so" }
-}
-
-fn base_lib_name(base: &str) -> String {
-    format!("lib{base}.{}", base_suffix())
-}
-
 /// The pid in a base file name (`libbase-<pid>-<hash>.so`): the process
 /// that built it. Base files are also unique per session instance (the
 /// session's object dir is mixed into the hash), so one session never
@@ -688,9 +678,9 @@ pub fn sweep_bases(base_dir: &Path, exiting_pid: u32) {
             let name = e.file_name().to_string_lossy().into_owned();
             if let Some(rest) = name.strip_prefix("libbase-tmp-")
                 && let Some(pid) = rest.split('-').next()
-                && let Ok(pid_n) = pid.parse::<u32>()
-                && pid_n != std::process::id()
-                && !crate::sys_host::process_alive(pid_n)
+                && pid.parse::<u32>().is_ok()
+                && pid != std::process::id().to_string()
+                && !Path::new(&format!("/proc/{pid}")).exists()
             {
                 let _ = std::fs::remove_file(e.path());
             }
@@ -717,7 +707,7 @@ pub fn sweep_bases(base_dir: &Path, exiting_pid: u32) {
     }
     let owner_alive = |soname: &str| match base_owner_pid(soname) {
         Some(pid) if pid == exiting_pid => false,
-        Some(pid) => pid == std::process::id() || crate::sys_host::process_alive(pid),
+        Some(pid) => pid == std::process::id() || Path::new(&format!("/proc/{pid}")).exists(),
         None => false,
     };
     let mut kept = String::new();
@@ -2093,7 +2083,7 @@ fn resolved_setup(
         let unit =
             cargo::select_unit(&graph, &greq, &key.krate.target_kind, &key.krate.target_name, &pre_env, &front.interner, key.krate.test)
                 .map_err(code2)?;
-        let root_text = crate::srctext::read(&unit.target.src_path)
+        let root_text = std::fs::read_to_string(&unit.target.src_path)
             .map_err(|e| code2(format!("cannot read {}: {e}", unit.target.src_path.display())))?;
         // Edition and lint gates for the selected unit (section 1.1),
         // rendered against the crate root file.
@@ -2286,7 +2276,7 @@ fn resolved_setup(
         None => {
             let mut user = StdPlan::guess_crate(&root_path, &unspliced_root, root_asks);
             for dep in crate::resolve::worklist::dep_roots(&externs) {
-                if let Ok(text) = crate::srctext::read(&dep) {
+                if let Ok(text) = std::fs::read_to_string(&dep) {
                     user = user.or(StdPlan::guess_crate(&dep, &text, StdPlan::asks(&text)));
                 }
             }
@@ -2611,7 +2601,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         };
     }
     let path = req.file.to_string_lossy().to_string();
-    let mut src = match crate::srctext::read(&req.file) {
+    let mut src = match std::fs::read_to_string(&req.file) {
         Ok(s) => s,
         Err(e) => return Response { stderr: format!("error: cannot read {path}: {e}\n"), code: 2, ..Default::default() },
     };
@@ -5911,7 +5901,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         }
         let base = if rebuild_base {
             caches.base_gen += 1;
-            let tmp = base_dir.join(format!("libbase-tmp-{}-{}-{}.{}", std::process::id(), caches.base_gen, base_tmp_seq(), base_suffix()));
+            let tmp = base_dir.join(format!("libbase-tmp-{}-{}-{}.so", std::process::id(), caches.base_gen, base_tmp_seq()));
             let built = std::fs::create_dir_all(&base_dir)
                 .map_err(|e| format!("cannot create {}: {e}", base_dir.display()))
                 .and_then(|_| crate::tcc::link_shared(&all_base, &tmp, req.debug))
@@ -5922,7 +5912,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     // see `base_owner_pid`.
                     let (a, b) = crate::driver::cache::hash128(&[&bytes, caches.obj_dir.to_string_lossy().as_bytes()], 41);
                     caches.base_name = format!("base-{}-{a:016x}{b:016x}", std::process::id());
-                    let soname = base_lib_name(&caches.base_name);
+                    let soname = format!("lib{}.so", caches.base_name);
                     install_base(&tmp, &base_dir.join(&soname))?;
                     if !caches.base_files.contains(&soname) {
                         caches.base_files.push_back(soname);
@@ -5934,14 +5924,14 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             }
             t.lap("link libbase.so");
             built
-        } else if !caches.base_name.is_empty() && !base_dir.join(base_lib_name(&caches.base_name)).exists() {
+        } else if !caches.base_name.is_empty() && !base_dir.join(format!("lib{}.so", caches.base_name)).exists() {
             // The base file vanished under a live session. The bases dir
             // is in `.lust-cache`, state outside tools may delete as a
             // cache (the edit fuzzer rewrites the crate tree every edit).
             // The base objects still live in the session object dir, so
             // relink the same base under the same name.
-            let dest = base_dir.join(base_lib_name(&caches.base_name));
-            let tmp = base_dir.join(format!("libbase-tmp-{}-relink-{}.{}", std::process::id(), base_tmp_seq(), base_suffix()));
+            let dest = base_dir.join(format!("lib{}.so", caches.base_name));
+            let tmp = base_dir.join(format!("libbase-tmp-{}-relink-{}.so", std::process::id(), base_tmp_seq()));
             let built = std::fs::create_dir_all(&base_dir)
                 .map_err(|e| format!("cannot create {}: {e}", base_dir.display()))
                 .and_then(|_| crate::tcc::link_shared(&all_base, &tmp, req.debug))
@@ -5969,7 +5959,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // kept keeps its base; one that was overwritten or deleted does not. A running program
     // keeps its mapped copy after unlink.
     if caches.persistent && !caches.base_name.is_empty() {
-        let soname = base_lib_name(&caches.base_name);
+        let soname = format!("lib{}.so", caches.base_name);
         if let Some(base_dir) = caches.base_dir.clone() {
             record_base_user(&base_dir, &soname, &req.out);
         }

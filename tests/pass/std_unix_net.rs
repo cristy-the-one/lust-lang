@@ -1,4 +1,3 @@
-// only: unix
 // std::os::unix::net: pair, bind/connect/accept by pathname and
 // abstract name, addresses, shutdown, and io errors.
 use std::io::{Read, Write};

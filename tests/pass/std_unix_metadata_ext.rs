@@ -1,4 +1,3 @@
-// only: unix
 // std::os::unix::fs::MetadataExt: the raw stat fields of a
 // file the program makes (identity fields compared, never
 // printed raw).

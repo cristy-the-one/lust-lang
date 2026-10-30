@@ -1,4 +1,3 @@
-// only: unix
 // PermissionsExt (mode, set_mode, from_mode) by method and by path, fs::set_permissions (chmod), and std's Mode Debug (the ls form only for a known file type).
 use std::os::unix::fs::PermissionsExt;
 fn main() { more();

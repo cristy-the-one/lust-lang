@@ -1,4 +1,3 @@
-// only: unix
 // CommandExt::arg0 (argv[0], NUL check, both Debug forms) and the OwnedFd
 // conversions of UnixStream and Stdio (tf-p6 R11).
 use std::io::{Read, Write};

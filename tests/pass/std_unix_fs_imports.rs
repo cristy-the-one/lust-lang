@@ -1,4 +1,3 @@
-// only: unix
 // std::os::unix::fs is a partial platform module (it defines
 // only MetadataExt): its other items keep the std compat
 // handling, so every import below resolves (fx-stdos; the

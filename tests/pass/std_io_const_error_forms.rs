@@ -1,4 +1,3 @@
-// only: unix
 // std const_error! forms (Debug `Error { kind, message }`) of the zero
 // timeout and socket address errors (tf-p6); OpenOptions keeps its Custom form.
 use std::net::ToSocketAddrs;

@@ -214,30 +214,6 @@ ll_build() {
 # std's own library/ path and line (src/stdloc.rs), so the whole text compares exactly.
 lust_stderr() { mask_stderr "$2" | sed "s|$1|@CASE@|g"; }
 
-# A case marked `// only: unix` (or linux, macos, windows) is not this host.
-# Unix-only std (std::os::unix, std::os::linux) is valid Rust on Linux and
-# macOS and a rustc error on Windows; skipping it here keeps that case in
-# the suite without failing the other host. unsupported does not fail.
-platform_skip() {
-  local only
-  only=$(sed -n 's|^// only: *\([a-z][a-z]*\).*|\1|p' "$1" | head -1)
-  [ -n "$only" ] || return 1
-  local os fam
-  case "$(uname -s)" in
-    Linux) os=linux; fam=unix ;;
-    Darwin) os=macos; fam=unix ;;
-    MINGW*|MSYS*|CYGWIN*) os=windows; fam=windows ;;
-    *) os=other; fam=other ;;
-  esac
-  case "$only" in
-    unix) [ "$fam" = unix ] && return 1 ;;
-    linux|macos|windows) [ "$os" = "$only" ] && return 1 ;;
-  esac
-  echo unsupported >st
-  echo "SKIP $2: only $only"
-  return 0
-}
-
 if [ "${PANIC:-abort}" = unwind ] || [ "${RELEASE:-0}" = 1 ]; then
   # RELEASE=1 alone unwinds, as a release profile and plain rustc do.
   panic=${PANIC:-unwind}
@@ -269,7 +245,6 @@ if [ "${PANIC:-abort}" = unwind ] || [ "${RELEASE:-0}" = 1 ]; then
   # unwind_case <name> <file>: one PANIC=unwind case (see the header).
   unwind_case() {
     local name=$1 f=$2 rs ls msg
-    platform_skip "$f" "$name" && return
     rustc_oracle run "$f" "${rustc_flags[@]}"
     if [ "$(cat rustc.cc)" -ne 0 ]; then
       report bad "$name" "rustc ($mode) rejected it: $(head -3 rustc.err)"; return
@@ -346,7 +321,6 @@ no_frames() { sed -E '/^ +[0-9]+: /d; /^ +at /d'; }
 # pass_case <name> <file>: one tests/pass case (see the header).
 pass_case() {
   local name=$1 f=$2 rs ls panic_expect msg
-  platform_skip "$f" "$name" && return
   rustc_oracle run "$f" "${rustc_flags[@]}"
   if [ "$(cat rustc.cc)" -ne 0 ]; then
     report bad "$name" "rustc rejected it: $(head -3 rustc.err)"; return
@@ -379,7 +353,6 @@ pass_case() {
 # neg_case <name> <file>: one tests/fail or tests/reject case (see the header).
 neg_case() {
   local name=$1 f=$2 expect rustc_ok out
-  platform_skip "$f" "$name" && return
   expect=$(head -1 "$f" | sed -n 's|^// expect: *\(L[0-9]*\).*|\1|p')
   # Every mode uses the same default-lint flags: a fail case must be rejected and a reject
   # case accepted by rustc as it is.

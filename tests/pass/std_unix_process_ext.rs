@@ -1,4 +1,3 @@
-// only: unix
 // std::os::unix::process: ExitStatusExt over raw wait statuses (exit, signal,
 // core dump, stop, continue, unrecognised) and as a fn value, then
 // CommandExt::exec: a failed exec returns its error, a working one replaces the

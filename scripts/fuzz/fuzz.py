@@ -46,44 +46,13 @@
 # Exit status: 0 = clean, 1 = a failure was found, 2 = setup error.
 import argparse, os, random, re, shutil, signal, subprocess, sys, tempfile, time
 from collections import Counter
-
-
-def _windows_rss_mb(pid):
-    """Working set of `pid` in MB. 0 when the process cannot be queried."""
-    import ctypes
-    class Counters(ctypes.Structure):
-        _fields_ = [
-            ("cb", ctypes.c_uint32),
-            ("faults", ctypes.c_uint32),
-            ("peak_ws", ctypes.c_size_t),
-            ("ws", ctypes.c_size_t),
-            ("qpp", ctypes.c_size_t),
-            ("qp", ctypes.c_size_t),
-            ("qnpp", ctypes.c_size_t),
-            ("qnp", ctypes.c_size_t),
-            ("pf", ctypes.c_size_t),
-            ("peak_pf", ctypes.c_size_t),
-        ]
-    kernel = ctypes.WinDLL("kernel32")
-    psapi = ctypes.WinDLL("psapi")
-    handle = kernel.OpenProcess(0x1000, False, pid)
-    if not handle:
-        return 0.0
-    try:
-        c = Counters(cb=ctypes.sizeof(Counters))
-        if not psapi.GetProcessMemoryInfo(handle, ctypes.byref(c), c.cb):
-            return 0.0
-        return c.ws / 1024 / 1024
-    finally:
-        kernel.CloseHandle(handle)
 import sigops
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-import daemon_argv  # noqa: E402
 import oracle_log  # noqa: E402  (scripts/oracle_log.py)
 import rustc_sample  # noqa: E402  (scripts/rustc_sample.py)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-LUST = daemon_argv.lust_bin(os.path.join(ROOT, "target/release/lust"))
+LUST = os.path.join(ROOT, "target/release/lust")
 
 SMALL_CRATE = '''#[derive(Debug, Clone, PartialEq)]
 struct Point {
@@ -477,7 +446,7 @@ class Harness:
         # in-memory `run` forks the user program from the daemon, and a
         # non-terminating program must die with its daemon, not spin on
         # as an orphan.
-        self.daemon = subprocess.Popen(daemon_argv.daemon_argv(LUST), cwd=self.work, env=self.env,
+        self.daemon = subprocess.Popen([LUST, "daemon"], cwd=self.work, env=self.env,
                                        stderr=self.log, start_new_session=True)
         # Any guard check the previous daemon left pending is dead with it.
         self._poll_log()
@@ -533,15 +502,9 @@ class Harness:
             return (p.returncode, out, err)
         except subprocess.TimeoutExpired:
             try:
-                if os.name == "nt":
-                    p.kill()
-                else:
-                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                os.killpg(os.getpgid(p.pid), signal.SIGKILL)
             except Exception:
-                try:
-                    p.kill()
-                except Exception:
-                    pass
+                pass
             try:
                 p.communicate(timeout=5)
             except Exception:
@@ -573,8 +536,6 @@ class Harness:
         if RESTART:
             return 0.0
         try:
-            if os.name == "nt":
-                return _windows_rss_mb(self.daemon.pid)
             with open(f"/proc/{self.daemon.pid}/status") as f:
                 kb = next(int(l.split()[1]) for l in f if l.startswith("VmRSS:"))
             return kb / 1024

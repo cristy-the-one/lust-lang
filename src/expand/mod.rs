@@ -1899,7 +1899,7 @@ pub fn run_expand(args: &[String]) -> i32 {
         return 2;
     };
     let path = std::path::Path::new(file);
-    let src = match crate::srctext::read(path) {
+    let src = match std::fs::read_to_string(path) {
         Ok(src) => src,
         Err(e) => {
             eprintln!("error: cannot read {}: {e}", path.display());

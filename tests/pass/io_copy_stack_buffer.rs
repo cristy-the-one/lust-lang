@@ -1,4 +1,3 @@
-// only: unix
 // std::io::copy on std's stack_buffer_copy path: 8 KiB reads (the buffer zeroed once, then holding the earlier bytes), Interrupted retried, write_all per chunk, errors returned.
 use std::io::{self, Read, Write};
 struct Src { left: usize, calls: u32 }

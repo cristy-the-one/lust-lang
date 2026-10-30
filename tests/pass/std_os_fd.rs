@@ -1,4 +1,3 @@
-// only: unix
 // std::os::fd and std::os::unix::ffi (tf-adapters F1): fds print
 // only booleans, never raw numbers (the next free fd differs by
 // harness). FromRawFd needs an unsafe block in valid Rust, so it

@@ -10,10 +10,9 @@
 # marker string, and the marker's enclosing `f<slot>` definition names its slot.
 # Usage: python3 scripts/test-slots.py   (exit 0 = pass)
 import glob, os, re, subprocess, sys, tempfile, time
-import daemon_argv  # scripts/daemon_argv.py
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LUST = daemon_argv.lust_bin(os.path.join(ROOT, "target/release/lust"))
+LUST = os.path.join(ROOT, "target/release/lust")
 failures = []
 
 SRC = """\
@@ -64,7 +63,7 @@ def main():
         if os.path.exists(sock):
             os.remove(sock)
         log = open(os.path.join(work, "daemon.log"), "a")
-        d = subprocess.Popen(daemon_argv.daemon_argv(LUST), cwd=work, env=env, stderr=log)
+        d = subprocess.Popen([LUST, "daemon"], cwd=work, env=env, stderr=log)
         t0 = time.time()
         while not os.path.exists(sock):
             if time.time() - t0 > 10 or d.poll() is not None:

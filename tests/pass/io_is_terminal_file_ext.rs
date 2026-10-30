@@ -1,4 +1,3 @@
-// only: unix
 // io::IsTerminal, os::unix::fs::FileExt (pread/pwrite, read_exact_at EOF,
 // EINVAL offsets), and SocketAddrExt::from_abstract_name over AsRef<[u8]>
 // (tf-p6 R23); std const_error Debug forms of the SUN_LEN errors.

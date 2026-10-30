@@ -194,75 +194,35 @@ impl CfgEnv {
         if !self.facts.is_empty() {
             return self.facts.iter().any(|(n, v)| n == name && v.as_deref() == value);
         }
-        // The host target as `rustc --print cfg` prints it, with the build's
-        // panic strategy. Single-file compiles have no Cargo cfg, so these
-        // facts are what `cfg!` sees. A crate session passes `facts` instead.
-        #[cfg(not(windows))]
-        {
-            match (name, value) {
-                ("test", None) => self.test,
-                ("debug_assertions", None) => self.debug_assertions,
-                ("unix", None) => true,
-                ("windows", None) => false,
-                ("panic", Some(v)) => v == if self.panic_unwind { "unwind" } else { "abort" },
-                ("target_family", Some("unix")) => true,
-                ("target_family", Some(_)) => false,
-                ("target_os", Some("linux")) => true,
-                ("target_os", Some(_)) => false,
-                ("target_arch", Some(v)) => v == std::env::consts::ARCH,
-                ("target_pointer_width", Some("64")) => true,
-                ("target_pointer_width", Some(_)) => false,
-                ("target_endian", Some("little")) => true,
-                ("target_endian", Some(_)) => false,
-                ("target_env", Some("gnu")) => true,
-                ("target_env", Some(_)) => false,
-                ("target_abi", Some("")) => true,
-                ("target_abi", Some(_)) => false,
-                ("target_vendor", Some("unknown")) => true,
-                ("target_vendor", Some(_)) => false,
-                ("target_has_atomic", Some(v)) => matches!(v, "8" | "16" | "32" | "64" | "ptr"),
-                ("target_has_atomic_primitive_alignment", Some(v)) => matches!(v, "8" | "16" | "32" | "64" | "ptr"),
-                ("target_feature", Some(v)) => std::env::consts::ARCH == "x86_64" && matches!(v, "fxsr" | "sse" | "sse2"),
-                ("feature", Some(_)) => false,
-                _ => false,
-            }
-        }
-        #[cfg(windows)]
-        {
-            // `rustc --print cfg` for x86_64-pc-windows-msvc (and aarch64),
-            // the host triple `protocol::host_triple` reports.
-            match (name, value) {
-                ("test", None) => self.test,
-                ("debug_assertions", None) => self.debug_assertions,
-                ("unix", None) => false,
-                ("windows", None) => true,
-                ("panic", Some(v)) => v == if self.panic_unwind { "unwind" } else { "abort" },
-                ("target_family", Some("windows")) => true,
-                ("target_family", Some(_)) => false,
-                ("target_os", Some("windows")) => true,
-                ("target_os", Some(_)) => false,
-                ("target_arch", Some(v)) => v == std::env::consts::ARCH,
-                ("target_pointer_width", Some("64")) => cfg!(target_pointer_width = "64"),
-                ("target_pointer_width", Some(_)) => false,
-                ("target_endian", Some("little")) => true,
-                ("target_endian", Some(_)) => false,
-                ("target_env", Some("msvc")) => true,
-                ("target_env", Some(_)) => false,
-                ("target_abi", Some("")) => true,
-                ("target_abi", Some(_)) => false,
-                ("target_vendor", Some("pc")) => true,
-                ("target_vendor", Some(_)) => false,
-                ("target_has_atomic", Some("128")) => true,
-                ("target_has_atomic_primitive_alignment", Some("128")) => true,
-                ("target_has_atomic", Some(v)) => matches!(v, "8" | "16" | "32" | "64" | "ptr"),
-                ("target_has_atomic_primitive_alignment", Some(v)) => matches!(v, "8" | "16" | "32" | "64" | "ptr"),
-                ("target_feature", Some(v)) => {
-                    (std::env::consts::ARCH == "x86_64" && matches!(v, "cmpxchg16b" | "fxsr" | "sse" | "sse2" | "sse3"))
-                        || (std::env::consts::ARCH == "aarch64" && v == "neon")
-                }
-                ("feature", Some(_)) => false,
-                _ => false,
-            }
+        // The host target as `rustc --print cfg` prints it for
+        // x86_64/aarch64 Linux with the build's panic strategy: lust builds
+        // for the host, so these are the facts a cfg in user code sees.
+        match (name, value) {
+            ("test", None) => self.test,
+            ("debug_assertions", None) => self.debug_assertions,
+            ("unix", None) => true,
+            ("windows", None) => false,
+            ("panic", Some(v)) => v == if self.panic_unwind { "unwind" } else { "abort" },
+            ("target_family", Some("unix")) => true,
+            ("target_family", Some(_)) => false,
+            ("target_os", Some("linux")) => true,
+            ("target_os", Some(_)) => false,
+            ("target_arch", Some(v)) => v == std::env::consts::ARCH,
+            ("target_pointer_width", Some("64")) => true,
+            ("target_pointer_width", Some(_)) => false,
+            ("target_endian", Some("little")) => true,
+            ("target_endian", Some(_)) => false,
+            ("target_env", Some("gnu")) => true,
+            ("target_env", Some(_)) => false,
+            ("target_abi", Some("")) => true,
+            ("target_abi", Some(_)) => false,
+            ("target_vendor", Some("unknown")) => true,
+            ("target_vendor", Some(_)) => false,
+            ("target_has_atomic", Some(v)) => matches!(v, "8" | "16" | "32" | "64" | "ptr"),
+            ("target_has_atomic_primitive_alignment", Some(v)) => matches!(v, "8" | "16" | "32" | "64" | "ptr"),
+            ("target_feature", Some(v)) => std::env::consts::ARCH == "x86_64" && matches!(v, "fxsr" | "sse" | "sse2"),
+            ("feature", Some(_)) => false,
+            _ => false,
         }
     }
 
@@ -271,10 +231,7 @@ impl CfgEnv {
         let mut h = crate::intern::FxHasher::default();
         self.test.hash(&mut h);
         self.debug_assertions.hash(&mut h);
-        #[cfg(not(windows))]
         "host-unix-linux".hash(&mut h);
-        #[cfg(windows)]
-        "host-windows-msvc".hash(&mut h);
         for (n, v) in &self.facts {
             n.hash(&mut h);
             v.hash(&mut h);

@@ -13,8 +13,6 @@
 # scripts/slice-check.sh defer the retry until after their pool drains, but use
 # the same limits and the same slow/hang words.
 
-# shellcheck source=scripts/gnu-tools.sh
-source "${BASH_SOURCE[0]%/*}/gnu-tools.sh"
 retry_timeout=${RETRY_CASE_TIMEOUT:-$((case_timeout * 6))}
 
 # is_timeout <status>: true for a timeout (124 from `timeout`) or a kill after

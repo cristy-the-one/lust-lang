@@ -91,7 +91,7 @@ pub(crate) fn source_text(rel: &str) -> Result<String, String> {
     match std::env::var_os("LUST_STD_SRC") {
         Some(dir) if !dir.is_empty() => {
             let path = std::path::Path::new(&dir).join(rel);
-            crate::srctext::read(&path)
+            std::fs::read_to_string(&path)
                 .map_err(|e| format!("lust std load failed: cannot read {} from LUST_STD_SRC: {e}", path.display()))
         }
         _ => builtin_text(rel).map(str::to_string).ok_or_else(|| format!("lust std load failed: no built-in text for library/{rel}")),
@@ -175,7 +175,7 @@ impl StdPlan {
                 // A cap for a root in a huge tree; a short guess is still checked.
                 if seen.len() < 20_000 && !seen.contains(&path) {
                     seen.push(path.clone());
-                    if let Ok(t) = crate::srctext::read(&path) {
+                    if let Ok(t) = std::fs::read_to_string(&path) {
                         // A `#[path]` file's children load as a mod.rs file's do.
                         let dir =
                             if by_attr { path.parent().map(std::path::Path::to_path_buf).unwrap_or_default() } else { child_dir(&path) };

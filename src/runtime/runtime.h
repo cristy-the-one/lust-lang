@@ -121,76 +121,27 @@ static inline __attribute__((always_inline)) int lust_vec_fits(uint64_t n, uint6
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <shellapi.h>
-/* tcc's bundled headers and kernel32.def/msvcrt.def predate these
-   exports (Fls, one-time init, _lock_file). A direct call does not
-   link. Load them from the DLL instead. */
-static void *lust_win_proc(const char *dll, const char *name) {
-    HMODULE h = GetModuleHandleA(dll);
-    if (!h) h = LoadLibraryA(dll);
-    return h ? (void *)GetProcAddress(h, name) : 0;
-}
-static void lust_win_flockfile(FILE *f) {
-    static void (*fn)(FILE *);
-    if (!fn) fn = (void (*)(FILE *))lust_win_proc("msvcrt.dll", "_lock_file");
-    if (fn) fn(f);
-}
-static void lust_win_funlockfile(FILE *f) {
-    static void (*fn)(FILE *);
-    if (!fn) fn = (void (*)(FILE *))lust_win_proc("msvcrt.dll", "_unlock_file");
-    if (fn) fn(f);
-}
-#define flockfile lust_win_flockfile
-#define funlockfile lust_win_funlockfile
-typedef DWORD (WINAPI *lust_fls_alloc_fn)(PFLS_CALLBACK_FUNCTION);
-typedef PVOID (WINAPI *lust_fls_get_fn)(DWORD);
-typedef BOOL (WINAPI *lust_fls_set_fn)(DWORD, PVOID);
-static lust_fls_alloc_fn lust_fls_alloc;
-static lust_fls_get_fn lust_fls_get;
-static lust_fls_set_fn lust_fls_set;
-static void lust_fls_bind(void) {
-    if (lust_fls_get) return;
-    lust_fls_alloc = (lust_fls_alloc_fn)lust_win_proc("kernel32.dll", "FlsAlloc");
-    lust_fls_get = (lust_fls_get_fn)lust_win_proc("kernel32.dll", "FlsGetValue");
-    lust_fls_set = (lust_fls_set_fn)lust_win_proc("kernel32.dll", "FlsSetValue");
-}
+void _lock_file(FILE *);
+void _unlock_file(FILE *);
+#define flockfile _lock_file
+#define funlockfile _unlock_file
 static int lust_win_key_create(unsigned int *key, void (*dtor)(void *)) {
-    lust_fls_bind();
-    if (!lust_fls_alloc) return 1;
-    DWORD i = lust_fls_alloc((PFLS_CALLBACK_FUNCTION)dtor);
+    DWORD i = FlsAlloc((PFLS_CALLBACK_FUNCTION)dtor);
     if (i == 0xFFFFFFFFu) return 1;
     *key = (unsigned int)i;
     return 0;
 }
-static void *lust_win_getspecific(unsigned int key) {
-    lust_fls_bind();
-    return lust_fls_get ? lust_fls_get((DWORD)key) : 0;
-}
-static int lust_win_setspecific(unsigned int key, const void *v) {
-    lust_fls_bind();
-    if (!lust_fls_set) return 1;
-    return lust_fls_set((DWORD)key, (void *)v) ? 0 : 1;
-}
+static void *lust_win_getspecific(unsigned int key) { return FlsGetValue((DWORD)key); }
+static int lust_win_setspecific(unsigned int key, const void *v) { return FlsSetValue((DWORD)key, (void *)v) ? 0 : 1; }
 typedef struct { void (*init)(void); } lust_win_once_arg;
-typedef BOOL (CALLBACK *lust_once_cb)(void *, void *, void **);
-typedef BOOL (WINAPI *lust_once_exec_fn)(void *, lust_once_cb, void *, void **);
-static BOOL CALLBACK lust_win_once_cb(void *once, void *p, void **ctx) {
-    (void)once; (void)ctx;
+static BOOL CALLBACK lust_win_once_cb(PINIT_ONCE o, void *p, void **c) {
+    (void)o; (void)c;
     ((lust_win_once_arg *)p)->init();
     return TRUE;
 }
 static int lust_win_once(lust_pthread_once_t *once, void (*init)(void)) {
-    static lust_once_exec_fn exec;
-    static int ready;
-    if (!ready) {
-        exec = (lust_once_exec_fn)lust_win_proc("kernel32.dll", "InitOnceExecuteOnce");
-        ready = 1;
-    }
-    if (!exec) {
-        if (*once == 0) { *once = 2; init(); }
-        return 0;
-    }
     lust_win_once_arg a = {init};
-    return exec(once, lust_win_once_cb, &a, 0) ? 0 : 1;
+    return InitOnceExecuteOnce((PINIT_ONCE)once, lust_win_once_cb, &a, 0) ? 0 : 1;
 }
 typedef struct { void *(*start)(void *); void *arg; } lust_win_start;
 static DWORD WINAPI lust_win_thread_cb(void *p) {

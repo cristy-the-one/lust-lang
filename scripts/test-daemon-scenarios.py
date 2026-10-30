@@ -18,11 +18,10 @@
 # Exit 0 = pass, 1 = a mismatch, 2 = setup error.
 import os, re, shutil, signal, subprocess, sys, tempfile, time
 from concurrent.futures import ProcessPoolExecutor
-import daemon_argv  # scripts/daemon_argv.py
 import oracle_log  # scripts/oracle_log.py
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LUST = daemon_argv.lust_bin(os.environ.get("LUST_BIN", os.path.join(ROOT, "target/release/lust")))
+LUST = os.environ.get("LUST_BIN", os.path.join(ROOT, "target/release/lust"))
 SCEN = os.path.join(ROOT, "tests/daemon")
 RESTART = os.environ.get("DAEMON_SCENARIO_RESTART", "") not in ("", "0")
 
@@ -41,23 +40,11 @@ SUN_PATH_MAX = 107
 
 def sock_path(work):
     """`work`/d.sock, or d.sock in a new short dir under /tmp when that path is too long for a
-    Unix socket (`sock_dir_of` gives the dir to remove). Windows uses a TCP
-    address file, which has no sun_path limit."""
+    Unix socket (`sock_dir_of` gives the dir to remove)."""
     p = os.path.join(work, "d.sock")
-    if os.name == "nt" or len(os.fsencode(p)) <= SUN_PATH_MAX:
+    if len(os.fsencode(p)) <= SUN_PATH_MAX:
         return p
     return os.path.join(tempfile.mkdtemp(prefix="lsd-", dir="/tmp"), "d.sock")
-
-
-def stop_process_group(daemon):
-    """SIGTERM the daemon's session. Windows has no killpg; terminate() is the stop."""
-    if os.name == "nt":
-        daemon.terminate()
-        return
-    try:
-        os.killpg(os.getpgid(daemon.pid), signal.SIGTERM)
-    except Exception:
-        daemon.terminate()
 
 
 def sock_dir_of(sock, work):
@@ -250,7 +237,7 @@ def scenario(srcdir):
         env.pop("LUST_DAEMON_SOCKET", None)
         env["LUST_NO_DAEMON"] = "1"
     else:
-        daemon = subprocess.Popen(daemon_argv.daemon_argv(LUST), cwd=work, env=dict(env, **daemon_env(srcdir)), stderr=log,
+        daemon = subprocess.Popen([LUST, "daemon"], cwd=work, env=dict(env, **daemon_env(srcdir)), stderr=log,
                                   start_new_session=True)
     main = os.path.join(work, "main.rs")
     problems, notes = [], []
@@ -367,7 +354,10 @@ def scenario(srcdir):
         log.flush()
         if daemon is not None:
             problems.extend(guard_problems(os.path.join(work, "daemon.log"), name))
-            stop_process_group(daemon)
+            try:
+                os.killpg(os.getpgid(daemon.pid), signal.SIGTERM)
+            except Exception:
+                daemon.terminate()
         log.close()
         # Under LUST_CHECK_ITEMPATCH=1 a scenario the oracle never checked
         # fails (the returned tuple holds this same list).
@@ -389,14 +379,9 @@ def rebuilt_binary():
     work = tempfile.mkdtemp(prefix=f"lust-scen-{name}-")
     problems, sock = [], None
     try:
-        copied = {}
         for b in ("lust", "lust-core"):
-            src_dir = os.path.dirname(LUST)
-            src = os.path.join(src_dir, b + ".exe") if os.name == "nt" and os.path.isfile(os.path.join(src_dir, b + ".exe")) else os.path.join(src_dir, b)
-            dest_name = os.path.basename(src)
-            shutil.copy2(src, os.path.join(work, dest_name))
-            copied[b] = os.path.join(work, dest_name)
-        lust = copied["lust"]
+            shutil.copy2(os.path.join(os.path.dirname(LUST), b), os.path.join(work, b))
+        lust = os.path.join(work, "lust")
         main = os.path.join(work, "main.rs")
         with open(main, "w") as f:
             f.write("fn main() {\n    let x: u8 = true;\n}\n")
@@ -404,28 +389,21 @@ def rebuilt_binary():
         env = dict(os.environ, LUST_DAEMON_SOCKET=sock, LUST_NO_CACHE="1")
         env.pop("LUST_NO_DAEMON", None)
         log = open(os.path.join(work, "daemon.log"), "w")
-        daemon = subprocess.Popen(daemon_argv.daemon_argv(lust), cwd=work, env=env, stderr=log, start_new_session=True)
+        daemon = subprocess.Popen([lust, "daemon"], cwd=work, env=env, stderr=log, start_new_session=True)
         t0 = time.time()
         while not os.path.exists(env["LUST_DAEMON_SOCKET"]) and time.time() - t0 < 10:
             time.sleep(0.005)
         rc1, _, err1 = run([lust, "check", main], work, env)
         # The rebuild: a new file at the same path (new inode and mtime).
-        # Windows will not replace a running executable, but it will rename
-        # one. The running image keeps the renamed file; the path the next
-        # client opens is a new copy.
-        core = copied["lust-core"]
-        if os.name == "nt":
-            os.rename(core, core + ".running")
-            shutil.copy2(core + ".running", core)
-        else:
-            shutil.copy2(core, core + ".new")
-            os.replace(core + ".new", core)
+        core = os.path.join(work, "lust-core")
+        shutil.copy2(core, core + ".new")
+        os.replace(core + ".new", core)
         rc2, _, err2 = run([lust, "check", main], work, env)
         try:
             daemon.wait(timeout=10)
         except subprocess.TimeoutExpired:
             problems.append(f"{name}: the old daemon still runs after a client of another build")
-            stop_process_group(daemon)
+            os.killpg(os.getpgid(daemon.pid), signal.SIGTERM)
         log.close()
         text = open(os.path.join(work, "daemon.log")).read()
         if (rc1, first_code(err1)) != (rc2, first_code(err2)) or rc1 == 0:

@@ -79,7 +79,7 @@ if ! command -v timeout >/dev/null 2>&1; then
   echo "FAIL: the timeout command is required for per-case timeouts"
   exit 1
 fi
-filter=${1:-}
+filter=${LUST_GATE_FILTER:-${1:-}}
 oracle_args=()
 source "$root/scripts/case-pool.sh"
 

@@ -2278,8 +2278,9 @@ fn param_ctype(p: &Program, t: &CTy) -> String {
 /// the stack, so a frame slot is only 16-aligned: on Linux the value
 /// lives at the first aligned address in a char buffer. On Windows that
 /// buffer faults for the large 128-byte frames, so the value is an
-/// `_aligned_malloc` block freed by tcc's cleanup when the function
-/// returns. `l{i}` is a macro for it up to the `#undef` after the
+/// `_aligned_malloc` block. tcc's cleanup attribute on that pointer
+/// fail-fasts under PE, so the block is left to the process.
+/// `l{i}` is a macro for it up to the `#undef` after the
 /// function (fx-overalign). Dev C only: the release C compilers (clang,
 /// gcc, zig cc) realign the frame, and a plain local stays visible to
 /// their copy and scalar optimizations, which a local behind integer
@@ -2289,7 +2290,7 @@ fn overaligned_local(out: &mut String, i: usize, ct: &str, decl: &str, align: u6
     if cfg!(windows) {
         let _ = writeln!(
             out,
-            "  void *l{i}_b __attribute__((cleanup(lust_overaligned_free))) = lust_overaligned_alloc(sizeof({ct}), {align}); {ct} *l{i}_p = l{i}_b;\n#define l{i} (*l{i}_p)"
+            "  void *l{i}_b = lust_overaligned_alloc(sizeof({ct}), {align}); {ct} *l{i}_p = l{i}_b;\n#define l{i} (*l{i}_p)"
         );
     } else {
         let _ = writeln!(

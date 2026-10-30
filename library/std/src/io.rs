@@ -1403,12 +1403,6 @@ pub struct BufWriter<W: Write> {
     inner: W,
     /// The buffered bytes; its Vec capacity is the buffer capacity.
     buf: Vec<u8>,
-    /// A write reported more bytes than `buf` holds, so `drop_prefix`
-    /// panics. Windows rustc then `__fastfail`s from the second panic in
-    /// Drop, and that message never reaches a pipe. Drop exits 127
-    /// before flushing again.
-    #[cfg(windows)]
-    range_panic: bool,
 }
 
 impl<W: Write> BufWriter<W> {
@@ -1419,7 +1413,7 @@ impl<W: Write> BufWriter<W> {
 
     /// Creates a buffered writer with at least the given capacity.
     pub fn with_capacity(capacity: usize, inner: W) -> BufWriter<W> {
-        BufWriter { inner, buf: Vec::with_capacity(capacity), #[cfg(windows)] range_panic: false }
+        BufWriter { inner, buf: Vec::with_capacity(capacity) }
     }
 
     /// The inner writer.
@@ -1451,10 +1445,6 @@ impl<W: Write> BufWriter<W> {
         }
         let len = self.buf.len();
         if n > len {
-            #[cfg(windows)]
-            {
-                self.range_panic = true;
-            }
             panic!("range start index {} out of range for slice of length {}", n, len); //@ core/src/slice/index.rs:1020:55
         }
         for i in n..len {
@@ -1526,10 +1516,6 @@ impl<W: Write> Write for BufWriter<W> {
 
 impl<W: Write> Drop for BufWriter<W> {
     fn drop(&mut self) {
-        #[cfg(windows)]
-        if self.range_panic {
-            core::intrinsics::exit(127);
-        }
         if !self.buf.is_empty() {
             let _ = self.flush_buf();
         }

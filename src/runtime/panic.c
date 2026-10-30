@@ -260,7 +260,21 @@ static void lust_abort_hooked(lust_exc *ex, const uint8_t *msg, uint64_t len, co
    text), then `ex` pending. */
 static void lust_unw_raise_exc(lust_exc *ex, const uint8_t *msg, uint64_t len, const char *file, uint32_t line, uint32_t col) {
     lust_unw_state *s = lust_unw_get();
-    if (s->pending) return;
+    /* A panic while one is already pending is a panic during cleanup.
+       Linux takes the first exception before the drop, so this does not
+       run there. On Windows the drop still sees it pending: print this
+       panic (count >= 2 asks for the backtrace header) and fail-fast
+       the way rustc does, instead of dropping the message. */
+    if (s->pending) {
+#ifdef _WIN32
+        if (!s->in_hook) s->count++;
+        lust_run_hook(ex, msg, len, file, line, col, s->count, &s->in_hook);
+        fflush(stderr);
+        abort();
+#else
+        return;
+#endif
+    }
     if (!s->in_hook) s->count++;
     lust_run_hook(ex, msg, len, file, line, col, s->count, &s->in_hook);
 #ifndef __TINYC__
@@ -1183,7 +1197,9 @@ static LONG CALLBACK lust_win_overflow(EXCEPTION_POINTERS *ep) {
     HANDLE err = GetStdHandle((DWORD)-12);
     DWORD wrote = 0;
     WriteFile(err, msg, (DWORD)m, &wrote, 0);
-    return 0;
+    /* rustc's handler prints, then __fastfail. Returning here makes bash
+       report the raw stack-overflow exception as 139. */
+    lust_fast_abort();
 }
 static void lust_stack_guard_init(void) {
     typedef PVOID (WINAPI *add_fn)(ULONG, LONG (CALLBACK *)(EXCEPTION_POINTERS *));

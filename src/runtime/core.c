@@ -904,6 +904,10 @@ uint64_t lust_bounds(uint64_t i, uint64_t len, lust_loc loc) LUST_BODY({
         lust_string_push_cstr(&s, " but the index is ");
         lust_fmt_u64(&s, i);
         lust_panic_dyn(&s, loc);
+        /* Unwind mode returns. Handing `i` back would load one past the
+           allocation; on Windows that is a heap fail-fast (exit 127)
+           before the frame can catch the panic. */
+        return 0;
     }
     return i;
 })

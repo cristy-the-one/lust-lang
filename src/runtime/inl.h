@@ -201,7 +201,24 @@
 #define lust_rem_i32(a, b, loc) lust_inl_divs_(int32_t, -2147483647 - 1, lust_rem_i32, %, a, b, loc)
 
 /* An uncontended Mutex lock or unlock: one compare-exchange; a contended one (a waiter to
-   wake, a wait) takes the function. */
+   wake, a wait) takes the function. Windows's mutex word is one byte (rustc's SmallFutex);
+   a 4-byte exchange would read past it into the poison flag and the value. */
+#ifdef _WIN32
+#define lust_mutex_lock(st)                                                                             \
+    __extension__({                                                                                     \
+        uint8_t *lust_st_ = (uint8_t *)(st), lust_z_ = (uint8_t)0;                                      \
+        if (!__builtin_expect(__atomic_compare_exchange_n(lust_st_, &lust_z_, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED), 1)) \
+            lust_mutex_lock(lust_st_);                                                                  \
+        (void)0;                                                                                        \
+    })
+#define lust_mutex_unlock(st)                                                                           \
+    __extension__({                                                                                     \
+        uint8_t *lust_st_ = (uint8_t *)(st), lust_one_ = (uint8_t)1;                                    \
+        if (!__builtin_expect(__atomic_compare_exchange_n(lust_st_, &lust_one_, 0, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED), 1)) \
+            lust_mutex_unlock(lust_st_);                                                                \
+        (void)0;                                                                                        \
+    })
+#else
 #define lust_mutex_lock(st)                                                                             \
     __extension__({                                                                                     \
         uint32_t *lust_st_ = (st), lust_z_ = 0;                                                         \
@@ -216,6 +233,7 @@
             lust_mutex_unlock(lust_st_);                                                                \
         (void)0;                                                                                        \
     })
+#endif
 
 /* An empty Vec with no allocation (its dangling pointer is the alignment). */
 #define lust_vec_with_capacity(n, elem, align)                                                         \

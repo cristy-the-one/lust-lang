@@ -253,7 +253,8 @@ int lust_arc_take_unique(uint64_t *h) LUST_BODY({
 
 /* ---------- Locks: Mutex and RwLock over a futex word ----------
 
-   A `Mutex<T>` is { uint32_t st; uint8_t poison; T v; } and an `RwLock<T>`
+   A `Mutex<T>` is { uint32_t st; uint8_t poison; T v; } (Windows: st is
+   a uint8_t, rustc's SmallFutex) and an `RwLock<T>` is
    { uint32_t st; uint32_t wn; uint8_t poison; T v; } (cgen/sync.rs). All
    zero is unlocked, so `Mutex::new` in a static needs no constructor. The
    poison flag stays 0: a panic aborts the process. Locking a lock this
@@ -348,6 +349,18 @@ static void lust_futex_wait_for(uint32_t *p, uint32_t v, long rs, long rn) {
     sched_yield();
 #endif
 }
+#ifdef _WIN32
+/* One-byte WaitOnAddress for rustc's SmallFutex mutex word. */
+static void lust_mutex_wait8(uint8_t *p, uint8_t v) {
+    pthread_once(&lust_woa_once, lust_woa_init);
+    if (lust_woa) lust_woa(p, &v, 1, 0xffffffffu);
+    else SwitchToThread();
+}
+static void lust_mutex_wake8(uint8_t *p) {
+    pthread_once(&lust_woa_once, lust_woa_init);
+    if (lust_wake1) lust_wake1(p);
+}
+#endif
 #endif
 
 /* Poisoning (panic=unwind): the `poison` byte of a Mutex or RwLock. Bit 0
@@ -387,7 +400,50 @@ static uint32_t lust_lock_spin(uint32_t *st, uint32_t busy) {
 }
 
 /* Mutex states: 0 unlocked, 1 locked, 2 locked with waiters (Drepper's
-   futex mutex, as std's: spin first, then mark waiters and sleep). */
+   futex mutex, as std's: spin first, then mark waiters and sleep).
+   Windows waits on one byte (SmallFutex / WaitOnAddress size 1). A
+   channel's `uint32_t` lock uses the same entry; only its low byte
+   moves, which is the whole state. */
+#ifdef _WIN32
+static uint8_t lust_lock_spin8(uint8_t *st, uint8_t busy) {
+    uint8_t s;
+    for (int i = 0; i < 100; i++) {
+        __atomic_load(st, &s, 0);
+        if (s != busy) return s;
+        lust_lock_pause();
+    }
+    __atomic_load(st, &s, 0);
+    return s;
+}
+void lust_mutex_lock(void *stp) LUST_BODY({
+    uint8_t *st = (uint8_t *)stp;
+    uint8_t zero = 0, one = 1, two = 2, old;
+    if (__atomic_compare_exchange(st, &zero, &one, 0, 2, 0)) return;
+    uint8_t s = lust_lock_spin8(st, 1);
+    if (s == 0) {
+        if (__atomic_compare_exchange(st, &s, &one, 0, 2, 0)) return;
+    }
+    for (;;) {
+        if (s != 2) {
+            __atomic_exchange(st, &two, &old, 2);
+            if (old == 0) return;
+        }
+        lust_mutex_wait8(st, 2);
+        s = lust_lock_spin8(st, 1);
+    }
+})
+int lust_mutex_trylock(void *stp) LUST_BODY({
+    uint8_t *st = (uint8_t *)stp;
+    uint8_t zero = 0, one = 1;
+    return __atomic_compare_exchange(st, &zero, &one, 0, 2, 0);
+})
+void lust_mutex_unlock(void *stp) LUST_BODY({
+    uint8_t *st = (uint8_t *)stp;
+    uint8_t zero = 0, old;
+    __atomic_exchange(st, &zero, &old, 3);
+    if (old == 2) lust_mutex_wake8(st);
+})
+#else
 void lust_mutex_lock(uint32_t *st) LUST_BODY({
     uint32_t zero = 0, one = 1, two = 2, old;
     if (__atomic_compare_exchange(st, &zero, &one, 0, 2, 0)) return;
@@ -416,6 +472,7 @@ void lust_mutex_unlock(uint32_t *st) LUST_BODY({
     __atomic_exchange(st, &zero, &old, 3);
     if (old == 2) lust_futex_wake(st, 1);
 })
+#endif
 
 /* RwLock: st is the reader count, or LUST_RW_WRITER while written; st[1]
    (wn) counts sleepers. Every step is SeqCst, so an unlock that reads

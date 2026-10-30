@@ -604,8 +604,10 @@ impl fmt::Debug for FileType {
 #[derive(Clone, PartialEq, Eq)]
 pub struct Permissions {
     pub(crate) mode: u64,
+    /// Raw `dwFileAttributes`. `pub(crate)` so `os::unix::fs::PermissionsExt::from_mode`
+    /// (compiled on every host) can build a value; it is not a public field.
     #[cfg(windows)]
-    attrs: u32,
+    pub(crate) attrs: u32,
 }
 
 impl Permissions {

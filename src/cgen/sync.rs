@@ -46,6 +46,9 @@ pub(super) fn sync_ctype(k: SyncTy, e: &CTy) -> String {
 /// `st` (the futex word), then `wn` (an RwLock's sleepers) and `poison`.
 pub(super) fn cell_words(k: SyncTy) -> &'static [IntTy] {
     match k {
+        // Windows `Mutex` is a `SmallFutex` (`AtomicU8`) plus the poison
+        // flag (`AtomicBool`), both align 1. Other hosts keep the 4-byte futex.
+        SyncTy::Mutex if cfg!(windows) => &[IntTy::U8, IntTy::U8],
         SyncTy::Mutex => &[IntTy::U32, IntTy::U8],
         SyncTy::RwLock => &[IntTy::U32, IntTy::U32, IntTy::U8],
         _ => &[IntTy::U32],

@@ -1102,9 +1102,10 @@ fn compute(
                 let v = no_niche(go(tys, shapes, tys.adt_first_ty_arg(t).ok_or(())?, env, frames, memo, active)?);
                 struct_layout(&[int_layout(IntTy::Isize), v], Repr::default())
             }
-            // The futex locks (Linux): `Mutex<T>` is `{ futex: AtomicU32,
-            // poison: AtomicBool, data: UnsafeCell<T> }`, `RwLock<T>` the
-            // same with an 8-byte state (two `AtomicU32`).
+            // `Mutex<T>` is `{ futex, poison: AtomicBool, data: UnsafeCell<T> }`.
+            // The futex is an `AtomicU32` on Unix and a `SmallFutex`
+            // (`AtomicU8`) on Windows. `RwLock<T>` is two `AtomicU32`s
+            // (8 bytes) plus the poison flag on every host.
             // `OnceLock<T>`: `{ once: Once (an AtomicU32 futex), value:
             // UnsafeCell<MaybeUninit<T>> }`.
             Some(BuiltinTy::Sync(crate::ty::sync::SyncTy::OnceLock)) => {
@@ -1114,8 +1115,12 @@ fn compute(
             }
             Some(BuiltinTy::Sync(k @ (crate::ty::sync::SyncTy::Mutex | crate::ty::sync::SyncTy::RwLock))) => {
                 let v = no_niche(go(tys, shapes, tys.adt_first_ty_arg(t).ok_or(())?, env, frames, memo, active)?);
-                let state = if k == crate::ty::sync::SyncTy::Mutex { 4 } else { 8 };
-                struct_layout(&[Layout::simple(state, 4, None), Layout::simple(1, 1, None), v], Repr::default())
+                let (state, state_align) = if k == crate::ty::sync::SyncTy::Mutex {
+                    if cfg!(windows) { (1, 1) } else { (4, 4) }
+                } else {
+                    (8, 4)
+                };
+                struct_layout(&[Layout::simple(state, state_align, None), Layout::simple(1, 1, None), v], Repr::default())
             }
             // The std types below as Rust 1.99 lays them out on 64-bit
             // Linux (checked with size_of and Option niches, tf-build): the

@@ -1949,7 +1949,9 @@ fn c_size_align_legacy(p: &Program, t: &CTy) -> (u64, u64) {
             CTy::Sync(k, e) if k.is_cell_struct() => {
                 let (es, ea) = go(p, e, seen);
                 let at = sync::cell_words(*k).iter().map(|i| i.bits() as u64 / 8).sum::<u64>();
-                let align = ea.max(4);
+                // The futex word's alignment: 4 for a `u32`, 1 for Windows's `u8` mutex.
+                let word_align = sync::cell_words(*k).iter().map(|i| (i.bits() as u64 / 8).min(8).max(1)).max().unwrap_or(1);
+                let align = ea.max(word_align);
                 (align_up(align_up(at, ea) + es, align), align)
             }
             CTy::Sync(crate::ty::sync::SyncTy::PoisonError | crate::ty::sync::SyncTy::SendError, e) => go(p, e, seen),

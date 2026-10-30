@@ -594,6 +594,11 @@ typedef struct lust_JoinHdr {
     lust_Scope *scope; /* 0 for thread::spawn */
     uint32_t panicked; /* the thread ended by a panic; `payload` is its Box<dyn Any + Send> */
     lust_dyn payload;
+    /* The packet allocation (`lust_alloc`). On Windows an over-aligned
+       return value makes this an `_aligned_malloc` block; `free` of it
+       fail-fasts. 0 means the caller did not record them (plain `free`). */
+    uint64_t pkt_bytes;
+    uint64_t pkt_align;
 } lust_JoinHdr;
 
 /* A JoinHdr's thread id as the pthread calls take it. The field is an
@@ -685,7 +690,8 @@ static void lust_packet_free(lust_JoinHdr *h) {
     uint32_t one = 1;
     if (sc && h->panicked) __atomic_store(&sc->panicked, &one, 5);
     lust_thread_info_release(h->th);
-    free(h);
+    if (h->pkt_bytes) lust_dealloc(h, h->pkt_bytes, h->pkt_align ? h->pkt_align : 1);
+    else free(h);
     if (sc && __atomic_sub_fetch(&sc->live, 1, 5) == 0) lust_futex_wake(&sc->live, 0x7fffffff);
 }
 

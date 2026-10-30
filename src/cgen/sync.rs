@@ -1566,7 +1566,7 @@ impl FnGen<'_, '_> {
             };
             let _ = writeln!(
                 self.out,
-                "    {pk} *{h} = (void *)lust_alloc(sizeof({pk}), _Alignof({pk})); {h}->h.run = {run}; {h}->h.drop_ret = {drop}; {h}->h.scope = {scope}; {h}->env = {env}; lust_ThreadBuilder bv_ = {bv}; int32_t {e2} = lust_thread_spawn_builder(&{h}->h, &bv_); drop_{}(&bv_); {} {t}; if ({e2} == 0) {{ {} {okv} = &{h}->h; }} else {{ {drop_env2}lust_dealloc((void*){h}, sizeof({pk}), _Alignof({pk})); {} {errv} = ({}){{ }}; {osf} = {e2}; {} }}",
+                "    {pk} *{h} = (void *)lust_alloc(sizeof({pk}), _Alignof({pk})); {h}->h.pkt_bytes = sizeof({pk}); {h}->h.pkt_align = _Alignof({pk}); {h}->h.run = {run}; {h}->h.drop_ret = {drop}; {h}->h.scope = {scope}; {h}->env = {env}; lust_ThreadBuilder bv_ = {bv}; int32_t {e2} = lust_thread_spawn_builder(&{h}->h, &bv_); drop_{}(&bv_); {} {t}; if ({e2} == 0) {{ {} {okv} = &{h}->h; }} else {{ {drop_env2}lust_dealloc((void*){h}, sizeof({pk}), _Alignof({pk})); {} {errv} = ({}){{ }}; {osf} = {e2}; {} }}",
                 mangle(&CTy::Sync(SyncTy::ThreadBuilder, Box::new(CTy::Unit))),
                 ctype(&res),
                 disc_set(self.p, &res, &t, 0),
@@ -1578,7 +1578,7 @@ impl FnGen<'_, '_> {
         }
         let _ = writeln!(
             self.out,
-            "    {pk} *{h} = (void *)lust_alloc(sizeof({pk}), _Alignof({pk})); {h}->h.run = {run}; {h}->h.drop_ret = {drop}; {h}->h.scope = {scope}; {h}->env = {env}; lust_thread_spawn(&{h}->h, {loc});"
+            "    {pk} *{h} = (void *)lust_alloc(sizeof({pk}), _Alignof({pk})); {h}->h.pkt_bytes = sizeof({pk}); {h}->h.pkt_align = _Alignof({pk}); {h}->h.run = {run}; {h}->h.drop_ret = {drop}; {h}->h.scope = {scope}; {h}->env = {env}; lust_thread_spawn(&{h}->h, {loc});"
         );
         format!("(&{h}->h)")
     }

@@ -141,8 +141,13 @@ impl Tcc {
         // gives the main thread 8 MiB, which is what the programs under
         // test were written for.
         let stack = if cfg!(windows) && (output == TCC_OUTPUT_EXE || output == TCC_OUTPUT_DLL) { " -Wl,-stack=8388608" } else { "" };
+        // A PE dll exports nothing unless asked. tcc units call the runtime
+        // (inl.h's fast paths are off under __TINYC__), and the warm
+        // executable resolves those calls against libbase. Linux exports
+        // every global from a .so; -rdynamic is that rule for tcc's PE linker.
+        let export = if cfg!(windows) && output == TCC_OUTPUT_DLL { " -rdynamic" } else { "" };
         let opts = CString::new(format!(
-            "{}{stack}",
+            "{}{stack}{export}",
             if debug { "-g -w -fno-asynchronous-unwind-tables" } else { "-w -fno-asynchronous-unwind-tables" }
         ))
         .unwrap();

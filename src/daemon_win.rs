@@ -22,6 +22,7 @@ unsafe extern "system" {
     fn WSAEventSelect(socket: usize, event: *mut std::ffi::c_void, mask: i32) -> i32;
     fn WSAEnumNetworkEvents(socket: usize, event: *mut std::ffi::c_void, events: *mut NetEvents) -> i32;
     fn WSAGetLastError() -> i32;
+    fn ioctlsocket(socket: usize, cmd: i32, arg: *mut u32) -> i32;
     fn select(nfds: i32, read: *mut FdSet, write: *mut FdSet, except: *mut FdSet, timeout: *mut Timeval) -> i32;
     fn recv(socket: usize, buf: *mut u8, len: i32, flags: i32) -> i32;
 }
@@ -48,6 +49,8 @@ const FD_ACCEPT: i32 = 1 << 3;
 const WAIT_TIMEOUT: u32 = 258;
 const MSG_PEEK: i32 = 2;
 const WSAEWOULDBLOCK: i32 = 10035;
+/// `FIONBIO`. Clearing it fails with `WSAEINVAL` while `WSAEventSelect` is set.
+const FIONBIO: i32 = 0x8004_667e_u32 as i32;
 
 static WAKE: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 
@@ -133,11 +136,25 @@ impl Listener {
     pub fn accept(&self) -> Option<TcpStream> {
         match self.tcp.accept() {
             Ok((stream, _)) => {
-                let _ = stream.set_nonblocking(false);
+                force_blocking(&stream);
                 Some(stream)
             }
             Err(_) => None,
         }
+    }
+}
+
+/// Makes an accepted stream block. `accept` copies the listener's
+/// `WSAEventSelect`, which forces non-blocking mode and makes
+/// `ioctlsocket(FIONBIO)` fail until that association is cleared. A
+/// non-blocking read before the client has written returns `WouldBlock`,
+/// and the serve loop answers that as `error: bad request`.
+pub fn force_blocking(stream: &TcpStream) {
+    let sock = stream.as_raw_socket() as usize;
+    unsafe {
+        WSAEventSelect(sock, std::ptr::null_mut(), 0);
+        let mut nb = 0u32;
+        ioctlsocket(sock, FIONBIO, &mut nb);
     }
 }
 

@@ -246,9 +246,17 @@ saved_tmpdir=${TMPDIR:-}
 saved_temp=${TEMP:-}
 saved_tmp=${TMP:-}
 export TMPDIR=$work/td; mkdir -p "$TMPDIR"
-# Rust's temp_dir on Windows reads TMP/TEMP, not TMPDIR, and wants a Windows path.
+# Rust's temp_dir on Windows reads TMP/TEMP, not TMPDIR. A mixed path
+# (forward slashes) survives Git bash's rewrite of backslash paths in
+# the environment of a native executable, and the exclusion stops a
+# second conversion. GetTempPath accepts the mixed form.
 if [ "$win" = 1 ]; then
-  export TEMP=$(cygpath -w "$TMPDIR") TMP=$TEMP
+  export TEMP=$(cygpath -m "$TMPDIR")
+  export TMP=$TEMP
+  case ";${MSYS2_ENV_CONV_EXCL:-};" in
+    *";TEMP;"*) ;;
+    *) export MSYS2_ENV_CONV_EXCL="${MSYS2_ENV_CONV_EXCL:+$MSYS2_ENV_CONV_EXCL;}TEMP;TMP" ;;
+  esac
 fi
 wait_gone() { # wait_gone <path>
   local i

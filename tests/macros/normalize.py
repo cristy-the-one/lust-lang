@@ -655,7 +655,14 @@ def canonicalize(toks):
 def main():
     # Space-joined tokens, wrapped at 100 columns. Wrapping is
     # cosmetic: normalize.py on its own output gives the same text.
+    # The committed .expanded files are LF. Windows text mode would
+    # write CR LF and every line would differ.
     out = sys.stdout
+    if hasattr(out, "reconfigure"):
+        try:
+            out.reconfigure(newline="\n")
+        except (AttributeError, OSError, ValueError):
+            pass
     col = 0
     for tok in canonicalize(list(tokens(sys.stdin.read()))):
         if col and col + 1 + len(tok) > 100:

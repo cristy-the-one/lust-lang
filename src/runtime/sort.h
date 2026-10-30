@@ -58,8 +58,10 @@ uint8_t *lust_sort_tmp_get(lust_sort_cx *s, lust_sort_tmp *t) LUST_BODY({
     t->p = s->size <= 64 && s->align <= 16 ? t->local : (uint8_t *)lust_alloc(s->size, s->align);
     return t->p;
 })
-void lust_sort_tmp_free(lust_sort_tmp *t) LUST_BODY({
-    if (t->p != t->local) free(t->p);
+void lust_sort_tmp_free(lust_sort_cx *s, lust_sort_tmp *t) LUST_BODY({
+    /* Heap temps come from lust_alloc. On Windows an element aligned past
+       16 is an _aligned_malloc block; free() of it fail-fasts. */
+    if (t->p != t->local) lust_dealloc(t->p, s->size, s->align);
 })
 
 /* shared/mod.rs find_existing_run */
@@ -93,7 +95,7 @@ void lust_sort_insert_tail(lust_sort_cx *s, uint8_t *begin, uint8_t *tail) LUST_
         if (!LS_LESS(tmp, sift)) break;
     }
     lust_copy_small(gap, tmp, s->size);
-    lust_sort_tmp_free(&t);
+    lust_sort_tmp_free(s, &t);
 })
 
 void lust_sort_insertion_shift_left(lust_sort_cx *s, uint8_t *v, uint64_t len, uint64_t offset) LUST_BODY({
@@ -240,7 +242,7 @@ void lust_sort_small_network(lust_sort_cx *s, uint8_t *v, uint64_t len) LUST_BOD
     uint8_t *stack = s->align <= 16 ? stack_buf : (uint8_t *)lust_alloc(sizeof stack_buf, s->align);
     lust_sort_bidir_merge(s, v, len, stack);
     lust_copy_small(v, stack, len * s->size);
-    if (stack != stack_buf) free(stack);
+    if (stack != stack_buf) lust_dealloc(stack, sizeof stack_buf, s->align);
 })
 
 /* shared/pivot.rs */
@@ -382,11 +384,11 @@ void lust_sort_stable_quick(lust_sort_cx *s, uint8_t *v, uint64_t len, uint8_t *
             v = LS_AT(v, mid_eq);
             len -= mid_eq;
             left_ancestor_pivot = 0;
-            lust_sort_tmp_free(&t);
+            lust_sort_tmp_free(s, &t);
             continue;
         }
         lust_sort_stable_quick(s, LS_AT(v, left_len), len - left_len, scratch, scratch_len, limit, pivot_ref);
-        lust_sort_tmp_free(&t);
+        lust_sort_tmp_free(s, &t);
         len = left_len;
     }
 })
@@ -492,7 +494,7 @@ void lust_sort_stable(void *v, uint64_t len, uint64_t size, uint64_t align, uint
     if (!scratch) abort();
     uint8_t eager = len <= lust_sort_stable_threshold(s) * 2;
     lust_sort_drift(s, (uint8_t *)v, len, scratch, scratch_len, eager);
-    free(scratch);
+    lust_dealloc(scratch, scratch_len * size, align);
 })
 
 /* ---------- unstable: ipnsort ---------- */
@@ -512,7 +514,7 @@ void lust_sort_unstable_small(lust_sort_cx *s, uint8_t *v, uint64_t len) LUST_BO
         uint8_t scratch_buf[4096] __attribute__((aligned(16)));
         uint8_t *scratch = s->align <= 16 ? scratch_buf : (uint8_t *)lust_alloc(sizeof scratch_buf, s->align);
         lust_sort_small_general(s, v, len, scratch);
-        if (scratch != scratch_buf) free(scratch);
+        if (scratch != scratch_buf) lust_dealloc(scratch, sizeof scratch_buf, s->align);
     } else if (len >= 2) {
         lust_sort_insertion_shift_left(s, v, len, 1);
     }
@@ -565,7 +567,7 @@ uint64_t lust_sort_lomuto(lust_sort_cx *s, uint8_t *v, uint64_t len, uint8_t *pi
         right += sz;
         if (is_done) break;
     }
-    lust_sort_tmp_free(&t);
+    lust_sort_tmp_free(s, &t);
     return num_lt;
 })
 
@@ -593,7 +595,7 @@ uint64_t lust_sort_hoare(lust_sort_cx *s, uint8_t *v, uint64_t len, uint8_t *piv
         left += sz;
     }
     if (gap_pos) lust_copy_small(gap_pos, gap_value, sz);
-    lust_sort_tmp_free(&t);
+    lust_sort_tmp_free(s, &t);
     return (uint64_t)(left - v) / sz;
 })
 

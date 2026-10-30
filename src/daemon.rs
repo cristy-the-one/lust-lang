@@ -1132,9 +1132,7 @@ impl Conn {
                 let _ = s.set_nonblocking(false);
             }
             #[cfg(windows)]
-            Conn::Tcp(s) => {
-                let _ = s.set_nonblocking(false);
-            }
+            Conn::Tcp(s) => win::force_blocking(s),
         }
     }
 
@@ -1273,6 +1271,10 @@ pub fn serve(sock: &Path) -> ! {
     let idle = protocol::daemon_idle();
     let mut last = std::time::Instant::now();
     let base = std::env::temp_dir().join(format!("lust-daemon-{}", std::process::id()));
+    // The directory exists for the whole serve, including the wait before
+    // the first session writes an object. A hard kill leaves it for the
+    // next daemon's sweep; every controlled exit deletes it.
+    let _ = std::fs::create_dir_all(&base);
     let mut sessions: HashMap<SessionKey, Entry> = HashMap::new();
     let mut made = 0usize;
     let mut served = 0u64;

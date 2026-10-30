@@ -1385,6 +1385,10 @@ struct FnGen<'b, 'p> {
     unw: Option<Unw>,
     /// The value being assigned comes from a `Call` terminator.
     unw_call: bool,
+    /// `place` is only resolving a type (`place_ty`). An index check
+    /// must not be emitted: the expression is discarded, and the real
+    /// `place` emits it.
+    suppress_index: bool,
     /// Unwind tables (`Program::unwind_tables`): this fn has a frame struct `L` (cgen/unwind.rs
     /// `frame_struct`), the ladder entry its block stored last in `L.st`, and whether the
     /// blocks being emitted are the cleanup fn's.
@@ -2089,8 +2093,16 @@ fn assume_unreachable(p: &Program) -> bool {
 }
 
 fn ret_by_out(p: &Program, t: &CTy) -> bool {
-    let size = c_size_align(p, t).0;
-    size > 32 || (size == 0 && zst_holds_array(p, t)) || split_ret_by_out(p, t, size)
+    let (size, align) = c_size_align(p, t);
+    size > 32
+        || (size == 0 && zst_holds_array(p, t))
+        || split_ret_by_out(p, t, size)
+        // PE tcc keeps the frame 16-aligned, so a by-value return of a
+        // more-aligned value is an sret slot in the caller and the frame
+        // size is wrong (`overaligned_locals`, exit 127, no stderr). Dev C
+        // on Windows passes it through the out pointer; the slot is one
+        // this compiler allocated. Release C realigns the frame itself.
+        || (cfg!(windows) && align > 16 && !names::release() && !ll::on(p))
 }
 
 /// `LUST_RELEASE_AGG_RET`: which 9-32 byte returns release C passes through the out pointer.
@@ -2301,6 +2313,21 @@ fn overaligned_local(out: &mut String, i: usize, ct: &str, decl: &str, align: u6
     if decl.contains('=') {
         let _ = writeln!(out, "  {decl};");
     }
+}
+
+/// Windows dev C cannot put a value aligned past 16 in tcc's frame: the
+/// slot is only 16-aligned, and the mis-sized frame is what
+/// `overaligned_locals` / `overaligned_by_value` die on (exit 127, no
+/// stderr). Release C compilers realign the frame themselves.
+fn win_heap_align(align: u64) -> bool {
+    cfg!(windows) && align > 16 && !names::release()
+}
+
+/// Declaration of a heap temporary `name` (the value is `(*name_p)`).
+fn win_heap_slot(name: &str, ct: &str, align: u64) -> String {
+    format!(
+        "void *{name}_b __attribute__((cleanup(lust_overaligned_free))) = lust_overaligned_alloc(sizeof({ct}), {align}ull); {ct} *{name}_p = {name}_b"
+    )
 }
 
 /// True when `f` gets C of its own: a plain fn, an instance, or a
@@ -2718,6 +2745,7 @@ impl<'b, 'p> FnGen<'b, 'p> {
             stmt_unw: body.stmt_unwind.iter().map(|&(b, i, u)| ((b.0, i), u.0)).collect(),
             unw: None,
             unw_call: false,
+            suppress_index: false,
             zc_frame: false,
             zc_st: None,
             zc_in_cleanup: false,
@@ -3738,9 +3766,17 @@ impl FnGen<'_, '_> {
                 (Proj::Downcast(v), _) => variant = Some(*v),
                 (Proj::Index(l), CTy::Vec(el)) => {
                     let loc = self.index_loc(*l, loc);
-                    e = match self.unw {
-                        Some(Unw::Goto(b)) => self.index_unw(&format!("{e}.len"), &format!("(({}*){e}.ptr)", ctype(&el)), *l, &loc, b),
-                        _ => format!("(({}*){e}.ptr)[lust_bounds(l{l}, {e}.len, {loc})]", ctype(&el)),
+                    let el_ct = ctype(&el);
+                    let b = match self.unw {
+                        Some(Unw::Goto(b)) => Some(b),
+                        _ => None,
+                    };
+                    e = if let Some(b) = b {
+                        let len = format!("{e}.len");
+                        let base = format!("(({el_ct}*){e}.ptr)");
+                        self.index_unw(&len, &base, *l, &loc, b)
+                    } else {
+                        format!("(({el_ct}*){e}.ptr)[lust_bounds(l{l}, {e}.len, {loc})]")
                     };
                     t = *el;
                 }
@@ -3761,9 +3797,16 @@ impl FnGen<'_, '_> {
                 }
                 (Proj::Index(l), CTy::Array(el, n)) => {
                     let loc = self.index_loc(*l, loc);
-                    e = match self.unw {
-                        Some(Unw::Goto(b)) => self.index_unw(&n.to_string(), &format!("{e}.v"), *l, &loc, b),
-                        _ => format!("{e}.v[lust_bounds(l{l}, {n}, {loc})]"),
+                    let b = match self.unw {
+                        Some(Unw::Goto(b)) => Some(b),
+                        _ => None,
+                    };
+                    e = if let Some(b) = b {
+                        let len = n.to_string();
+                        let base = format!("{e}.v");
+                        self.index_unw(&len, &base, *l, &loc, b)
+                    } else {
+                        format!("{e}.v[lust_bounds(l{l}, {n}, {loc})]")
                     };
                     t = *el;
                 }
@@ -3798,9 +3841,16 @@ impl FnGen<'_, '_> {
                 // `&Box<[T]>` walks it as `&Vec<T>` is walked).
                 (Proj::Index(l), CTy::Slice(el) | CTy::BoxSlice(el)) => {
                     let loc = self.index_loc(*l, loc);
-                    e = match self.unw {
-                        Some(Unw::Goto(b)) => self.index_unw(&format!("{e}.len"), &format!("{e}.ptr"), *l, &loc, b),
-                        _ => format!("{e}.ptr[lust_bounds(l{l}, {e}.len, {loc})]"),
+                    let b = match self.unw {
+                        Some(Unw::Goto(b)) => Some(b),
+                        _ => None,
+                    };
+                    e = if let Some(b) = b {
+                        let len = format!("{e}.len");
+                        let base = format!("{e}.ptr");
+                        self.index_unw(&len, &base, *l, &loc, b)
+                    } else {
+                        format!("{e}.ptr[lust_bounds(l{l}, {e}.len, {loc})]")
                     };
                     t = *el;
                 }
@@ -3821,14 +3871,36 @@ impl FnGen<'_, '_> {
     /// expression whose failed bounds check panics and leaves for the
     /// cleanup at block `b` before any element is read. The `(void)`
     /// keeps `wrap_calls` from adding its own check in front of `b`.
-    fn index_unw(&self, len: &str, base: &str, l: Local, loc: &str, b: u32) -> String {
+    ///
+    /// PE tcc miscompiles that `goto` when the statement expression is a
+    /// function argument (the closure's `ret` then `__fastfail`s, and
+    /// `catch_unwind` never sees the panic). Windows dev C emits the
+    /// check as its own statement and loads the element plainly.
+    fn index_unw(&mut self, len: &str, base: &str, l: Local, loc: &str, b: u32) -> String {
         if self.p.unwind_tables {
             // The bounds panic never returns: the frame's cleanup runs from `L.st`.
             return format!(
                 "(*({{ if (__builtin_expect(l{l} >= {len}, 0)) {{ (void)lust_bounds(l{l}, {len}, {loc}); __builtin_unreachable(); }} &{base}[l{l}]; }}))"
             );
         }
+        if cfg!(windows) && !self.suppress_index {
+            let _ = writeln!(
+                self.out,
+                "    if (l{l} >= {len}) {{ (void)lust_bounds(l{l}, {len}, {loc}); lust_unw_take(&ex); goto bb{b}; }}"
+            );
+            return format!("({base})[l{l}]");
+        }
         format!("(*({{ if (l{l} >= {len}) {{ (void)lust_bounds(l{l}, {len}, {loc}); lust_unw_take(&ex); goto bb{b}; }} &{base}[l{l}]; }}))")
+    }
+
+    /// `place` for its type only. The index check is not emitted; the
+    /// expression that later reads the place emits it once.
+    fn place_ty(&mut self, pl: &Place, loc: &str) -> CTy {
+        let prev = self.suppress_index;
+        self.suppress_index = true;
+        let t = self.place(pl, loc).1;
+        self.suppress_index = prev;
+        t
     }
 
     fn operand(&mut self, o: &Operand, loc: &str, post: &mut Vec<String>) -> (String, CTy) {
@@ -3889,6 +3961,23 @@ impl FnGen<'_, '_> {
 
     // ---------- Statements ----------
 
+    /// `T name = value` in the block this opens. On Windows dev C an
+    /// over-aligned `T` is a heap slot (`win_heap_align`); the returned
+    /// text is the expression that names the value.
+    fn assign_temp(&mut self, t: &CTy, value: &str) -> String {
+        let name = self.tmp();
+        let ct = ctype(t);
+        if win_heap_align(c_size_align(self.p, t).1) {
+            let align = c_size_align(self.p, t).1;
+            let slot = win_heap_slot(&name, &ct, align);
+            let _ = writeln!(self.out, "    {slot}; *{name}_p = {value};");
+            format!("(*{name}_p)")
+        } else {
+            let _ = writeln!(self.out, "    {ct} {name} = {value};");
+            name
+        }
+    }
+
     /// Stores a computed value into `dest`, dropping the old value first when
     /// the local owns one. Shared by `Assign` statements and `Call`
     /// terminators: `make_value` produces the value text (and may emit helper
@@ -3948,8 +4037,7 @@ impl FnGen<'_, '_> {
                 self.out.insert_str(body_start, &flags);
                 post.clear();
             }
-            let t = self.tmp();
-            let _ = writeln!(self.out, "    {} {t} = {value};", ctype(&dt));
+            let t = self.assign_temp(&dt, &value);
             for p in &post {
                 let _ = writeln!(self.out, "    {p}");
             }
@@ -4019,8 +4107,7 @@ impl FnGen<'_, '_> {
             return;
         }
         if drop {
-            let t = self.tmp();
-            let _ = writeln!(self.out, "    {} {t} = {value};", ctype(&dt));
+            let t = self.assign_temp(&dt, &value);
             for p in &post {
                 let _ = writeln!(self.out, "    {p}");
             }
@@ -4069,7 +4156,7 @@ impl FnGen<'_, '_> {
                     let _ = writeln!(self.out, "  if (!lk{}) {{", dest.local);
                 }
                 let mentions = rvalue_mentions(rv, dest.local);
-                let dest_cty = self.place(dest, &loc).1;
+                let dest_cty = self.place_ty(dest, &loc);
                 self.r3_value = inplace(self.p).r3 && !crate::ir::dropflags::may_panic_before_moves(dest, rv);
                 self.emit_assign(dest, mentions, &loc, |s, loc, post| match rv {
                     // A never value (which shares the unit C form) used
@@ -4155,7 +4242,7 @@ impl FnGen<'_, '_> {
                 // A call to a never fn (unit C form) whose destination
                 // has another type: the call never returns, so give the
                 // dead assignment a zero of the destination type.
-                let dest_cty = self.place(dest, &loc).1;
+                let dest_cty = self.place_ty(dest, &loc);
                 let ret_unit = match target {
                     CallTarget::Fn(f) => cty(&self.p.tys, self.p.fn_info(*f).ret) == CTy::Unit,
                     CallTarget::Intrinsic(id) => lang::intrinsic(*id).ret == SigTy::Never,
@@ -4452,12 +4539,20 @@ impl FnGen<'_, '_> {
     /// its callers.
     /// The out-pointer target of a large-return call: the destination the caller set in
     /// `call_out` (no declaration), else a new temporary of C type `ct` and its declaration.
-    fn out_target(&mut self, ct: &str) -> (String, String) {
+    fn out_target(&mut self, t: &CTy) -> (String, String) {
         match self.call_out.take() {
             Some(d) => (String::new(), d),
             None => {
-                let t = self.tmp();
-                (format!("{ct} {t}; "), t)
+                let name = self.tmp();
+                let ct = ctype(t);
+                let align = c_size_align(self.p, t).1;
+                if win_heap_align(align) {
+                    let slot = win_heap_slot(&name, &ct, align);
+                    let _ = writeln!(self.out, "    {slot};");
+                    (String::new(), format!("(*{name}_p)"))
+                } else {
+                    (format!("{ct} {name}; "), name)
+                }
             }
         }
     }
@@ -4510,7 +4605,8 @@ impl FnGen<'_, '_> {
                     return v;
                 }
                 if ret_is_large(self.p, f) {
-                    let (decl, t) = self.out_target(&ctype(&cty(&self.p.tys, info.ret)));
+                    let ret_ty = cty(&self.p.tys, info.ret);
+                    let (decl, t) = self.out_target(&ret_ty);
                     let pre = if args.is_empty() { String::new() } else { format!(", {}", args.join(", ")) };
                     let _ = writeln!(self.out, "    {decl}{}(&{t}{pre});", self.slots.callee(self.p, f));
                     t
@@ -4726,7 +4822,7 @@ impl FnGen<'_, '_> {
                 let rc = ctype(&ret);
                 let pre: String = vals.iter().map(|v| format!(", {v}")).collect();
                 if ret_by_out(self.p, &ret) {
-                    let (decl, t) = self.out_target(&rc);
+                    let (decl, t) = self.out_target(&ret);
                     let _ = writeln!(self.out, "    {decl}((void (*)({rc} *, {}))({rt}.vt[{k}]))(&{t}, {rt}.data{pre});", tys.join(", "));
                     t
                 } else {
@@ -4752,7 +4848,7 @@ impl FnGen<'_, '_> {
                     keep
                 });
                 if ret_by_out(self.p, ret) {
-                    let (decl, t) = self.out_target(&ctype(ret));
+                    let (decl, t) = self.out_target(ret);
                     let pre = if args.is_empty() { String::new() } else { format!(", {}", args.join(", ")) };
                     let _ = writeln!(self.out, "    {decl}l{callee}(&{t}{pre});");
                     t
@@ -4772,6 +4868,25 @@ impl FnGen<'_, '_> {
     fn make_variant(&mut self, t: &CTy, variant: usize, vals: &[String]) -> String {
         self.note_held(t);
         variant_lit(self.p, t, variant, vals)
+    }
+
+    /// Windows dev C: build a value of `t` in a heap slot when its alignment
+    /// is past 16 (`win_heap_align`), so the value is never a tcc frame slot.
+    /// `stores` writes the fields through the pointer (padding is zeroed, as
+    /// a compound literal would). None on every other target, and the caller
+    /// keeps its compound literal.
+    fn heap_overaligned(&mut self, t: &CTy, stores: impl FnOnce(&mut Self, &str)) -> Option<String> {
+        let align = c_size_align(self.p, t).1;
+        if !win_heap_align(align) {
+            return None;
+        }
+        let name = self.tmp();
+        let ct = ctype(t);
+        let slot = win_heap_slot(&name, &ct, align);
+        let _ = writeln!(self.out, "    {slot};");
+        let _ = writeln!(self.out, "    memset((void *){name}_p, 0, sizeof({ct}));");
+        stores(self, &format!("{name}_p"));
+        Some(format!("(*{name}_p)"))
     }
 
     /// `disc_call`: the read needs `t`'s definition (`nested_block`).
@@ -5080,9 +5195,25 @@ impl FnGen<'_, '_> {
                 let adt = self.p.adt(*a);
                 let vals: Vec<String> = ops.iter().map(|o| self.operand(o, loc, post).0).collect();
                 if adt.is_enum {
-                    self.make_variant(&CTy::Adt(*a), *v as usize, &vals)
+                    let t = CTy::Adt(*a);
+                    let vi = *v as usize;
+                    let p = self.p;
+                    if let Some(e) = self.heap_overaligned(&t, |s, ptr| {
+                        variant_stores(&mut s.out, p, ptr, &t, vi, &vals);
+                    }) {
+                        e
+                    } else {
+                        self.make_variant(&t, vi, &vals)
+                    }
                 } else if vals.is_empty() {
-                    zero_lit(self.p, &CTy::Adt(*a))
+                    let t = CTy::Adt(*a);
+                    if let Some(e) = self.heap_overaligned(&t, |_, _| {}) { e } else { zero_lit(self.p, &t) }
+                } else if let Some(e) = self.heap_overaligned(&CTy::Adt(*a), |s, ptr| {
+                    for (i, v) in vals.iter().enumerate() {
+                        let _ = writeln!(s.out, "    {ptr}->f{i} = {v};");
+                    }
+                }) {
+                    e
                 } else {
                     let fields: Vec<String> = vals.iter().enumerate().map(|(i, v)| format!(".f{i} = {v}")).collect();
                     format!("(({}){{ {} }})", names::adt(*a), fields.join(", "))
@@ -5220,7 +5351,13 @@ impl FnGen<'_, '_> {
                 let ct = ctype(&t);
                 let vals: Vec<String> = ops.iter().map(|o| self.operand(o, loc, post).0).collect();
                 if vals.is_empty() {
-                    zero_lit(self.p, &t)
+                    if let Some(e) = self.heap_overaligned(&t, |_, _| {}) { e } else { zero_lit(self.p, &t) }
+                } else if let Some(e) = self.heap_overaligned(&t, |s, ptr| {
+                    for (i, v) in vals.iter().enumerate() {
+                        let _ = writeln!(s.out, "    {ptr}->f{i} = {v};");
+                    }
+                }) {
+                    e
                 } else {
                     let fields: Vec<String> = vals.iter().enumerate().map(|(i, v)| format!(".f{i} = {v}")).collect();
                     format!("(({ct}){{ {} }})", fields.join(", "))
@@ -5230,21 +5367,55 @@ impl FnGen<'_, '_> {
                 let t = cty(&self.body.tys, *ty);
                 let ct = ctype(&t);
                 let vals: Vec<String> = ops.iter().map(|o| self.operand(o, loc, post).0).collect();
-                if vals.is_empty() { zero_lit(self.p, &t) } else { format!("(({ct}){{ .v = {{ {} }} }})", vals.join(", ")) }
+                if vals.is_empty() {
+                    if let Some(e) = self.heap_overaligned(&t, |_, _| {}) { e } else { zero_lit(self.p, &t) }
+                } else if let Some(e) = self.heap_overaligned(&t, |s, ptr| {
+                    for (i, v) in vals.iter().enumerate() {
+                        let _ = writeln!(s.out, "    {ptr}->v[{i}] = {v};");
+                    }
+                }) {
+                    e
+                } else {
+                    format!("(({ct}){{ .v = {{ {} }} }})", vals.join(", "))
+                }
             }
             Rvalue::ArrayRepeat(ty, o, n) => {
                 let at = cty(&self.body.tys, *ty);
                 let ct = ctype(&at);
-                let et = match &at {
-                    CTy::Array(e, _) => ctype(e),
-                    _ => "uint8_t".into(),
+                let elem = match &at {
+                    CTy::Array(e, _) => (**e).clone(),
+                    _ => CTy::Int(IntTy::U8),
                 };
+                let et = ctype(&elem);
                 let (v, _) = self.operand(o, loc, post);
                 let (t, xt, i) = (self.tmp(), self.tmp(), self.tmp());
-                let _ = writeln!(self.out, "    {et} {xt} = {v};\n    {ct} {t};");
+                let elem_align = c_size_align(self.p, &elem).1;
+                let arr_align = c_size_align(self.p, &at).1;
                 // A zero-sized element has nothing to copy (`[(); usize::MAX]`).
-                let _ = writeln!(self.out, "    if (sizeof({et})) for (uint64_t {i} = 0; {i} < {n}; {i}++) {t}.v[{i}] = {xt};");
-                t
+                if win_heap_align(elem_align) || win_heap_align(arr_align) {
+                    let xt_expr = if win_heap_align(elem_align) {
+                        let slot = win_heap_slot(&xt, &et, elem_align);
+                        let _ = writeln!(self.out, "    {slot}; *{xt}_p = {v};");
+                        format!("(*{xt}_p)")
+                    } else {
+                        let _ = writeln!(self.out, "    {et} {xt} = {v};");
+                        xt.clone()
+                    };
+                    let (t_expr, slot) = if win_heap_align(arr_align) {
+                        let slot = win_heap_slot(&t, &ct, arr_align);
+                        let _ = writeln!(self.out, "    {slot};");
+                        (format!("(*{t}_p)"), format!("{t}_p->v"))
+                    } else {
+                        let _ = writeln!(self.out, "    {ct} {t};");
+                        (t.clone(), format!("{t}.v"))
+                    };
+                    let _ = writeln!(self.out, "    if (sizeof({et})) for (uint64_t {i} = 0; {i} < {n}; {i}++) {slot}[{i}] = {xt_expr};");
+                    t_expr
+                } else {
+                    let _ = writeln!(self.out, "    {et} {xt} = {v};\n    {ct} {t};");
+                    let _ = writeln!(self.out, "    if (sizeof({et})) for (uint64_t {i} = 0; {i} < {n}; {i}++) {t}.v[{i}] = {xt};");
+                    t
+                }
             }
             Rvalue::Format(parts) => self.format(parts, loc, post, 0),
             Rvalue::WriteFmt(dst, parts, stream) => self.write_fmt(dst, parts, *stream, loc, post),
@@ -5835,8 +6006,16 @@ impl FnGen<'_, '_> {
         for (t, a) in params.iter().zip(args.iter_mut()) {
             if param_by_ptr(self.p, t) && !param_dropped(self.p, t) {
                 let v = self.tmp();
-                let _ = writeln!(out, "    {} {v} = {a};", ctype(t));
-                *a = format!("&{v}");
+                let ct = ctype(t);
+                let align = c_size_align(self.p, t).1;
+                if win_heap_align(align) {
+                    let slot = win_heap_slot(&v, &ct, align);
+                    let _ = writeln!(out, "    {slot}; *{v}_p = {a};");
+                    *a = format!("&(*{v}_p)");
+                } else {
+                    let _ = writeln!(out, "    {ct} {v} = {a};");
+                    *a = format!("&{v}");
+                }
             }
         }
     }
@@ -5875,13 +6054,27 @@ impl FnGen<'_, '_> {
             i += 1;
             keep
         });
-        if ret_is_large(self.p, f) {
+        let align = c_size_align(self.p, &rt).1;
+        let ct = ctype(&rt);
+        let expr = if ret_is_large(self.p, f) {
             let rest: String = all.iter().map(|a| format!(", {a}")).collect();
-            let _ = writeln!(out, "  {} {v}; {call}(&{v}{rest});", ctype(&rt));
+            if win_heap_align(align) {
+                let slot = win_heap_slot(&v, &ct, align);
+                let _ = writeln!(out, "  {slot}; {call}(&(*{v}_p){rest});");
+                format!("(*{v}_p)")
+            } else {
+                let _ = writeln!(out, "  {ct} {v}; {call}(&{v}{rest});");
+                v.clone()
+            }
+        } else if win_heap_align(align) {
+            let slot = win_heap_slot(&v, &ct, align);
+            let _ = writeln!(out, "  {slot}; *{v}_p = {call}({});", all.join(", "));
+            format!("(*{v}_p)")
         } else {
-            let _ = writeln!(out, "  {} {v} = {call}({});", ctype(&rt), all.join(", "));
-        }
-        (v, rt)
+            let _ = writeln!(out, "  {ct} {v} = {call}({});", all.join(", "));
+            v.clone()
+        };
+        (expr, rt)
     }
 
     /// C statements (into `out`) comparing the values at pointer
@@ -6009,24 +6202,44 @@ impl FnGen<'_, '_> {
                 vals.push(format!("p{i}"));
             }
         }
-        let value = match &**ret {
-            CTy::Adt(a) if !self.p.adt(*a).is_enum => {
-                if vals.is_empty() {
-                    zero_lit(self.p, ret)
-                } else {
-                    let fields: Vec<String> = vals.iter().enumerate().map(|(i, v)| format!(".f{i} = {v}")).collect();
-                    format!("(({}){{ {} }})", names::adt(*a), fields.join(", "))
-                }
-            }
-            _ => self.make_variant(ret, variant, &vals),
-        };
         let rt = ctype(ret);
-        if ret_by_out(self.p, ret) {
+        let align = c_size_align(self.p, ret).1;
+        // The shim is its own function. A compound literal of an
+        // over-aligned value would be a frame slot in it; store the
+        // fields through `out` instead (`ret_by_out` holds here).
+        if ret_by_out(self.p, ret) && win_heap_align(align) {
+            self.note_held(ret);
             decls.insert(0, format!("{rt} *out"));
-            let _ = writeln!(self.prelude, "static void {name}({}) {{ *out = {value}; }}", decls.join(", "));
+            let mut body = String::new();
+            let _ = writeln!(body, "  memset((void *)out, 0, sizeof({rt}));");
+            match &**ret {
+                CTy::Adt(a) if !self.p.adt(*a).is_enum => {
+                    for (i, v) in vals.iter().enumerate() {
+                        let _ = writeln!(body, "  out->f{i} = {v};");
+                    }
+                }
+                _ => variant_stores(&mut body, self.p, "out", ret, variant, &vals),
+            }
+            let _ = writeln!(self.prelude, "static void {name}({}) {{\n{body}}}", decls.join(", "));
         } else {
-            let params = if decls.is_empty() { "void".to_string() } else { decls.join(", ") };
-            let _ = writeln!(self.prelude, "static {rt} {name}({params}) {{ return {value}; }}");
+            let value = match &**ret {
+                CTy::Adt(a) if !self.p.adt(*a).is_enum => {
+                    if vals.is_empty() {
+                        zero_lit(self.p, ret)
+                    } else {
+                        let fields: Vec<String> = vals.iter().enumerate().map(|(i, v)| format!(".f{i} = {v}")).collect();
+                        format!("(({}){{ {} }})", names::adt(*a), fields.join(", "))
+                    }
+                }
+                _ => self.make_variant(ret, variant, &vals),
+            };
+            if ret_by_out(self.p, ret) {
+                decls.insert(0, format!("{rt} *out"));
+                let _ = writeln!(self.prelude, "static void {name}({}) {{ *out = {value}; }}", decls.join(", "));
+            } else {
+                let params = if decls.is_empty() { "void".to_string() } else { decls.join(", ") };
+                let _ = writeln!(self.prelude, "static {rt} {name}({params}) {{ return {value}; }}");
+            }
         }
         name
     }
@@ -8612,26 +8825,50 @@ impl FnGen<'_, '_> {
             B::MemSwap => {
                 // A byte exchange through a stack temp: both places
                 // stay initialized, so their drop flags are untouched.
+                // Windows dev C keeps an over-aligned temp on the heap
+                // (`win_heap_align`).
                 let CTy::Ref(inner) = &tys[0] else { unreachable!() };
                 let et = ctype(inner);
+                let align = c_size_align(self.p, inner).1;
                 let (pa, pb, t) = (self.tmp(), self.tmp(), self.tmp());
-                let _ = writeln!(
-                    self.out,
-                    "    {et}* {pa} = {}; {et}* {pb} = {}; {et} {t}; lust_memcpy(&{t}, {pa}, sizeof({et})); lust_memcpy({pa}, {pb}, sizeof({et})); lust_memcpy({pb}, &{t}, sizeof({et}));",
-                    vals[0], vals[1]
-                );
+                if win_heap_align(align) {
+                    let slot = win_heap_slot(&t, &et, align);
+                    let _ = writeln!(
+                        self.out,
+                        "    {et}* {pa} = {}; {et}* {pb} = {}; {slot}; lust_memcpy({t}_p, {pa}, sizeof({et})); lust_memcpy({pa}, {pb}, sizeof({et})); lust_memcpy({pb}, {t}_p, sizeof({et}));",
+                        vals[0], vals[1]
+                    );
+                } else {
+                    let _ = writeln!(
+                        self.out,
+                        "    {et}* {pa} = {}; {et}* {pb} = {}; {et} {t}; lust_memcpy(&{t}, {pa}, sizeof({et})); lust_memcpy({pa}, {pb}, sizeof({et})); lust_memcpy({pb}, &{t}, sizeof({et}));",
+                        vals[0], vals[1]
+                    );
+                }
                 "((lust_Unit){})".into()
             }
             B::MemReplace => {
                 let CTy::Ref(inner) = &tys[0] else { unreachable!() };
                 let et = ctype(inner);
+                let align = c_size_align(self.p, inner).1;
                 let (pa, nv, old) = (self.tmp(), self.tmp(), self.tmp());
-                let _ = writeln!(
-                    self.out,
-                    "    {et}* {pa} = {}; {et} {nv} = {}; {et} {old}; lust_memcpy(&{old}, {pa}, sizeof({et})); lust_memcpy({pa}, &{nv}, sizeof({et}));",
-                    vals[0], vals[1]
-                );
-                old
+                if win_heap_align(align) {
+                    let nv_slot = win_heap_slot(&nv, &et, align);
+                    let old_slot = win_heap_slot(&old, &et, align);
+                    let _ = writeln!(
+                        self.out,
+                        "    {et}* {pa} = {}; {nv_slot}; *{nv}_p = {}; {old_slot}; lust_memcpy({old}_p, {pa}, sizeof({et})); lust_memcpy({pa}, {nv}_p, sizeof({et}));",
+                        vals[0], vals[1]
+                    );
+                    format!("(*{old}_p)")
+                } else {
+                    let _ = writeln!(
+                        self.out,
+                        "    {et}* {pa} = {}; {et} {nv} = {}; {et} {old}; lust_memcpy(&{old}, {pa}, sizeof({et})); lust_memcpy({pa}, &{nv}, sizeof({et}));",
+                        vals[0], vals[1]
+                    );
+                    old
+                }
             }
             B::MemTake => unreachable!("take lowers to a default fill plus MemReplace"),
             // The value through a slot whose address escapes into an empty
@@ -10686,6 +10923,50 @@ fn rename_idents(text: &str, map: &[(String, String)]) -> String {
         }
     }
     out
+}
+
+/// Field stores for `variant_lit`, through pointer `ptr`, after the slot
+/// has been zeroed. Windows dev C uses this for an over-aligned value so
+/// tcc never builds the compound literal in the frame (`heap_overaligned`).
+fn variant_stores(out: &mut String, p: &Program, ptr: &str, t: &CTy, variant: usize, vals: &[String]) {
+    let fields = |out: &mut String| {
+        for (i, v) in vals.iter().enumerate() {
+            let _ = writeln!(out, "    {ptr}->u.v{variant}.f{i} = {v};");
+        }
+    };
+    match c_layout(p, t) {
+        None => match t {
+            CTy::Option(_) => {
+                if vals.is_empty() {
+                    let _ = writeln!(out, "    {ptr}->tag = 0;");
+                } else {
+                    let _ = writeln!(out, "    {ptr}->tag = 1;");
+                    let _ = writeln!(out, "    {ptr}->v = {};", vals[0]);
+                }
+            }
+            _ => {
+                let _ = writeln!(out, "    {ptr}->tag = {variant};");
+                if !vals.is_empty() {
+                    fields(out);
+                }
+            }
+        },
+        Some(l) => match l.enum_tag {
+            Some(EnumTag::Explicit { size, signed }) => {
+                let _ = writeln!(out, "    {ptr}->u.v{variant}._tag = {};", disc_lit(adt_discs(p, t)[variant], size, signed));
+                fields(out);
+            }
+            Some(EnumTag::NicheFilled { variant: niche_variant, niche, first, start, .. }) if variant != niche_variant => {
+                let _ = writeln!(
+                    out,
+                    "    {ptr}->u.v{variant}._s = {};",
+                    scalar_lit(niche_tag_value(niche, first, start, variant), niche.scalar_size, false)
+                );
+                fields(out);
+            }
+            _ => fields(out),
+        },
+    }
 }
 
 /// One enum or Option value as a compound literal from its field value
@@ -13022,8 +13303,16 @@ fn glue_args(p: &Program, f: LocalDefId, args: &[&str], pre: &mut String) -> Vec
         .enumerate()
         .map(|(i, a)| match ps.get(i) {
             Some(t) if param_by_ptr(p, t) => {
-                let _ = writeln!(pre, "  {} ga{i} = {a};", ctype(t));
-                format!("&ga{i}")
+                let ct = ctype(t);
+                let align = c_size_align(p, t).1;
+                if win_heap_align(align) {
+                    let slot = win_heap_slot(&format!("ga{i}"), &ct, align);
+                    let _ = writeln!(pre, "  {slot}; *ga{i}_p = {a};");
+                    format!("&(*ga{i}_p)")
+                } else {
+                    let _ = writeln!(pre, "  {ct} ga{i} = {a};");
+                    format!("&ga{i}")
+                }
             }
             _ => a.to_string(),
         })

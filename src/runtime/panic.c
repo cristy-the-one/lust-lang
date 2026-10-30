@@ -393,14 +393,20 @@ int32_t lust_unw_mine(void) LUST_BODY({
 })
 
 /* A destructor that cleanup called ended with a new exception: Rust's
-   nounwind "panic in a destructor during cleanup", then abort. */
+   nounwind "panic in a destructor during cleanup", then abort.
+   Windows rustc prints that line and then `__fastfail`s, which does not
+   flush it, so a pipe never sees it. Printing it here (this fflush)
+   is the extra text in `panicloc_io_bufwriter_over`. The panics that
+   ran first are already flushed by `lust_default_hook`. */
 void lust_unw_cleanup_abort(void) LUST_BODY({
+#ifndef _WIN32
     const uint8_t *tn;
     uint64_t tl;
     lust_cur_thread_name(&tn, &tl);
     fprintf(stderr, "\nthread '%.*s' (%llu) panicked at " LUST_STD_SRC "core/src/panicking.rs:233:5:\npanic in a destructor during cleanup\nthread caused non-unwinding panic. aborting.\n",
             (int)tl, (const char *)tn, lust_os_tid());
     fflush(stderr);
+#endif
     abort();
 })
 

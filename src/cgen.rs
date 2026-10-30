@@ -13826,9 +13826,13 @@ fn glue_def_value(
                     // An empty Vec never allocates; its pointer is the
                     // dangling aligned address, not a heap block. A
                     // zero-sized element never allocates either, so that
-                    // case is decided here, not at run time.
+                    // case is decided here, not at run time. The buffer
+                    // came from lust_alloc: on Windows an element aligned
+                    // past 16 is an _aligned_malloc block, and free() of
+                    // it fail-fasts (exit 127) when the Vec drops.
                     if c_layout(p, e).is_none_or(|l| l.size > 0) {
-                        body.push_str("  if (p->cap) free(p->ptr);\n");
+                        let et = ctype(e);
+                        let _ = writeln!(body, "  if (p->cap) lust_dealloc(p->ptr, p->cap * sizeof({et}), _Alignof({et}));");
                     }
                 }
                 // Through the vtable: the drop entry (0 when none), then
@@ -13873,7 +13877,8 @@ fn glue_def_value(
                         let _ = writeln!(body, "  for (uint64_t i = p->front; i < p->len; i++) drop_{}(&(({}*)p->ptr)[i]);", mangle(e), ctype(e));
                     }
                     if c_layout(p, e).is_none_or(|l| l.size > 0) {
-                        body.push_str("  if (p->cap) free(p->ptr);\n");
+                        let et = ctype(e);
+                        let _ = writeln!(body, "  if (p->cap) lust_dealloc(p->ptr, p->cap * sizeof({et}), _Alignof({et}));");
                     }
                 }
                 CTy::VecDrain(e) => {

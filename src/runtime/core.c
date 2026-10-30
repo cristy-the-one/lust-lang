@@ -61,7 +61,8 @@ void lust_oom_size(uint64_t n) LUST_BODY({
    ts-rust jemalloc case). A zero size returns a dangling pointer with the
    requested alignment and allocates nothing; well-formed wrappers never
    ask for one, but the Vec core uses the same form for empty buffers.
-   Every pointer these return can go to plain free(). */
+   Release them with lust_dealloc. On Windows an alignment above 16 is
+   an _aligned_malloc block, and free() of that pointer fail-fasts. */
 void *lust_alloc(uint64_t size, uint64_t align) LUST_BODY({
     if (!size) return (void *)(uintptr_t)(align ? align : 1);
     void *p = 0;
@@ -444,7 +445,7 @@ void lust_vec_shrink_to(lust_Vec *v, uint64_t min_cap, uint64_t elem, uint64_t a
     uint64_t target = min_cap > v->len ? min_cap : v->len;
     if (v->cap <= target) return;
     if (!target) {
-        free(v->ptr);
+        lust_dealloc(v->ptr, v->cap * elem, align);
         v->ptr = (void *)(uintptr_t)(align ? align : 1);
         v->cap = 0;
         return;

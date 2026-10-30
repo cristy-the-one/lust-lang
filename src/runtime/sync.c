@@ -1407,7 +1407,7 @@ static void lust_chan_push(lust_Chan *c, const void *v) {
         uint64_t nc = c->bufcap ? c->bufcap * 2 : 4;
         uint8_t *nb = (uint8_t *)lust_alloc(nc * c->esize, c->ealign);
         for (uint64_t i = 0; i < c->len; i++) memcpy(nb + i * c->esize, c->buf + ((c->head + i) % c->bufcap) * c->esize, c->esize);
-        if (c->bufcap && c->esize) free(c->buf);
+        if (c->bufcap && c->esize) lust_dealloc(c->buf, c->bufcap * c->esize, c->ealign);
         c->buf = nb;
         c->bufcap = nc;
         c->head = 0;
@@ -1430,7 +1430,7 @@ static void lust_chan_drain(lust_Chan *c) {
 }
 static void lust_chan_free(lust_Chan *c) {
     lust_chan_drain(c);
-    if (c->bufcap && c->esize) free(c->buf);
+    if (c->bufcap && c->esize) lust_dealloc(c->buf, c->bufcap * c->esize, c->ealign);
     free(c);
 }
 #endif

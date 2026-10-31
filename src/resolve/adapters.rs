@@ -56,6 +56,8 @@ pub const ADAPTER_PACKAGES: &[&str] = &[
     "same-file",
     "name-to-handle-at",
     "jiff",
+    "base64",
+    "sha2",
 ];
 
 /// One adapter crate, read from its manifest.

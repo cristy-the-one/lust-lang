@@ -1,0 +1,7 @@
+// `base64::prelude`: the same names upstream re-exports.
+
+pub use crate::engine::Engine;
+pub use crate::engine::general_purpose::STANDARD as BASE64_STANDARD;
+pub use crate::engine::general_purpose::STANDARD_NO_PAD as BASE64_STANDARD_NO_PAD;
+pub use crate::engine::general_purpose::URL_SAFE as BASE64_URL_SAFE;
+pub use crate::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD;

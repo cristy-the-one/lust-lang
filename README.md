@@ -228,7 +228,7 @@ Supported today:
 - Types: all integers (also 128-bit), floats, `bool`, `char`, tuples, arrays, slices, `String`, `&str`, references with lifetimes (also in structs), `Box`, `Rc`, `Arc`, `RefCell`, `Cell`, `Mutex`, `RwLock`, atomics, `dyn Trait` for crate traits and the `Fn` family, `impl Trait` as a whole return type.
 - Closures, iterator chains, `?` on `Option` and `Result`, `let`-else, `if let` chains, labeled blocks.
 - Derives: `Debug`, `Clone`, `Copy`, `PartialEq`, `Eq`, `PartialOrd`, `Ord`, `Hash`, `Default`.
-- Std: a std written in lust source (`library/std`, `library/core`, `library/alloc`) plus a C runtime. `HashMap`, `BTreeMap`, `VecDeque`, formatting with specs, `std::fs`, `std::io`, `std::env`, `std::process`, threads, `thread::scope`, `mpsc`, panics with unwinding and `catch_unwind`.
+- Std: a std written in lust source (`library/std`, `library/core`, `library/alloc`) plus a C runtime. `HashMap`, `BTreeMap`, `VecDeque`, `BinaryHeap`, formatting with specs, `std::fs`, `std::io`, `std::env`, `std::process`, threads, `thread::scope`, `mpsc`, panics with unwinding and `catch_unwind`.
 - Dependencies: 18 adapter crates in `library/deps` stand in for crates.io packages (`indexmap`, `smallvec`, `memchr`, `rustc-hash`, `num-bigint`, `bumpalo`, `flate2`, `jiff`, and others). Each must give the same output as the real crate.
 - Borrow checking: moves, initialization, NLL-style loans, two-phase borrows, and a restricted region model for lifetimes.
 

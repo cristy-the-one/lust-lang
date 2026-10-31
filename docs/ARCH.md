@@ -1659,7 +1659,7 @@ library/alloc/   heap types: String, Vec, Box, Rc, Arc, collections,
                  format!, Cow, BTreeMap
 library/std/     OS: fs, io, env, process, path, time, thread, sync,
                  panic runtime hooks, prelude
-library/deps/    adapter crates (3.6): indexmap, smallvec, rustc-hash
+library/deps/    adapter crates (3.6): indexmap, smallvec, rustc-hash, base64, sha2
 ```
 
 Lust compiles these crates with lust itself, once per
@@ -2129,6 +2129,8 @@ clear error, not a silent mismatch.
 | `xxhash-rust` (xxh3) | C xxhash in the runtime, thin source API. 128-bit results as `u128`. | Digests vs upstream test vectors. |
 | `ryu-js` | C port of the JS number printer. | Byte compare vs the crate on random f64 bits. |
 | `num-bigint` (subset) | Small source BigInt: parse, print, the ops ts-rust calls (5 refs). | Parse/print roundtrip difftests. |
+| `base64` | Source encode and decode for the four general-purpose engines (standard and URL-safe, padded and unpadded). | Byte compare vs 0.22.1, including decode errors. |
+| `sha2` | Source SHA-256 (`new`, `update`, `finalize`, `digest`). | Digests vs 0.10.9, including multi-chunk updates. |
 
 Adapter code is user-level lust. It goes through the
 same check and mono as any crate. It may use

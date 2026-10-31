@@ -1,0 +1,139 @@
+std "" ok []
+np "" ok []
+url "" ok []
+std "A" Invalid input length: 1 | InvalidLength(1)
+np "A" Invalid input length: 1 | InvalidLength(1)
+url "A" Invalid input length: 1 | InvalidLength(1)
+std "AA" Invalid padding | InvalidPadding
+np "AA" ok [0]
+url "AA" Invalid padding | InvalidPadding
+std "AAA" Invalid padding | InvalidPadding
+np "AAA" ok [0, 0]
+url "AAA" Invalid padding | InvalidPadding
+std "AAAA" ok [0, 0, 0]
+np "AAAA" ok [0, 0, 0]
+url "AAAA" ok [0, 0, 0]
+std "AA=" Invalid padding | InvalidPadding
+np "AA=" Invalid padding | InvalidPadding
+url "AA=" Invalid padding | InvalidPadding
+std "A===" Invalid symbol 61, offset 1. | InvalidByte(1, 61)
+np "A===" Invalid symbol 61, offset 1. | InvalidByte(1, 61)
+url "A===" Invalid symbol 61, offset 1. | InvalidByte(1, 61)
+std "====" Invalid symbol 61, offset 0. | InvalidByte(0, 61)
+np "====" Invalid symbol 61, offset 0. | InvalidByte(0, 61)
+url "====" Invalid symbol 61, offset 0. | InvalidByte(0, 61)
+std "Zm9v" ok [102, 111, 111]
+np "Zm9v" ok [102, 111, 111]
+url "Zm9v" ok [102, 111, 111]
+std "Zm9vYmFy" ok [102, 111, 111, 98, 97, 114]
+np "Zm9vYmFy" ok [102, 111, 111, 98, 97, 114]
+url "Zm9vYmFy" ok [102, 111, 111, 98, 97, 114]
+std "@@@" Invalid symbol 64, offset 0. | InvalidByte(0, 64)
+np "@@@" Invalid symbol 64, offset 0. | InvalidByte(0, 64)
+url "@@@" Invalid symbol 64, offset 0. | InvalidByte(0, 64)
+std "Zg==" ok [102]
+np "Zg==" Invalid padding | InvalidPadding
+url "Zg==" ok [102]
+std "Zg=" Invalid padding | InvalidPadding
+np "Zg=" Invalid padding | InvalidPadding
+url "Zg=" Invalid padding | InvalidPadding
+std "Zg" Invalid padding | InvalidPadding
+np "Zg" ok [102]
+url "Zg" Invalid padding | InvalidPadding
+std "Zm8" Invalid padding | InvalidPadding
+np "Zm8" ok [102, 111]
+url "Zm8" Invalid padding | InvalidPadding
+std "Zm8=" ok [102, 111]
+np "Zm8=" Invalid padding | InvalidPadding
+url "Zm8=" ok [102, 111]
+std "/w==" ok [255]
+np "/w==" Invalid padding | InvalidPadding
+url "/w==" Invalid symbol 47, offset 0. | InvalidByte(0, 47)
+std "/w=" Invalid padding | InvalidPadding
+np "/w=" Invalid padding | InvalidPadding
+url "/w=" Invalid symbol 47, offset 0. | InvalidByte(0, 47)
+std "/w" Invalid padding | InvalidPadding
+np "/w" ok [255]
+url "/w" Invalid symbol 47, offset 0. | InvalidByte(0, 47)
+std "YQ" Invalid padding | InvalidPadding
+np "YQ" ok [97]
+url "YQ" Invalid padding | InvalidPadding
+std "YQI" Invalid padding | InvalidPadding
+np "YQI" ok [97, 2]
+url "YQI" Invalid padding | InvalidPadding
+std "YQI=" ok [97, 2]
+np "YQI=" Invalid padding | InvalidPadding
+url "YQI=" ok [97, 2]
+std "*A==" Invalid symbol 42, offset 0. | InvalidByte(0, 42)
+np "*A==" Invalid symbol 42, offset 0. | InvalidByte(0, 42)
+url "*A==" Invalid symbol 42, offset 0. | InvalidByte(0, 42)
+std "AA=A" Invalid symbol 61, offset 2. | InvalidByte(2, 61)
+np "AA=A" Invalid symbol 61, offset 2. | InvalidByte(2, 61)
+url "AA=A" Invalid symbol 61, offset 2. | InvalidByte(2, 61)
+std "AAA==" Invalid symbol 61, offset 3. | InvalidByte(3, 61)
+np "AAA==" Invalid symbol 61, offset 3. | InvalidByte(3, 61)
+url "AAA==" Invalid symbol 61, offset 3. | InvalidByte(3, 61)
+std "A A" Invalid symbol 32, offset 1. | InvalidByte(1, 32)
+np "A A" Invalid symbol 32, offset 1. | InvalidByte(1, 32)
+url "A A" Invalid symbol 32, offset 1. | InvalidByte(1, 32)
+std "Zg===" Invalid symbol 61, offset 2. | InvalidByte(2, 61)
+np "Zg===" Invalid symbol 61, offset 2. | InvalidByte(2, 61)
+url "Zg===" Invalid symbol 61, offset 2. | InvalidByte(2, 61)
+std "////" ok [255, 255, 255]
+np "////" ok [255, 255, 255]
+url "////" Invalid symbol 47, offset 0. | InvalidByte(0, 47)
+std "////AA==" ok [255, 255, 255, 0]
+np "////AA==" Invalid padding | InvalidPadding
+url "////AA==" Invalid symbol 47, offset 0. | InvalidByte(0, 47)
+std "/x==" Invalid last symbol 120, offset 1. | InvalidLastSymbol(1, 120)
+np "/x==" Invalid padding | InvalidPadding
+url "/x==" Invalid symbol 47, offset 0. | InvalidByte(0, 47)
+std "/y==" Invalid last symbol 121, offset 1. | InvalidLastSymbol(1, 121)
+np "/y==" Invalid padding | InvalidPadding
+url "/y==" Invalid symbol 47, offset 0. | InvalidByte(0, 47)
+std "YR==" Invalid last symbol 82, offset 1. | InvalidLastSymbol(1, 82)
+np "YR==" Invalid padding | InvalidPadding
+url "YR==" Invalid last symbol 82, offset 1. | InvalidLastSymbol(1, 82)
+std "YQJ=" Invalid last symbol 74, offset 2. | InvalidLastSymbol(2, 74)
+np "YQJ=" Invalid padding | InvalidPadding
+url "YQJ=" Invalid last symbol 74, offset 2. | InvalidLastSymbol(2, 74)
+std "///=" Invalid last symbol 47, offset 2. | InvalidLastSymbol(2, 47)
+np "///=" Invalid padding | InvalidPadding
+url "///=" Invalid symbol 47, offset 0. | InvalidByte(0, 47)
+std "AAA/" ok [0, 0, 63]
+np "AAA/" ok [0, 0, 63]
+url "AAA/" Invalid symbol 47, offset 3. | InvalidByte(3, 47)
+std "ABC=" Invalid last symbol 67, offset 2. | InvalidLastSymbol(2, 67)
+np "ABC=" Invalid padding | InvalidPadding
+url "ABC=" Invalid last symbol 67, offset 2. | InvalidLastSymbol(2, 67)
+std "ABD=" Invalid last symbol 68, offset 2. | InvalidLastSymbol(2, 68)
+np "ABD=" Invalid padding | InvalidPadding
+url "ABD=" Invalid last symbol 68, offset 2. | InvalidLastSymbol(2, 68)
+std "Zh==" Invalid last symbol 104, offset 1. | InvalidLastSymbol(1, 104)
+np "Zh==" Invalid padding | InvalidPadding
+url "Zh==" Invalid last symbol 104, offset 1. | InvalidLastSymbol(1, 104)
+std "Zm9=" Invalid last symbol 57, offset 2. | InvalidLastSymbol(2, 57)
+np "Zm9=" Invalid padding | InvalidPadding
+url "Zm9=" Invalid last symbol 57, offset 2. | InvalidLastSymbol(2, 57)
+std "Zm9w" ok [102, 111, 112]
+np "Zm9w" ok [102, 111, 112]
+url "Zm9w" ok [102, 111, 112]
+std "AAA@AAAA" Invalid symbol 64, offset 3. | InvalidByte(3, 64)
+np "AAA@AAAA" Invalid symbol 64, offset 3. | InvalidByte(3, 64)
+url "AAA@AAAA" Invalid symbol 64, offset 3. | InvalidByte(3, 64)
+std "AAAAAAA@" Invalid symbol 64, offset 7. | InvalidByte(7, 64)
+np "AAAAAAA@" Invalid symbol 64, offset 7. | InvalidByte(7, 64)
+url "AAAAAAA@" Invalid symbol 64, offset 7. | InvalidByte(7, 64)
+std "AAAA\nAAAA" Invalid symbol 10, offset 4. | InvalidByte(4, 10)
+np "AAAA\nAAAA" Invalid symbol 10, offset 4. | InvalidByte(4, 10)
+url "AAAA\nAAAA" Invalid symbol 10, offset 4. | InvalidByte(4, 10)
+std "++++" ok [251, 239, 190]
+np "++++" ok [251, 239, 190]
+url "++++" Invalid symbol 43, offset 0. | InvalidByte(0, 43)
+std "----" Invalid symbol 45, offset 0. | InvalidByte(0, 45)
+np "----" Invalid symbol 45, offset 0. | InvalidByte(0, 45)
+url "----" ok [251, 239, 190]
+std "____" Invalid symbol 95, offset 0. | InvalidByte(0, 95)
+np "____" Invalid symbol 95, offset 0. | InvalidByte(0, 95)
+url "____" ok [255, 255, 255]
+std "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA@AAAA" Invalid symbol 64, offset 64. | InvalidByte(64, 64)

@@ -2570,7 +2570,21 @@ fn location_path(p: &str, library: &Path, display_root: Option<&Path>, client: &
         return format!("library/{}", rel.to_string_lossy());
     }
     match display_root.and_then(|r| Path::new(p).strip_prefix(r).ok()) {
-        Some(rel) => rel.to_string_lossy().into_owned(),
+        // Cargo's rustc prints this relative to the workspace with the
+        // native separator (`src\main.rs` on Windows). A manifest read
+        // in-process keeps the `/` of the path it was joined from, and
+        // the panic line would then disagree with the Cargo binary.
+        Some(rel) => {
+            let rel = rel.to_string_lossy().into_owned();
+            #[cfg(windows)]
+            {
+                rel.replace('/', "\\")
+            }
+            #[cfg(not(windows))]
+            {
+                rel
+            }
+        }
         None => client.shown(p),
     }
 }

@@ -52,6 +52,8 @@ the upstream features it implements, and its exact-layout types.
 | deps/libm | Adapter for 0.2.16: sqrt, trig, exp, log, pow, rounding, and fmod, bit-identical to the real crate (deps/libm/README.md). | W-DEPS |
 | deps/base64 | Adapter for 0.22.1: standard and URL-safe `encode` / `decode` (deps/base64/README.md). | W-DEPS |
 | deps/sha2 | Adapter for 0.10.9: SHA-256 `new`, `update`, `finalize`, `digest` (deps/sha2/README.md). | W-DEPS |
+| deps/quick-xml | Adapter for 0.42.0: reader events and the escaping writer (deps/quick-xml/README.md). | W-DEPS |
+| deps/zip | Adapter for 9.2.0: stored and Deflated entries over the flate2 encoder (deps/zip/README.md). | W-DEPS |
 | deps/occt | Path-name adapter for the Open CASCADE shim's first slice (session, box, cylinder, tessellate, mesh bytes). Not a crates.io package. See docs/occt-shim.md. | W-DEPS |
 
 ## The std platform crate (W-SHIM)

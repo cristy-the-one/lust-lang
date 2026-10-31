@@ -1,0 +1,98 @@
+-- model
+decl "xml version=\"1.0\" encoding=\"UTF-8\""
+start model unit=mm note=a&lt;b&amp;&quot;&apos;
+text "hi "
+ref lt
+ref amp
+ref gt
+end model
+eof
+-- empty
+empty a
+eof
+-- empty-sp
+empty a
+eof
+-- empty-attr
+empty a b=c
+eof
+-- sq
+empty a b=c
+eof
+-- comment
+start r
+comment " hi "
+start t
+text "x"
+end t
+end r
+eof
+-- cdata
+start r
+cdata "a<b>&"
+end r
+eof
+-- pi
+start r
+pi "target data"
+end r
+eof
+-- doctype
+doctype "html"
+empty r
+eof
+-- doctype-sub
+doctype "note [<!ELEMENT note ANY>]"
+empty r
+eof
+-- ws
+start r
+text "\n  "
+start t
+text " x "
+end t
+text "\n"
+end r
+eof
+-- ref
+start r
+ref #60
+text " "
+ref #x41
+end r
+eof
+-- uni
+start r
+text "héllo 文件"
+end r
+eof
+-- end-sp
+start a
+end a
+eof
+-- mismatch
+start a
+err ill-formed document: expected `</a>`, but `</b>` was found
+-- extra-end
+err ill-formed document: close tag `</a>` does not match any open tag
+-- trim
+start r
+start t
+text "x"
+end t
+end r
+eof
+-- writer
+<?xml version="1.0" encoding="UTF-8"?><model unit="mm" note="a&lt;b&amp;&quot;&apos;">hi &lt;&amp;&gt;<br/><!-- c --><![CDATA[a<b>]]></model>
+-- writer-parse
+decl "xml version=\"1.0\" encoding=\"UTF-8\""
+start model unit=mm note=a&lt;b&amp;&quot;&apos;
+text "hi "
+ref lt
+ref amp
+ref gt
+empty br
+comment " c "
+cdata "a<b>"
+end model
+eof

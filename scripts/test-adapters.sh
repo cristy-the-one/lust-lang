@@ -6,6 +6,9 @@
 # Wave B adds the adapter crates in tests/adapters/crates/ (ARCH
 # 3.6), each against its real crate (see corpus_crate_dir below).
 # The filter also matches a crate dir name: `test-adapters.sh memchr`.
+# A filter that is exactly a crate directory runs only that crate.
+# Otherwise `zip` would also build flate2's `gzip_*` cases, whose
+# default-feature resolve needs zlib-rs.
 # Usage: scripts/test-adapters.sh [filter]
 # Modes and knobs: see scripts/test-corpus-lib.sh.
 set -uo pipefail
@@ -219,7 +222,16 @@ corpus_crate_one() {
   corpus_lust_note match "$pkg/$name" ""
 }
 
+# An exact crate-directory name wins over a case-name substring, so
+# `zip` does not select `gzip_write`.
+exact_crate=
+if [ -n "$corpus_filter" ] && [ -d "$corpus_root/tests/adapters/crates/$corpus_filter" ]; then
+  exact_crate=1
+fi
 for d in "$corpus_root"/tests/adapters/crates/*/; do
+  if [ -n "$exact_crate" ] && [ "$(basename "$d")" != "$corpus_filter" ]; then
+    continue
+  fi
   m0=$lust_match u0=$lust_unsupported w0=$lust_wrong h0=$lust_hang
   corpus_crate_dir "tests/adapters/crates/$(basename "$d")"
   # One line per crate in lust mode: the W-DEPS exactness table (ARCH

@@ -86,9 +86,15 @@ files that apply (`.cargo/config.toml` chain). The driver runs
 `cargo metadata --format-version 1` with those inputs once per
 graph key. `cargo metadata` alone unifies features over the whole
 workspace, which can differ from a `-p ts_goport --bin tsgo`
-build. So the feature set of each selected unit comes from one
+build. When the workspace has one member and no package in the
+graph has a dev-dependency, a build-dependency, a target-specific
+dependency, or `required-features`, the resolve-node features are
+the features `cargo check` would report, and the dry run is skipped.
+Otherwise the feature set of each selected unit comes from one
 cached `cargo check --message-format=json` dry run for the same
-request. The dry run has lust-core as its RUSTC_WRAPPER: build
+request. A manifest that is one package plus path dependencies,
+with no features and no build script, is read in-process.
+`cargo metadata` runs for every other shape. The dry run has lust-core as its RUSTC_WRAPPER: build
 scripts, proc macros, and their dependencies compile for real, and
 every check unit gets an empty dep-info file and no `.rmeta`, so a
 later real check rebuilds it (`src/resolve/probe.rs`). Cargo still

@@ -4795,7 +4795,15 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     if rebuild_base {
         // Everything not yet in the base goes in: all units on a fresh base, else the overlays.
         if fresh_base {
-            todo.extend([(1, false), (2, false), (3, false), (LOC_UNIT, false)]);
+            // The tcc path links a cached runtime object (unit 2) instead of
+            // compiling the amalgam on every fresh base. The release driver
+            // still compiles it with the external C compiler. A warm edit
+            // does not enter this branch: its base already holds the object.
+            if req.cc {
+                todo.extend([(1, false), (2, false), (3, false), (LOC_UNIT, false)]);
+            } else {
+                todo.extend([(1, false), (3, false), (LOC_UNIT, false)]);
+            }
             todo.extend(fn_units.iter().map(|&u| (u, false)));
         } else {
             let mut units: Vec<usize> = caches.overlays.iter().copied().chain(dirty_fn_units.iter().copied()).collect();
@@ -5858,7 +5866,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         && groups.len() == 1
         && !req.debug
         && occt_loader.is_none()
-        && let Ok(runtime_obj) = crate::tcc::cached_runtime_object(&cgen::runtime_unit(), req.debug)
+        && let Ok(runtime_obj) = crate::tcc::cached_runtime_object(req.debug)
     {
         let mem_units: Vec<(PathBuf, String)> = units.iter().filter(|(o, _)| *o != base_obj(2)).cloned().collect();
         let mut argv = vec![req.out.to_string_lossy().into_owned()];
@@ -5893,6 +5901,26 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     if let Err(e) = std::fs::create_dir_all(&dir) {
         caches.objects = None;
         return Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() };
+    }
+    // Fresh tcc base: unit 2 is the cached runtime object, not a unit in `todo`.
+    if fresh_base && !req.cc {
+        let cached = match crate::tcc::cached_runtime_object(req.debug) {
+            Ok(p) => p,
+            Err(e) => {
+                caches.objects = None;
+                return Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() };
+            }
+        };
+        let dest = base_obj(2);
+        if cached != dest {
+            let _ = std::fs::remove_file(&dest);
+            if std::fs::hard_link(&cached, &dest).is_err()
+                && let Err(e) = std::fs::copy(&cached, &dest)
+            {
+                caches.objects = None;
+                return Response { stderr: format!("error: cannot install the runtime object: {e}\n"), code: 3, ..Default::default() };
+            }
+        }
     }
     let keys: Vec<Option<String>> = match &disk_cache {
         Some(cache) => par_map(&units, |(_, c)| Some(cache.unit_key(c, req.debug))),

@@ -76,9 +76,19 @@ check() { local name=$1; shift; if "$@" >/dev/null 2>&1; then ok "$name"; else b
 sock() { local f; for f in "$1"/.lust-daemon-*.sock "$1"/.lust-daemon-*.sock.lock; do [ -e "$f" ] && { echo "${f%.lock}"; return; }; done; echo "$1/.lust-daemon-none.sock"; }
 
 stop_daemon() { # stop_daemon <dir>
-  local pid
+  local pid i
   pid=$(cat "$(sock "$1").lock" 2>/dev/null) || return 0
-  [ -n "$pid" ] && kill "$pid" 2>/dev/null
+  [ -n "$pid" ] || return 0
+  if [ "$win" = 1 ]; then
+    # Git bash's kill does not reach a Windows pid. Removing the address
+    # file is the daemon's graceful stop (it removes its temp dir too);
+    # TerminateProcess only if it is still there after 5 s.
+    rm -f "$(sock "$1")"
+    for i in $(seq 1 50); do pid_alive "$pid" || return 0; sleep 0.1; done
+    kill_hard "$pid"
+    return 0
+  fi
+  kill "$pid" 2>/dev/null
   return 0
 }
 cleanup() {

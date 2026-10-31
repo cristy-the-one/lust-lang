@@ -93,6 +93,10 @@ def main():
         bases_dir = os.path.join(work, ".lust-cache", "bases")
 
         base_ext = "dll" if os.name == "nt" else "so"
+        # Windows links warm builds statically (compile.rs `static_warm`;
+        # LUST_STATIC_WARM selects it elsewhere): no base library, so the
+        # checks on base files do not apply there.
+        static_warm = os.name == "nt" or bool(os.environ.get("LUST_STATIC_WARM"))
 
         def base_of(binpath):
             m = re.search(rb"libbase-\d+-[0-9a-f]+\.(?:so|dll)", open(binpath, "rb").read())
@@ -127,7 +131,10 @@ def main():
         # live binary (here p1.bin's base). Unreferenced old generations must be gone.
         new_bases = set(glob.glob(os.path.join(bases_dir, f"libbase-*.{base_ext}"))) - bases_before
         p1_base = base_of(os.path.join(work, "p1.bin"))
-        check("base generations bounded per session",
+        if static_warm:
+            print("skip base generations bounded per session (static warm links)")
+        else:
+          check("base generations bounded per session",
               0 < len(new_bases) <= 5 and p1_base is not None
               and os.path.exists(os.path.join(bases_dir, p1_base)),
               f"new bases: {sorted(os.path.basename(b) for b in new_bases)}, p1 base: {p1_base}")
@@ -154,8 +161,9 @@ def main():
         cold_env = dict(env, LUST_NO_DAEMON="1", LUST_DAEMON_SOCKET=os.path.join(work, "none"))
         r = run_timed([LUST, "run", pc, "-o", os.path.join(work, "pc2.bin")], 20, cwd=work,
                            env=cold_env, capture_output=True, text=True)
-        warm_loc = re.search(r"panicked at [^:\n]*:(\d+):(\d+)", err)
-        cold_loc = re.search(r"panicked at [^:\n]*:(\d+):(\d+)", r.stderr)
+        # A Windows path starts with a drive letter and its colon.
+        warm_loc = re.search(r"panicked at (?:[A-Za-z]:)?[^:\n]*:(\d+):(\d+)", err)
+        cold_loc = re.search(r"panicked at (?:[A-Za-z]:)?[^:\n]*:(\d+):(\d+)", r.stderr)
         check("panic column after body edit",
               rc1 == 0 and warm_loc is not None and cold_loc is not None
               and warm_loc.groups() == cold_loc.groups() == ("3", "5"),
@@ -195,7 +203,10 @@ def main():
               set(dirs) == {"alpha", "beta"} and dirs.get("alpha") != dirs.get("beta"),
               f"dirs={dirs}")
         fa_base, fb_base = base_of(os.path.join(work, "fa.bin")), base_of(os.path.join(work, "fb.bin"))
-        check("routing: each session built its own base",
+        if static_warm:
+            print("skip routing: each session built its own base (static warm links)")
+        else:
+          check("routing: each session built its own base",
               fa_base is not None and fb_base is not None and fa_base != fb_base
               and os.path.exists(os.path.join(bases_dir, fa_base))
               and os.path.exists(os.path.join(bases_dir, fb_base)),
@@ -403,7 +414,7 @@ fn grown() -> i64 { 1 }
         open(heal, "w").write('fn main() { println!("heal {}", 1); }\n')
         rc, out, err = run_lust(["build", heal, "-o", os.path.join(sub, "h1.bin")])
         check("vanished bases dir: first build ok", rc == 0, err)
-        shutil.rmtree(os.path.join(sub, ".lust-cache", "bases"))
+        shutil.rmtree(os.path.join(sub, ".lust-cache", "bases"), ignore_errors=True)
         open(heal, "w").write('fn main() { println!("heal {}", 2); }\n')
         rc, out, err = run_lust(["build", heal, "-o", os.path.join(sub, "h2.bin")])
         check("vanished bases dir: build still works", rc == 0, err)
@@ -814,8 +825,9 @@ fn grown() -> i64 { 1 }
         check("temp: kept binary still runs after daemon exit", r.stdout == "v1\n",
               f"stdout={r.stdout!r} stderr={r.stderr!r}")
         p1_base_path = os.path.join(bases_dir, p1_base) if p1_base else ""
-        check("temp: kept binary's base survives daemon exit",
-              bool(p1_base_path) and os.path.exists(p1_base_path), p1_base_path)
+        if not static_warm:
+            check("temp: kept binary's base survives daemon exit",
+                  bool(p1_base_path) and os.path.exists(p1_base_path), p1_base_path)
         # Once the executable is deleted, the next daemon's first base
         # build sweeps its base via the manifest, while bases of kept
         # executables (fa.bin) stay.
@@ -837,8 +849,9 @@ fn grown() -> i64 { 1 }
             finally:
                 daemon2.terminate()
                 daemon2.wait(timeout=10)
-        check("temp: deleted binary's base swept by the next daemon",
-              bool(p1_base_path) and not os.path.exists(p1_base_path), p1_base_path)
+        if not static_warm:
+            check("temp: deleted binary's base swept by the next daemon",
+                  bool(p1_base_path) and not os.path.exists(p1_base_path), p1_base_path)
         r = run_bin(os.path.join(work, "fa.bin"))
         check("temp: another kept binary still runs after the sweep", r.stdout == "feat 11\n",
               f"stdout={r.stdout!r} stderr={r.stderr!r}")

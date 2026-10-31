@@ -1207,15 +1207,32 @@ static LONG CALLBACK lust_win_overflow(EXCEPTION_POINTERS *ep) {
        report the raw stack-overflow exception as 139. */
     lust_fast_abort();
 }
+/* The handler runs on the overflowed stack, in what is left after the
+   guard page: without a reserve it can fault again (another overflow, or
+   an access violation while it formats), and the process dies with the
+   raw exception (bash: 139) instead of Rust's line and exit 127. std
+   reserves 0x5000 bytes per thread with SetThreadStackGuarantee (its
+   `stack_overflow::Handler::new`); so does each lust thread. */
+static void lust_win_stack_guarantee(void) {
+    typedef BOOL (WINAPI *sg_fn)(PULONG);
+    sg_fn sg = (sg_fn)GetProcAddress(GetModuleHandleA("kernel32.dll"), "SetThreadStackGuarantee");
+    ULONG size = 0x5000;
+    if (sg) sg(&size);
+}
 static void lust_stack_guard_init(void) {
     typedef PVOID (WINAPI *add_fn)(ULONG, LONG (CALLBACK *)(EXCEPTION_POINTERS *));
     add_fn add = (add_fn)GetProcAddress(GetModuleHandleA("kernel32.dll"), "AddVectoredExceptionHandler");
     if (add) add(1, lust_win_overflow);
+    lust_win_stack_guarantee();
 }
 #else
 static void lust_stack_guard_init(void) {}
 #endif
+#ifdef _WIN32
+static void lust_thread_guard_init(uintptr_t *lo, uintptr_t *hi, void **alt) { (void)lo; (void)hi; (void)alt; lust_win_stack_guarantee(); }
+#else
 static void lust_thread_guard_init(uintptr_t *lo, uintptr_t *hi, void **alt) { (void)lo; (void)hi; (void)alt; }
+#endif
 static void lust_thread_guard_fini(void *alt) { (void)alt; }
 #endif
 

@@ -50,6 +50,8 @@ the upstream features it implements, and its exact-layout types.
 | deps/num-bigint | Adapter for 0.4.6: `BigInt` parse, print, pow, conversions (deps/num-bigint/README.md). | W-DEPS |
 | deps/bumpalo | Adapter for 3.20.3: the Bump subset of leak_arena.rs with upstream's chunk bookkeeping (deps/bumpalo/README.md). | W-DEPS |
 | deps/libm | Adapter for 0.2.16: sqrt, trig, exp, log, pow, rounding, and fmod, bit-identical to the real crate (deps/libm/README.md). | W-DEPS |
+| deps/base64 | Adapter for 0.22.1: standard and URL-safe `encode` / `decode` (deps/base64/README.md). | W-DEPS |
+| deps/sha2 | Adapter for 0.10.9: SHA-256 `new`, `update`, `finalize`, `digest` (deps/sha2/README.md). | W-DEPS |
 
 ## The std platform crate (W-SHIM)
 

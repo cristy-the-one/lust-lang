@@ -1919,3 +1919,172 @@ pub mod vec_deque {
         }
     }
 }
+
+/// A max-heap. `data` is std's heap array: the same sift rules
+/// (`sift_up`, `sift_down_to_bottom` on pop, `sift_down_range` when
+/// rebuilt from a `Vec`), so `iter`, `into_vec`, `as_slice` and `Debug`
+/// see std's element order. Swaps stand in for std's `Hole` moves;
+/// both leave every element where std leaves it.
+pub struct BinaryHeap<T> {
+    data: Vec<T>,
+}
+
+pub mod binary_heap {
+    pub use super::BinaryHeap;
+
+    impl<T: Ord> BinaryHeap<T> {
+        pub fn new() -> BinaryHeap<T> {
+            BinaryHeap { data: Vec::new() }
+        }
+
+        pub fn with_capacity(capacity: usize) -> BinaryHeap<T> {
+            BinaryHeap { data: Vec::with_capacity(capacity) }
+        }
+
+        pub fn push(&mut self, item: T) {
+            let old_len = self.data.len();
+            self.data.push(item);
+            self.sift_up(0, old_len);
+        }
+
+        pub fn pop(&mut self) -> Option<T> {
+            match self.data.pop() {
+                None => None,
+                Some(mut item) => {
+                    if !self.data.is_empty() {
+                        core::mem::swap(&mut item, &mut self.data[0]);
+                        self.sift_down_to_bottom(0);
+                    }
+                    Some(item)
+                }
+            }
+        }
+
+        pub fn peek(&self) -> Option<&T> {
+            self.data.first()
+        }
+
+        pub fn into_sorted_vec(mut self) -> Vec<T> {
+            let mut end = self.data.len();
+            while end > 1 {
+                end -= 1;
+                self.data.swap(0, end);
+                self.sift_down_range(0, end);
+            }
+            self.data
+        }
+
+        fn sift_up(&mut self, start: usize, pos: usize) -> usize {
+            let mut pos = pos;
+            while pos > start {
+                let parent = (pos - 1) / 2;
+                if self.data[pos] <= self.data[parent] {
+                    break;
+                }
+                self.data.swap(pos, parent);
+                pos = parent;
+            }
+            pos
+        }
+
+        fn sift_down_range(&mut self, pos: usize, end: usize) {
+            let mut pos = pos;
+            let mut child = 2 * pos + 1;
+            while end >= 2 && child <= end - 2 {
+                if self.data[child] <= self.data[child + 1] {
+                    child += 1;
+                }
+                if self.data[pos] >= self.data[child] {
+                    return;
+                }
+                self.data.swap(pos, child);
+                pos = child;
+                child = 2 * pos + 1;
+            }
+            if end >= 1 && child == end - 1 && self.data[pos] < self.data[child] {
+                self.data.swap(pos, child);
+            }
+        }
+
+        fn sift_down_to_bottom(&mut self, pos: usize) {
+            let end = self.data.len();
+            let start = pos;
+            let mut pos = pos;
+            let mut child = 2 * pos + 1;
+            while end >= 2 && child <= end - 2 {
+                if self.data[child] <= self.data[child + 1] {
+                    child += 1;
+                }
+                self.data.swap(pos, child);
+                pos = child;
+                child = 2 * pos + 1;
+            }
+            if end >= 1 && child == end - 1 {
+                self.data.swap(pos, child);
+                pos = child;
+            }
+            self.sift_up(start, pos);
+        }
+
+        fn rebuild(&mut self) {
+            let mut n = self.data.len() / 2;
+            while n > 0 {
+                n -= 1;
+                let len = self.data.len();
+                self.sift_down_range(n, len);
+            }
+        }
+    }
+
+    impl<T> BinaryHeap<T> {
+        pub fn len(&self) -> usize {
+            self.data.len()
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.data.is_empty()
+        }
+
+        pub fn capacity(&self) -> usize {
+            self.data.capacity()
+        }
+
+        pub fn clear(&mut self) {
+            self.data.clear();
+        }
+
+        pub fn into_vec(self) -> Vec<T> {
+            self.data
+        }
+
+        pub fn as_slice(&self) -> &[T] {
+            self.data.as_slice()
+        }
+    }
+
+    impl<T: Ord> From<Vec<T>> for BinaryHeap<T> {
+        fn from(vec: Vec<T>) -> BinaryHeap<T> {
+            let mut heap = BinaryHeap { data: vec };
+            heap.rebuild();
+            heap
+        }
+    }
+
+    impl<T: Ord> Default for BinaryHeap<T> {
+        fn default() -> BinaryHeap<T> {
+            BinaryHeap::new()
+        }
+    }
+
+    impl<T: Clone> Clone for BinaryHeap<T> {
+        fn clone(&self) -> BinaryHeap<T> {
+            BinaryHeap { data: self.data.clone() }
+        }
+    }
+
+    impl<T: core::fmt::Debug> core::fmt::Debug for BinaryHeap<T> {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.debug_list().entries(self.data.iter()).finish()
+        }
+    }
+}

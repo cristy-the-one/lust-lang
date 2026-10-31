@@ -344,7 +344,16 @@ stop_daemon "$d2"; sleep 0.3
 # object file is intentional; only directories count here).
 d=$(fresh tmpcold)
 (cd "$d" && LUST_NO_DAEMON=1 "$lust" build hello.rs -o cold1) >/dev/null 2>&1
-if [ -z "$(find "$TMPDIR" -mindepth 1 -type d -print -quit)" ]; then ok "temp cold: no temp dir after a one-shot build"; else bad "temp cold: no temp dir after a one-shot build" "a dir remains in TMPDIR"; fi
+# A daemon stopped just above may still be removing its own dir (a Windows
+# graceful stop is the address file going away), so wait a little, and name
+# whatever is left.
+left=""
+for i in $(seq 1 50); do
+  left=$(find "$TMPDIR" -mindepth 1 -type d -print 2>/dev/null | head -n 5 | tr '\n' ' ')
+  [ -z "$left" ] && break
+  sleep 0.1
+done
+if [ -z "$left" ]; then ok "temp cold: no temp dir after a one-shot build"; else bad "temp cold: no temp dir after a one-shot build" "left in TMPDIR: $left"; fi
 check "temp cold: binary runs" test "$(runb "$d/cold1")" = "hello 42"
 if [ -n "$saved_tmpdir" ]; then export TMPDIR=$saved_tmpdir; else unset TMPDIR; fi
 if [ "$win" = 1 ]; then

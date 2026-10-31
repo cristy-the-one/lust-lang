@@ -56,10 +56,13 @@ def main():
 
     try:
         # 1. A tab (and a newline) in a file name goes through the daemon.
-        # A newline is a legal file name on Unix and illegal on Windows.
-        names = ["with\ttab.rs"]
+        # Both are legal file names on Unix. Windows forbids every control
+        # character in a name, so there the odd name is spaces, `#`, `&` and a
+        # non-ASCII letter instead.
         if os.name != "nt":
-            names.append("with newline\nname.rs")
+            names = ["with\ttab.rs", "with newline\nname.rs"]
+        else:
+            names = ["with space #&\u00e9.rs"]
         for name in names:
             p = os.path.join(work, name)
             open(p, "w").write('fn main() { println!("hi"); }\n')

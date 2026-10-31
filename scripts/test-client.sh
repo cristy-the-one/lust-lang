@@ -91,11 +91,19 @@ trap cleanup EXIT
 # loads_base <exe> : true when <exe> loads libbase.so, so a daemon built it. ldd output is
 # captured first: `ldd | grep -q` under pipefail fails when grep exits at the match and ldd
 # takes SIGPIPE on its next line (the `race` flake: the binary was right, the check was not).
+# On Windows a warm build links statically (compile.rs `static_warm`), so the binary
+# shows nothing: the client's route log (LUST_ROUTE_LOG) says which way its last build
+# of that output name went.
+export LUST_ROUTE_LOG=$work/route.log
+if [ "$win" = 1 ]; then LUST_ROUTE_LOG=$(cygpath -m "$LUST_ROUTE_LOG"); fi
 loads_base() {
   local bin=$1
   [ -f "$bin" ] || bin=$1.exe
   if [ "$win" = 1 ]; then
-    python3 -c 'import sys; d=open(sys.argv[1],"rb").read(); sys.exit(0 if b"libbase" in d else 1)' "$bin"
+    local name last
+    name=$(basename "$1")
+    last=$(awk -v n="$name" '$2 == n || $2 == n ".exe" { r = $1 } END { print r }' "$LUST_ROUTE_LOG" 2>/dev/null)
+    [ "$last" = daemon ]
     return
   fi
   local out
@@ -228,7 +236,7 @@ check "idle: daemon starts" wait_socket "$d"
 ipid=$(cat "$(sock "$d").lock" 2>/dev/null)
 gone=0
 for i in $(seq 1 100); do
-  if ! kill -0 "$ipid" 2>/dev/null; then gone=1; break; fi
+  if ! pid_alive "$ipid"; then gone=1; break; fi
   sleep 0.1
 done
 check "idle: daemon exits after the idle span" test $gone -eq 1
@@ -265,7 +273,7 @@ wait_gone() { # wait_gone <path>
 }
 wait_dead_pid() { # wait_dead_pid <pid>
   local i
-  for i in $(seq 1 100); do kill -0 "$1" 2>/dev/null || return 0; sleep 0.05; done
+  for i in $(seq 1 100); do pid_alive "$1" || return 0; sleep 0.05; done
   return 1
 }
 # warm_build <dir> <out> : cold build (starts a daemon), then a daemon build to <out>.
@@ -312,12 +320,13 @@ if wait_gone "$TMPDIR/lust-daemon-$pid"; then ok "temp idle: temp dir removed on
 d=$(fresh tmpkill); daemon_dirs+=("$d")
 warm_build "$d" warm2
 pid=$(cat "$(sock "$d").lock" 2>/dev/null)
-kill -9 "$pid" 2>/dev/null
+kill_hard "$pid"
 wait_dead_pid "$pid" >/dev/null
 check "temp kill: temp dir left by SIGKILL" test -d "$TMPDIR/lust-daemon-$pid"
 mkdir -p "$TMPDIR/lust-daemon-4000000002" "$TMPDIR/lust-4000000002"
 touch "$TMPDIR/lust-daemon-4000000002/x.o" "$TMPDIR/lust-rustc-check-4000000002.rmeta"
-mkdir -p "$TMPDIR/lust-daemon-$$"
+mypid=$(self_pid)
+mkdir -p "$TMPDIR/lust-daemon-$mypid"
 d2=$(fresh tmpsweep); daemon_dirs+=("$d2")
 (cd "$d2" && "$lust" check hello.rs) >/dev/null 2>&1
 wait_socket "$d2" >/dev/null
@@ -327,8 +336,8 @@ if wait_gone "$TMPDIR/lust-daemon-4000000002" && wait_gone "$TMPDIR/lust-4000000
 else
   bad "temp sweep: dead-pid lust dirs and files swept" "a dead entry remains"
 fi
-check "temp sweep: live-pid dir kept" test -d "$TMPDIR/lust-daemon-$$"
-rm -rf "$TMPDIR/lust-daemon-$$"
+check "temp sweep: live-pid dir kept" test -d "$TMPDIR/lust-daemon-$mypid"
+rm -rf "$TMPDIR/lust-daemon-$mypid"
 check "temp sweep: kept binary still runs after sweep" test "$(runb "$d/warm2")" = "hello 42"
 stop_daemon "$d2"; sleep 0.3
 # A cold one-shot build leaves no temp dir either (the cached runtime

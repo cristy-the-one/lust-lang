@@ -181,9 +181,11 @@ fn main() {
                 && protocol::source_override().is_none()
                 && let Some(resp) = protocol::request(&sock, &req)
             {
+                log_route("daemon", &req.out);
                 protocol::finish(resp, run, &req.out, &run_args);
             }
             // No daemon answered: start one for the next command, answer this one cold.
+            log_route("cold", &req.out);
             maybe_autostart(&sock, &req.file, &core);
             let mut cmd = std::process::Command::new(&core);
             cmd.args(&args);
@@ -198,6 +200,19 @@ fn main() {
             cmd.args(&args);
             replace_with(&mut cmd, &core);
         }
+    }
+}
+
+/// `LUST_ROUTE_LOG=<file>`: append which way a compile request went, `daemon <out>`
+/// or `cold <out>` (the output file's name). Tests use it to tell a daemon-built
+/// binary from a cold one where the binary itself does not show it (a Windows warm
+/// build links statically, so it loads no base library).
+fn log_route(route: &str, out: &std::path::Path) {
+    let Some(path) = std::env::var_os("LUST_ROUTE_LOG") else { return };
+    let name = out.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        use std::io::Write;
+        let _ = writeln!(f, "{route} {name}");
     }
 }
 

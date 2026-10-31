@@ -1,0 +1,15 @@
+# Lust adapter crate (docs/ARCH.md section 3.6). Dev builds compile this
+# crate in place of the registry package libm 0.2.16; release builds use
+# the real crate through Cargo. The driver checks `version` against the
+# resolved package and the metadata against src/resolve/adapters.rs.
+[package]
+name = "libm"
+version = "0.2.16"
+edition = "2024"
+publish = false
+
+[package.metadata.lust]
+adapter = 1
+# Cargo turns the default feature on, and that feature is `arch`.
+# `unstable`, `force-soft-floats`, and the other nightly flags are not here.
+features = ["arch", "default"]

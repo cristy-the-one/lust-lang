@@ -56,6 +56,7 @@ pub const ADAPTER_PACKAGES: &[&str] = &[
     "same-file",
     "name-to-handle-at",
     "jiff",
+    "libm",
     "base64",
     "sha2",
     "quick-xml",

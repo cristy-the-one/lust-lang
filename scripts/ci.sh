@@ -99,14 +99,25 @@ run_step() {
   local name=$1
   shift
   step "$name"
+  # The step's own output also goes to a file, so a failure can carry its
+  # evidence into ci-failures.txt (the PR comment and the artifact): the raw
+  # job log is not readable by every agent that works on this branch.
+  local out=$root/ci-step.log
   set +e
-  "$@"
-  local st=$?
+  "$@" 2>&1 | tee "$out"
+  local st=${PIPESTATUS[0]}
   set -e
   if [ "$st" -ne 0 ]; then
     failed+=("$name")
     echo "ci: step failed: $name (exit $st)"
-    printf 'STEP %s exit %s\n' "$name" "$st" >> "$LUST_FAIL_LOG"
+    {
+      printf 'STEP %s exit %s\n' "$name" "$st"
+      echo "--- $name: lines that look like failures (first 40)"
+      grep -a -E -i 'fail|error|mismatch|differ|bad request|panicked|not found|cannot|timed? ?out|expected' "$out" | grep -a -v -E '^(ok|PASS) ' | head -n 40
+      echo "--- $name: last 25 lines"
+      tail -n 25 "$out"
+      echo
+    } >> "$LUST_FAIL_LOG"
   fi
 }
 macro_corpus() {

@@ -154,6 +154,25 @@ bench_suite() {
   python3 -c "import json; d = json.load(open('bench/tsrust/baseline.json')); assert d['rows'], 'no rows'"
 }
 
+# libm is a lust source adapter. The oracle is the real crate, so the
+# registry has to hold that exact version before the offline adapter run.
+# LUST_STRICT makes a mismatched bit pattern fail the step.
+adapter_oracles() {
+  local proj st=0
+  proj=$(mktemp -d)
+  mkdir -p "$proj/src"
+  echo 'fn main() {}' >"$proj/src/main.rs"
+  {
+    printf '[package]\nname = "prefetch-libm"\nversion = "0.0.0"\nedition = "2024"\n\n[dependencies]\n'
+    cat tests/adapters/crates/libm/deps.toml
+    printf '\n[workspace]\n'
+  } >"$proj/Cargo.toml"
+  cargo fetch --manifest-path "$proj/Cargo.toml" || return 1
+  rm -rf "$proj"
+  LUST="$root/target/release/lust" LUST_STRICT=1 scripts/test-adapters.sh libm || st=1
+  return "$st"
+}
+run_step "libm adapter" adapter_oracles
 run_step difftest scripts/difftest.sh ${gate_filter:+"$gate_filter"}
 run_step "macro corpus" macro_corpus
 run_step "ts-rust kernels and compat fixtures" kernel_suite

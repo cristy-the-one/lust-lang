@@ -83,22 +83,23 @@ maps to `STEPControl_Reader` and `STEPControl_Writer`. Those names are
 the OCCT 7.x API. The cache key below pins the OCCT version so a later
 OCCT cannot silently change the mesh.
 
-Lust side, when this is implemented, follows `memchr` and does not
-follow `deps.h`. `deps.h` prototypes are pasted into every generated
-unit (`src/runtime/deps.h`). An OCCT prototype there would cost every
+The lust side follows `memchr` and does not follow `deps.h`.
+`deps.h` prototypes are pasted into every generated unit
+(`src/runtime/deps.h`). An OCCT prototype there would cost every
 program compile time, so it does not go there. The pieces are:
 
-- A small lust crate, on the same pattern as `library/deps/memchr`,
-  whose functions call `core::intrinsics::occt_*`.
+- A small lust crate, `library/deps/occt`, whose functions call
+  `core::intrinsics::occt_*`.
 - One `IntrinsicDef` row per function in `src/ty/lang.rs`,
-  `allowed` set to that crate only, `c_symbol` the `lust_occt_*` name.
-  User code that does not depend on the crate never resolves the name.
+  `allowed` set to that crate only. The `c_symbol` is a loader
+  wrapper (`lust_occt_h_*`), because lust cannot pass out-pointers.
+  The wrapper calls the header's `lust_occt_*` export. User code
+  that does not depend on the crate never resolves the name.
 - Codegen emits the call only when the intrinsic is lowered.
 - The loader unit below is emitted only in that same case.
 
 No `ShippedCrate` arm runs unless that crate is actually compiled.
-Adding the rows is a compiler change and has to be remeasured (section
-3). Phase 1 does not add them.
+The rows are a compiler change and are remeasured in section 3.
 
 ## 2. What the first slice needs
 
@@ -125,8 +126,8 @@ would add to stand in for `truck-stepio`. Clipper, 3MF (`quick-xml` +
 
 ### Build
 
-`scripts/build-occt-shim.sh` (not written in this phase) is a manual
-script. It is not called from `scripts/build.sh` or from CI.
+`scripts/build-occt-shim.sh` is a manual script. It is not called
+from `scripts/build.sh` or from CI.
 
 Linux: `g++ -shared -fPIC -O2` of `shim.cc`, linked to the OCCT import
 set the first slice needs (`TKernel`, `TKMath`, `TKBRep`, `TKPrim`,
@@ -153,13 +154,14 @@ does not look at the cache.
 
 ### Link, without new link-line machinery
 
-When, and only when, lowering emits a `lust_occt_*` call, codegen also
-emits one extra C unit: a loader. tcc compiles that unit like any other
-generated unit and links the resulting object with the program. The
-loader defines the `lust_occt_*` symbols. Each one `dlopen`s (Linux) or
-`LoadLibraryW`s (Windows) the cached shim on first use and
-`dlsym`/`GetProcAddress` the same name. The path is the cache path
-baked into that unit, or `LUST_OCCT_SHIM` when set.
+When, and only when, lowering emits a `lust_occt_h_*` call, codegen
+also emits one extra C unit: a loader. tcc compiles that unit like
+any other generated unit and links the resulting object with the
+program. The loader defines the `lust_occt_h_*` symbols. Each one
+`dlopen`s (Linux) or `LoadLibraryW`s (Windows) the cached shim on
+first use and `dlsym`/`GetProcAddress` the header's `lust_occt_*`
+name. The path is the cache path baked into that unit, or
+`LUST_OCCT_SHIM` when set.
 
 The compiler's link step does not gain `tcc_add_library`, a search
 path, or a `#[link]` attribute. OCCT's own DT_NEEDED / DLL dependencies
@@ -179,7 +181,7 @@ oracle, the same idea as the memchr adapter versus the real crate:
    `lust_occt_make_box`, `lust_occt_make_cylinder`, and
    `lust_occt_tessellate` / `mesh_copy`.
 2. The lust bin is the adapter crate calling the intrinsics. Codegen
-   emits calls to those same symbols, satisfied by the loader.
+   emits calls to the loader wrappers, which call those same symbols.
 3. Both print the status, the two counts, and the raw little-endian
    vertex and index bytes (or a hash of those bytes). The committed
    stdout is the rustc run. Lust must match it byte for byte.
@@ -188,8 +190,8 @@ Tessellation is deterministic for one OCCT build and one deflection.
 The oracle pins that build through the cache key and runs it
 single-threaded. It is not a promise that two OCCT versions mesh alike.
 
-The oracle stays out of `scripts/ci.sh` until a runner image actually
-has the cache. Missing OCCT skips the probe. It does not fail the gate.
+`scripts/ci.sh` runs `scripts/occt-oracle.sh`. Missing OCCT skips
+the probe. It does not fail the gate. CI does not install OCCT.
 
 ### Compile and edit time for programs that do not use it
 

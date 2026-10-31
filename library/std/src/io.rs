@@ -1804,3 +1804,106 @@ impl BufRead for StdinLock<'_> {
         core::intrinsics::sys_stdin_consume(n as u64);
     }
 }
+
+/// A cursor over an in-memory buffer. `ZipWriter` and `ZipArchive` take
+/// `Read + Write + Seek`, and `std::io::Cursor<Vec<u8>>` is the buffer
+/// those calls use. Position may move past the end; a later write pads
+/// the gap with zeros, as std's cursor does.
+pub struct Cursor<T> {
+    inner: T,
+    pos: u64,
+}
+
+impl<T> Cursor<T> {
+    /// A cursor at the start of `inner`.
+    pub const fn new(inner: T) -> Cursor<T> {
+        Cursor { inner, pos: 0 }
+    }
+
+    /// The underlying buffer.
+    pub fn into_inner(self) -> T {
+        self.inner
+    }
+
+    /// The underlying buffer.
+    pub fn get_ref(&self) -> &T {
+        &self.inner
+    }
+
+    /// The underlying buffer, mutably.
+    pub fn get_mut(&mut self) -> &mut T {
+        &mut self.inner
+    }
+
+    /// The position from the start of the buffer.
+    pub fn position(&self) -> u64 {
+        self.pos
+    }
+
+    /// Sets the position. A position past the end is allowed.
+    pub fn set_position(&mut self, pos: u64) {
+        self.pos = pos;
+    }
+}
+
+fn seek_pos(len: u64, pos: u64, style: SeekFrom) -> Result<u64> {
+    let next = match style {
+        SeekFrom::Start(n) => n as i64,
+        SeekFrom::End(n) => (len as i64).wrapping_add(n),
+        SeekFrom::Current(n) => (pos as i64).wrapping_add(n),
+    };
+    if next < 0 {
+        Err(Error::new(ErrorKind::InvalidInput, "invalid seek to a negative or overflowing position"))
+    } else {
+        Ok(next as u64)
+    }
+}
+
+impl Read for Cursor<Vec<u8>> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        let data = &self.inner;
+        let pos = self.pos as usize;
+        if self.pos != pos as u64 || pos >= data.len() {
+            return Ok(0);
+        }
+        let n = buf.len().min(data.len() - pos);
+        for i in 0..n {
+            buf[i] = data[pos + i];
+        }
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Write for Cursor<Vec<u8>> {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        let pos = self.pos as usize;
+        if self.pos != pos as u64 {
+            return Err(Error::new(ErrorKind::InvalidInput, "invalid seek to a negative or overflowing position"));
+        }
+        let end = pos + buf.len();
+        if end < pos {
+            return Err(Error::new(ErrorKind::InvalidInput, "invalid seek to a negative or overflowing position"));
+        }
+        while self.inner.len() < end {
+            self.inner.push(0);
+        }
+        for i in 0..buf.len() {
+            self.inner[pos + i] = buf[i];
+        }
+        self.pos = end as u64;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl Seek for Cursor<Vec<u8>> {
+    fn seek(&mut self, style: SeekFrom) -> Result<u64> {
+        let next = seek_pos(self.inner.len() as u64, self.pos, style)?;
+        self.pos = next;
+        Ok(next)
+    }
+}

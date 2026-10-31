@@ -10,6 +10,9 @@ The trig, exp, log, and pow bodies are the real crate's musl kernels.
 `arch` feature uses on x86_64. Rounding, `fmod`, `scalbn`, `copysign`,
 and `fmin`/`fmax` follow the generic bit recipes. Returned bits match
 the real crate, including signed zero, subnormals, infinities, and NaNs.
+`tests/adapters/crates/libm/random.rs` checks a fixed seed of 4096
+random f64 patterns and 4096 random f32 patterns on every function,
+plus values near multiples of pi/2.
 
 ## Implemented
 

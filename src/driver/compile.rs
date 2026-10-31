@@ -649,6 +649,20 @@ fn record_base_user(base_dir: &Path, soname: &str, out: &Path) {
 
 /// Shared-library suffix: `.so` on Unix, `.dll` on Windows. tcc's PE linker
 /// records the dll name, and the loader finds it beside the executable.
+/// Whether a warm (daemon) build links one static executable from the
+/// session's unit objects instead of a base library plus overlays. On
+/// Windows: an executable that reads data from a PE dll needs
+/// `__declspec(dllimport)` on every such declaration (`lust_fns`,
+/// `lust_argc`, ...), and the same unit objects go into both the dll and
+/// the executable, so no one declaration fits both; a dll also keeps its
+/// own copy of any symbol an overlay redefines, where an ELF executable's
+/// copy interposes. Compiles stay incremental (only dirty units recompile);
+/// the link is tcc's static link of the cached objects. `LUST_STATIC_WARM`
+/// selects the same on another host, to test it.
+fn static_warm() -> bool {
+    cfg!(windows) || std::env::var_os("LUST_STATIC_WARM").is_some()
+}
+
 fn base_suffix() -> &'static str {
     if cfg!(windows) { "dll" } else { "so" }
 }
@@ -4770,7 +4784,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         caches.base_units = groups.len();
     }
     let table_dirty = cap_grown || groups.len() != caches.base_units;
-    let rebuild_base = fresh_base || table_dirty || caches.overlays.len() + dirty_fn_units.len() > MAX_OVERLAYS;
+    // Windows links warm builds statically (`static_warm`), so every edit
+    // goes into the unit objects and none into overlays.
+    let rebuild_base = static_warm() || fresh_base || table_dirty || caches.overlays.len() + dirty_fn_units.len() > MAX_OVERLAYS;
     let dir = caches.obj_dir.clone();
     let base_obj = |u: usize| dir.join(format!("u{u}.o"));
     let overlay_obj = |u: usize| dir.join(format!("o{u}.o"));
@@ -5893,7 +5909,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     caches.objects = Some(req.debug);
     t.lap("tcc compile");
     let all_base: Vec<PathBuf> = [1, 2, 3, LOC_UNIT].into_iter().chain(link_fn_units.iter().copied()).map(base_obj).collect();
-    let linked = if !caches.persistent {
+    let linked = if !caches.persistent || static_warm() {
         let mut objs = vec![base_obj(0)];
         objs.extend(all_base);
         crate::tcc::link(&objs, &req.out, req.debug)

@@ -7,6 +7,7 @@ mod ir_cache;
 pub mod buildscript;
 pub mod cache;
 mod compile;
+mod occt;
 mod const_reach;
 pub(crate) mod kept_delta;
 mod kept_derive;

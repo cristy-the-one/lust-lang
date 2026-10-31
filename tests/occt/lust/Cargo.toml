@@ -1,0 +1,8 @@
+[package]
+name = "occt_oracle"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+occt = { path = "../../../library/deps/occt" }

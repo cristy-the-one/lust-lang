@@ -49,6 +49,7 @@ pub enum ShippedCrate {
     Nix,
     SignalHook,
     NameToHandleAt,
+    Occt,
 }
 
 impl ShippedCrate {
@@ -70,6 +71,7 @@ impl ShippedCrate {
         ShippedCrate::Nix,
         ShippedCrate::SignalHook,
         ShippedCrate::NameToHandleAt,
+        ShippedCrate::Occt,
     ];
 
     /// The crate name as user code writes it in a path (`std::...`).
@@ -90,6 +92,7 @@ impl ShippedCrate {
             ShippedCrate::Nix => "nix",
             ShippedCrate::SignalHook => "signal_hook",
             ShippedCrate::NameToHandleAt => "name_to_handle_at",
+            ShippedCrate::Occt => "occt",
         }
     }
 
@@ -342,6 +345,7 @@ const ALLOC_STD: &[ShippedCrate] = &[C::Alloc, C::Std];
 const CORE_ALLOC: &[ShippedCrate] = &[C::Core, C::Alloc];
 const CORE_STD: &[ShippedCrate] = &[C::Core, C::Std];
 const ONLY_STD: &[ShippedCrate] = &[C::Std];
+const ONLY_OCCT: &[ShippedCrate] = &[C::Occt];
 
 /// The intrinsic registry (section 3.2 table, plus the section 3.4
 /// predicates and the section 3.6 adapter cores). Width-specific atomic
@@ -1381,6 +1385,21 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
     // symlink(2) for `std::os::unix::fs::symlink` (TRIAGE T5):
     // 0, errno, or -1 for a path with a NUL byte (sys.h).
     IntrinsicDef { name: "sys_symlink", c_symbol: "lust_sys_symlink", params: &[S::Bytes, S::Bytes], ret: S::I32, allowed: ONLY_STD, implemented: true },
+    // Open CASCADE first slice (docs/occt-shim.md). The symbols are the
+    // loader's wrappers, not the shim's out-param C API. Emitted only
+    // when this crate is compiled. Append-only: these rows stay at the end.
+    IntrinsicDef { name: "occt_session_new", c_symbol: "lust_occt_h_session_new", params: &[], ret: S::U64, allowed: ONLY_OCCT, implemented: true },
+    IntrinsicDef { name: "occt_session_free", c_symbol: "lust_occt_h_session_free", params: &[S::U64], ret: S::Unit, allowed: ONLY_OCCT, implemented: true },
+    IntrinsicDef { name: "occt_make_box", c_symbol: "lust_occt_h_make_box", params: &[S::U64, S::F64, S::F64, S::F64], ret: S::U64, allowed: ONLY_OCCT, implemented: true },
+    IntrinsicDef { name: "occt_make_cylinder", c_symbol: "lust_occt_h_make_cylinder", params: &[S::U64, S::F64, S::F64], ret: S::U64, allowed: ONLY_OCCT, implemented: true },
+    IntrinsicDef { name: "occt_shape_free", c_symbol: "lust_occt_h_shape_free", params: &[S::U64, S::U64], ret: S::Unit, allowed: ONLY_OCCT, implemented: true },
+    IntrinsicDef { name: "occt_tessellate", c_symbol: "lust_occt_h_tessellate", params: &[S::U64, S::U64, S::F64], ret: S::U64, allowed: ONLY_OCCT, implemented: true },
+    IntrinsicDef { name: "occt_mesh_nverts", c_symbol: "lust_occt_h_mesh_nverts", params: &[S::U64], ret: S::U64, allowed: ONLY_OCCT, implemented: true },
+    IntrinsicDef { name: "occt_mesh_ntris", c_symbol: "lust_occt_h_mesh_ntris", params: &[S::U64], ret: S::U64, allowed: ONLY_OCCT, implemented: true },
+    IntrinsicDef { name: "occt_mesh_copy", c_symbol: "lust_occt_h_mesh_copy", params: &[S::U64, S::VecU8Mut, S::VecU8Mut], ret: S::I32, allowed: ONLY_OCCT, implemented: true },
+    IntrinsicDef { name: "occt_mesh_free", c_symbol: "lust_occt_h_mesh_free", params: &[S::U64], ret: S::Unit, allowed: ONLY_OCCT, implemented: true },
+    IntrinsicDef { name: "occt_last_status", c_symbol: "lust_occt_h_last_status", params: &[], ret: S::I32, allowed: ONLY_OCCT, implemented: true },
+    IntrinsicDef { name: "occt_last_error", c_symbol: "lust_occt_h_last_error", params: &[], ret: S::Bytes, allowed: ONLY_OCCT, implemented: true },
 ];
 
 /// The intrinsic with this `core::intrinsics` name: its registry id.
@@ -2527,6 +2546,10 @@ mod tests {
         assert!(arena.allows(Some(ShippedCrate::Bumpalo)));
         assert!(!arena.allows(Some(ShippedCrate::Std)));
         assert!(!arena.allows(Some(ShippedCrate::Memchr)));
+        let occt = intrinsic(intrinsic_by_name("occt_session_new").unwrap());
+        assert!(occt.allows(Some(ShippedCrate::Occt)));
+        assert!(!occt.allows(None));
+        assert!(!occt.allows(Some(ShippedCrate::Std)));
     }
 
     /// Shipped crate hashes are distinct, so privilege by disambiguator

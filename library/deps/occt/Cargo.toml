@@ -1,0 +1,12 @@
+# Lust adapter for the Open CASCADE shim (docs/occt-shim.md).
+# Not a crates.io package. A path dependency named `occt` is this crate.
+# The compiler swaps it in so the crate may call the occt intrinsics.
+[package]
+name = "occt"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata.lust]
+adapter = 1
+features = []

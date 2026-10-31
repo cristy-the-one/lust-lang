@@ -5642,6 +5642,21 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         }
     };
     let rgroups = rg_cell.into_inner();
+    // OCCT loader (docs/occt-shim.md): only after an occt intrinsic was
+    // lowered, including on a later edit whose adapter unit was not
+    // rebuilt. A missing shim is a diagnostic. It does not build OCCT.
+    if program.occt_emit.load(std::sync::atomic::Ordering::Relaxed) {
+        caches.occt_loader = true;
+    }
+    let occt_loader: Option<(PathBuf, String)> = if caches.occt_loader {
+        let triple = if req.session.target_triple.is_empty() { crate::protocol::host_triple() } else { req.session.target_triple.as_str() };
+        match super::occt::loader_source(triple.contains("windows")) {
+            Ok(text) => Some((dir.join("occt_loader.o"), text)),
+            Err(e) => return Response { stderr: format!("error: {e}\n"), code: 1, ..Default::default() },
+        }
+    } else {
+        None
+    };
     // The LLVM backend (cgen/ll.rs) wrote `.ll` companions: only cc.rs builds them.
     let llvm = rgroups.is_some() && cgen::names::with(rn, || cgen::ll::on(&program));
     // The units the link takes after 1..4: release C has its own fn units, glue shards and
@@ -5651,6 +5666,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         None => fn_units.clone(),
     };
     if let Some(p) = &req.emit_c {
+        if let Some((_, text)) = &occt_loader {
+            let _ = std::fs::write(format!("{}.occt_loader.c", p.display()), text);
+        }
         // Emitted C must be self-contained: write every base unit, not only the units
         // rebuilt for this (possibly warm, incremental) build.
         if rgroups.is_some() {
@@ -5752,6 +5770,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             if triple.ends_with("-musl") && std::env::var("LUST_RELEASE_MEM").as_deref() != Ok("libc") {
                 all.push(("memfast".to_string(), crate::cc::memfast_unit()));
             }
+            if let Some((_, text)) = &occt_loader {
+                all.push(("occt_loader".to_string(), text.clone()));
+            }
             if let Some(parent) = req.out.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
             }
@@ -5836,6 +5857,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         && fresh_base
         && groups.len() == 1
         && !req.debug
+        && occt_loader.is_none()
         && let Ok(runtime_obj) = crate::tcc::cached_runtime_object(&cgen::runtime_unit(), req.debug)
     {
         let mem_units: Vec<(PathBuf, String)> = units.iter().filter(|(o, _)| *o != base_obj(2)).cloned().collect();
@@ -5892,6 +5914,12 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             miss_keys.push(key);
         }
     }
+    if let Some((obj, text)) = &occt_loader
+        && let Err(e) = crate::tcc::compile_units(&[(obj.clone(), text.clone())], req.debug)
+    {
+        caches.objects = None;
+        return Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() };
+    }
     if let Err(e) = crate::tcc::compile_units(&miss_units, req.debug) {
         caches.objects = None;
         return Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() };
@@ -5908,10 +5936,30 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     drop(miss_units);
     caches.objects = Some(req.debug);
     t.lap("tcc compile");
-    let all_base: Vec<PathBuf> = [1, 2, 3, LOC_UNIT].into_iter().chain(link_fn_units.iter().copied()).map(base_obj).collect();
+    let mut all_base: Vec<PathBuf> = [1, 2, 3, LOC_UNIT].into_iter().chain(link_fn_units.iter().copied()).map(base_obj).collect();
+    // The loader is its own object. A static link (and a Windows warm
+    // link) puts it on the executable. A base rebuild puts it in the
+    // base. An overlay edit leaves it there, or adds it to the
+    // executable when this base was built before the program used OCCT.
+    let mut occt_on_exe = false;
+    if let Some((obj, _)) = &occt_loader {
+        if !caches.persistent || static_warm() {
+            occt_on_exe = true;
+        } else if rebuild_base {
+            all_base.push(obj.clone());
+            caches.occt_in_base = true;
+        } else if !caches.occt_in_base {
+            occt_on_exe = true;
+        }
+    } else if rebuild_base {
+        caches.occt_in_base = false;
+    }
     let linked = if !caches.persistent || static_warm() {
         let mut objs = vec![base_obj(0)];
         objs.extend(all_base);
+        if occt_on_exe && let Some((obj, _)) = &occt_loader {
+            objs.push(obj.clone());
+        }
         crate::tcc::link(&objs, &req.out, req.debug)
     } else {
         // The base library lives in a persistent dir under a content name
@@ -5958,6 +6006,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             // relink the same base under the same name.
             let dest = base_dir.join(base_lib_name(&caches.base_name));
             let tmp = base_dir.join(format!("libbase-tmp-{}-relink-{}.{}", std::process::id(), base_tmp_seq(), base_suffix()));
+            if caches.occt_in_base && let Some((obj, _)) = &occt_loader {
+                all_base.push(obj.clone());
+            }
             let built = std::fs::create_dir_all(&base_dir)
                 .map_err(|e| format!("cannot create {}: {e}", base_dir.display()))
                 .and_then(|_| crate::tcc::link_shared(&all_base, &tmp, req.debug))
@@ -5973,6 +6024,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         let name = caches.base_name.clone();
         let mut objs = vec![base_obj(0)];
         objs.extend(caches.overlays.iter().map(|&u| overlay_obj(u)));
+        if occt_on_exe && let Some((obj, _)) = &occt_loader {
+            objs.push(obj.clone());
+        }
         base.and_then(|_| crate::tcc::link_with_base(&objs, &base_dir, &name, &req.out, req.debug))
     };
     if let Err(e) = linked {

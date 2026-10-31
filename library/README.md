@@ -52,6 +52,7 @@ the upstream features it implements, and its exact-layout types.
 | deps/libm | Adapter for 0.2.16: sqrt, trig, exp, log, pow, rounding, and fmod, bit-identical to the real crate (deps/libm/README.md). | W-DEPS |
 | deps/base64 | Adapter for 0.22.1: standard and URL-safe `encode` / `decode` (deps/base64/README.md). | W-DEPS |
 | deps/sha2 | Adapter for 0.10.9: SHA-256 `new`, `update`, `finalize`, `digest` (deps/sha2/README.md). | W-DEPS |
+| deps/occt | Path-name adapter for the Open CASCADE shim's first slice (session, box, cylinder, tessellate, mesh bytes). Not a crates.io package. See docs/occt-shim.md. | W-DEPS |
 
 ## The std platform crate (W-SHIM)
 
@@ -210,7 +211,9 @@ src/runtime/sys.c); `clock_now_raw`, `system_time_raw`, and `fmt_align`
 `xxh3_64`/`xxh3_128` (xxhash-rust, C in src/runtime/deps.c) and
 `ryu_js_fmt_f64` (ryu-js, the JS printer in src/runtime/float.c).
 Adapter crates get their privilege from the resolver's record of their
-files (`Program::shipped_crate_at`).
+files (`Program::shipped_crate_at`). The `occt_*` rows are implemented:
+codegen emits the loader call, and the loader unit is linked only when
+one of those calls was lowered (`docs/occt-shim.md`).
 
 Registered with signature and privilege list, no body yet (a
 privileged call rejects with L0640): the memory, bytes, ptr, float

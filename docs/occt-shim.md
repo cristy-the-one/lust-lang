@@ -1,7 +1,12 @@
-# Open CASCADE shim (phase 1 plan)
+# Open CASCADE shim
 
-This is a plan, not an implementation. Nothing here is built, and CI does
-not fetch or compile Open CASCADE.
+The first slice is implemented. CI does not fetch or compile Open
+CASCADE. `scripts/occt-oracle.sh` skips when the shim cache is absent,
+so Linux and Windows CI stay green without it. macOS CI stays disabled.
+
+The first slice is session create/free, last error, box, cylinder,
+shape free, tessellate, mesh counts, mesh copy, and mesh free. Fuse,
+cut, common, and STEP are not built.
 
 Marius chose a fixed C shim over general `extern` blocks. Lust keeps
 rejecting `extern` blocks (L0810), `unsafe` (L0404), and `#[link]`
@@ -202,14 +207,13 @@ That holds only if all of the following stay true:
 
 The `IntrinsicDef` rows and one `allowed` crate are a compiler rebuild,
 the same class of change as registering `memchr`. They are not on the
-per-function path of a program that never names the crate. After the
-rows exist, remeasure a non-user program the way the libm and
-quick-xml edits were remeasured (alternating runs, warmup dropped,
-median and spread). If the median moves, the rows or the emit check
-are on a hot path and the change stops.
-
-Phase 1 adds none of those rows. This document does not change the
-compiler.
+per-function path of a program that never names the crate. The
+`occt_*` rows are at the end of the registry. A non-user program does
+not resolve them and does not stat the shim cache. Remeasure a
+non-user program the way the libm and quick-xml edits were remeasured
+(alternating runs, warmup dropped, median and spread). If the median
+moves, the rows or the emit check are on a hot path and the change
+stops.
 
 ## 4. Risks
 
@@ -248,10 +252,17 @@ match that CRT.
 needs in one directory. A rustc oracle that links the import lib must
 use the same directory.
 
-## What this phase does not do
+## What is built
 
-No shim source, no script, no intrinsic, no CI job, no ARCH table row
-claiming the adapter exists. The next implementation step, if this
-plan is accepted, is the loader-unit rule and the first-slice C
-functions, still without OCCT in CI, and a non-user edit remeasure
-before the intrinsic rows land.
+- `shims/occt/lust_occt.h` and `shim.cc`: catch-all `extern "C"` exports for the first slice. Built by `scripts/build-occt-shim.sh`, not by `scripts/build.sh`.
+- The lust adapter `library/deps/occt`. A path dependency named `occt` is that crate. It is not a crates.io package and it is not in `ADAPTER_PACKAGES`.
+- `occt_*` intrinsics. Codegen emits a file-scope prototype only on the function that calls one, and a loader unit only when one was lowered. The loader is not in `deps.h` or `runtime_source`.
+- `scripts/occt-oracle.sh`: rustc calls the shim with `extern "C"`; lust calls the intrinsics. Stdout (status, counts, raw mesh bytes) must match. Missing cache skips.
+
+Windows: the script prints the `cl` steps and exits. That build was not run here. It needs a machine with an OCCT toolchain (Marius's).
+
+Ubuntu 24.04's `libocct-foundation-dev` omits `NCollection_AliasedArray.hxx`. The script downloads the OCCT 7.6.3 copy into the cache. It is not vendored in this repo.
+
+## What this slice does not do
+
+No fuse/cut/common, no STEP, no OCCT in CI, no general `extern` blocks, no `#[link]`. A program that does not depend on `occt` does not stat the cache and does not link the loader.

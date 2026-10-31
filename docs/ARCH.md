@@ -2132,11 +2132,13 @@ clear error, not a silent mismatch.
 | `libm` | Source port of libm 0.2.16 for the float maths a slicer calls (sqrt, trig, exp, log, pow, rounding, fmod). Kernels follow the real crate. | Bit compare vs 0.2.16, including signed zero, subnormals, inf, NaN, and arguments near multiples of pi/2. |
 | `base64` | Source encode and decode for the four general-purpose engines (standard and URL-safe, padded and unpadded). | Byte compare vs 0.22.1, including decode errors. |
 | `sha2` | Source SHA-256 (`new`, `update`, `finalize`, `digest`). | Digests vs 0.10.9, including multi-chunk updates. |
+| `occt` | Path-name adapter for the Open CASCADE shim, not a crates.io swap. First slice: session, box, cylinder, tessellate, mesh bytes (`docs/occt-shim.md`). The loader unit is emitted only when an `occt_*` intrinsic is lowered. | Same-shim oracle: rustc `extern "C"` versus the lust intrinsics, status, counts, and raw mesh bytes. Skipped when the shim cache is absent. |
 
 Adapter code is user-level lust. It goes through the
 same check and mono as any crate. It may use
 intrinsics only where the table says (memchr, arena,
-xxh3, ryu-js cores).
+xxh3, ryu-js, and the `occt_*` rows). The OCCT loader is
+not part of the runtime unit.
 
 ### 3.7 Shim crates and the allocator
 

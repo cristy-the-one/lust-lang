@@ -17,7 +17,10 @@ use core::fmt;
 pub(crate) fn status(code: i32) -> io::Result<()> {
     match code {
         0 => Ok(()),
-        -1 => Err(io::Error::simple_message(io::ErrorKind::InvalidInput, "file name contained an unexpected NUL byte")),
+        -1 => Err(io::Error::simple_message(
+            io::ErrorKind::InvalidInput,
+            if cfg!(windows) { "strings passed to WinAPI cannot contain NULs" } else { "file name contained an unexpected NUL byte" },
+        )),
         -2 => Err(io::Error::simple_message(io::ErrorKind::WriteZero, "failed to write whole buffer")),
         code => Err(io::Error::from_raw_os_error(code)),
     }
@@ -170,16 +173,29 @@ struct OpenOptionsInner<'a>(&'a OpenOptions);
 
 impl fmt::Debug for OpenOptionsInner<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("OpenOptions")
-            .field("read", &self.0.read)
+        let mut d = f.debug_struct("OpenOptions");
+        d.field("read", &self.0.read)
             .field("write", &self.0.write)
             .field("append", &self.0.append)
             .field("truncate", &self.0.truncate)
             .field("create", &self.0.create)
             .field("create_new", &self.0.create_new)
-            .field("custom_flags", &self.0.custom_flags)
-            .field("mode", &PermModeText(mode_text(self.0.mode as u64)))
-            .finish()
+            .field("custom_flags", &self.0.custom_flags);
+        if cfg!(windows) {
+            // rustc's Windows OpenOptions: the fields std prints, with its
+            // defaults (share read|write|delete, no access mode, no inherit).
+            let access_mode: Option<i32> = None;
+            d.field("access_mode", &access_mode)
+                .field("attributes", &0u32)
+                .field("share_mode", &7u32)
+                .field("security_qos_flags", &0u32)
+                .field("inherit_handle", &false)
+                .field("freeze_last_access_time", &false)
+                .field("freeze_last_write_time", &false);
+        } else {
+            d.field("mode", &PermModeText(mode_text(self.0.mode as u64)));
+        }
+        d.finish()
     }
 }
 
@@ -283,12 +299,15 @@ impl fmt::Debug for File {
         let link = format!("/proc/self/fd/{}", self.fd);
         let mut raw: Vec<u8> = Vec::new();
         let _ = core::intrinsics::sys_readlink(core::intrinsics::sys_str_as_bytes(&link), &mut raw);
-        f.debug_struct("File")
-            .field("fd", &self.fd)
-            .field("path", &PathBuf::from_os_string(OsString::__from_vec(raw)))
-            .field("read", &self.read)
-            .field("write", &self.write)
-            .finish()
+        let path = PathBuf::from_os_string(OsString::__from_vec(raw));
+        let mut d = f.debug_struct("File");
+        d.field("fd", &self.fd).field("path", &path);
+        // rustc's Windows File Debug is the handle and the path. It has
+        // no `read` field, so "read: true" must not appear.
+        if !cfg!(windows) {
+            d.field("read", &self.read).field("write", &self.write);
+        }
+        d.finish()
     }
 }
 
@@ -596,10 +615,15 @@ impl fmt::Debug for FileType {
     }
 }
 
-/// The permission bits of a file.
+/// The permission bits of a file. On Windows `attrs` is the raw
+/// `dwFileAttributes` (`FILE_ATTRIBUTE_ARCHIVE` is 32).
 #[derive(Clone, PartialEq, Eq)]
 pub struct Permissions {
     pub(crate) mode: u64,
+    /// Raw `dwFileAttributes`. `pub(crate)` so `os::unix::fs::PermissionsExt::from_mode`
+    /// (compiled on every host) can build a value; it is not a public field.
+    #[cfg(windows)]
+    pub(crate) attrs: u32,
 }
 
 impl Permissions {
@@ -609,14 +633,20 @@ impl Permissions {
     }
 }
 
+/// Unix: `Permissions(FilePermissions { mode: 0o100644 (-rw-r--r--) })`.
+/// Windows: `Permissions(FilePermissions { attrs: 32 })`.
+#[cfg(not(windows))]
 impl fmt::Debug for Permissions {
-    /// As std: `Permissions(FilePermissions { mode: 0o100644 (-rw-r--r--) })`.
-    /// std's `Mode` Debug: the octal value, then the `ls` form only for a
-    /// directory, block or char device, symlink, fifo, or regular file;
-    /// the sticky bit shows (`t`, `T`) only on a directory.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mode = PermModeText(mode_text(self.mode));
         f.debug_tuple("Permissions").field(&FilePerm { mode }).finish()
+    }
+}
+
+#[cfg(windows)]
+impl fmt::Debug for Permissions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Permissions").field(&FilePerm { attrs: self.attrs }).finish()
     }
 }
 
@@ -671,12 +701,23 @@ impl fmt::Debug for PermModeText {
 /// The inner value of `Permissions` debug output, built with
 /// `debug_struct` so the alternate (`{:#?}`) form expands as std's does.
 struct FilePerm {
+    #[cfg(not(windows))]
     mode: PermModeText,
+    #[cfg(windows)]
+    attrs: u32,
 }
 
+#[cfg(not(windows))]
 impl fmt::Debug for FilePerm {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FilePermissions").field("mode", &self.mode).finish()
+    }
+}
+
+#[cfg(windows)]
+impl fmt::Debug for FilePerm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FilePermissions").field("attrs", &self.attrs).finish()
     }
 }
 
@@ -734,7 +775,11 @@ impl Metadata {
 
     /// The permissions.
     pub fn permissions(&self) -> Permissions {
-        Permissions { mode: self.mode }
+        Permissions {
+            mode: self.mode,
+            #[cfg(windows)]
+            attrs: self.uid as u32,
+        }
     }
 
     /// The birth time fields, for the std splice's `created()`

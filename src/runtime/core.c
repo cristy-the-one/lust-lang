@@ -56,12 +56,37 @@ void lust_oom_size(uint64_t n) LUST_BODY({
     abort();
 })
 
+/* LUST_ALIGNED_EMU (Linux dev only): emulate Windows' _aligned_malloc
+   pairing on Linux. An over-aligned block is then a pointer inside a
+   larger malloc block, so a plain free() of it aborts at once (glibc:
+   "free(): invalid pointer"), as _aligned_malloc + free fail-fasts on
+   Windows. This finds mismatched frees in minutes on Linux instead of in
+   a Windows CI run. Off unless the variable is set. */
+#ifndef _WIN32
+static int lust_aligned_emu_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("LUST_ALIGNED_EMU") != 0;
+    return on;
+}
+static void *lust_emu_aligned_malloc(uint64_t size, uint64_t align) {
+    void *raw = malloc((size_t)(size + align + sizeof(void *)));
+    if (!raw) return 0;
+    uintptr_t a = ((uintptr_t)raw + sizeof(void *) + align - 1) & ~(uintptr_t)(align - 1);
+    ((void **)a)[-1] = raw;
+    return (void *)a;
+}
+static void lust_emu_aligned_free(void *p) {
+    if (p) free(((void **)p)[-1]);
+}
+#endif
+
 /* The `alloc(size, align)` intrinsic family (ARCH 3.2). `align` is a power
    of two, as Rust's Layout guarantees. Alignment up to 4 MiB works (the
    ts-rust jemalloc case). A zero size returns a dangling pointer with the
    requested alignment and allocates nothing; well-formed wrappers never
    ask for one, but the Vec core uses the same form for empty buffers.
-   Every pointer these return can go to plain free(). */
+   Release them with lust_dealloc. On Windows an alignment above 16 is
+   an _aligned_malloc block, and free() of that pointer fail-fasts. */
 void *lust_alloc(uint64_t size, uint64_t align) LUST_BODY({
     if (!size) return (void *)(uintptr_t)(align ? align : 1);
     void *p = 0;
@@ -69,12 +94,41 @@ void *lust_alloc(uint64_t size, uint64_t align) LUST_BODY({
     p = align <= 16 ? malloc(size) : _aligned_malloc((size_t)size, (size_t)align);
 #else
     if (align <= 16) p = malloc(size);
+    else if (lust_aligned_emu_on()) p = lust_emu_aligned_malloc(size, align);
     else if ((size & (align - 1)) == 0) p = aligned_alloc(align, size);
     else if (posix_memalign(&p, align, size) != 0) p = 0;
 #endif
     if (!p) lust_oom_size(size);
     return p;
 })
+
+/* A dev-C value whose alignment is over 16 (cgen `overaligned_local`,
+   and clone/default glue). tcc's frame is only 16-aligned, and a char
+   buffer big enough to realign a 128-byte local inside it faults on PE.
+   The value lives in an aligned block for the rest of the process:
+   tcc's cleanup attribute on that pointer fail-fasts under PE. */
+void *lust_overaligned_alloc(uint64_t size, uint64_t align) LUST_BODY({
+    if (!size) size = 1;
+    if (align < sizeof(void *)) align = sizeof(void *);
+    void *p;
+#ifdef _WIN32
+    p = _aligned_malloc((size_t)size, (size_t)align);
+#else
+    p = 0;
+    if (align <= 16) p = malloc(size);
+    else if (lust_aligned_emu_on()) p = lust_emu_aligned_malloc(size, align);
+    else if ((size & (align - 1)) == 0) p = aligned_alloc(align, size);
+    else if (posix_memalign(&p, align, size) != 0) p = 0;
+#endif
+    if (!p) lust_oom_size(size);
+    return p;
+})
+#ifdef _WIN32
+void lust_overaligned_free(void *pp) LUST_BODY({
+    void *p = *(void **)pp;
+    if (p) _aligned_free(p);
+})
+#endif
 
 /* std's System::alloc_zeroed: calloc when malloc's alignment is enough,
    so the pages stay untouched until used (`vec![0u8; n]` for a large n
@@ -103,6 +157,8 @@ void lust_dealloc(void *ptr, uint64_t size, uint64_t align) LUST_BODY({
     if (!size) return;
 #ifdef _WIN32
     if (align > 16) { _aligned_free(ptr); return; }
+#else
+    if (align > 16 && lust_aligned_emu_on()) { lust_emu_aligned_free(ptr); return; }
 #endif
     (void)align;
     free(ptr);
@@ -417,7 +473,7 @@ void lust_vec_shrink_to(lust_Vec *v, uint64_t min_cap, uint64_t elem, uint64_t a
     uint64_t target = min_cap > v->len ? min_cap : v->len;
     if (v->cap <= target) return;
     if (!target) {
-        free(v->ptr);
+        lust_dealloc(v->ptr, v->cap * elem, align);
         v->ptr = (void *)(uintptr_t)(align ? align : 1);
         v->cap = 0;
         return;
@@ -509,6 +565,10 @@ static lust_loc lust_std_loc(uint32_t file, uint32_t line, uint32_t col) {
    `slice::range` is track_caller to there, and `Vec::drain` is not
    track_caller at all. */
 static void lust_range_bounds_check(uint64_t len, uint64_t s_tag, uint64_t s_val, uint64_t e_tag, uint64_t e_val, uint64_t *out_s, uint64_t *out_e) LUST_BODY({
+    /* A failed check panics and, in flag mode, returns. The later
+       checks would also fail (a start past `len` is past `end` too)
+       and raise again while the first panic is still pending. Windows
+       then fail-fasts (exit 127) instead of unwinding to 101. */
     uint64_t end;
     if (e_tag == 0) {
         if (e_val >= len) {
@@ -518,6 +578,7 @@ static void lust_range_bounds_check(uint64_t len, uint64_t s_tag, uint64_t s_val
             lust_string_push_cstr(&s, " out of range for slice of length ");
             lust_fmt_u64(&s, len);
             lust_panic(&s, lust_std_loc(12, 1005, 52));
+            if (lust_unwind_mode && lust_unw_mine()) return;
         }
         end = e_val + 1;
     } else if (e_tag == 1) {
@@ -528,6 +589,7 @@ static void lust_range_bounds_check(uint64_t len, uint64_t s_tag, uint64_t s_val
             lust_string_push_cstr(&s, " out of range for slice of length ");
             lust_fmt_u64(&s, len);
             lust_panic(&s, lust_std_loc(12, 1009, 51));
+            if (lust_unwind_mode && lust_unw_mine()) return;
         }
         end = e_val;
     } else {
@@ -547,6 +609,7 @@ static void lust_range_bounds_check(uint64_t len, uint64_t s_tag, uint64_t s_val
             lust_string_push_cstr(&s, " out of range for slice of length ");
             lust_fmt_u64(&s, len);
             lust_panic(&s, start_loc);
+            if (lust_unwind_mode && lust_unw_mine()) return;
         }
         if (s_tag == 1 && s_val == end) {
             lust_String s = lust_string_new();
@@ -555,6 +618,7 @@ static void lust_range_bounds_check(uint64_t len, uint64_t s_tag, uint64_t s_val
             lust_string_push_cstr(&s, " out of range for slice of length ");
             lust_fmt_u64(&s, len);
             lust_panic(&s, start_loc);
+            if (lust_unwind_mode && lust_unw_mine()) return;
         }
         if (s_val > end) {
             lust_String s = lust_string_new();
@@ -563,6 +627,7 @@ static void lust_range_bounds_check(uint64_t len, uint64_t s_tag, uint64_t s_val
             lust_string_push_cstr(&s, " but ends at ");
             lust_fmt_u64(&s, end);
             lust_panic(&s, start_loc);
+            if (lust_unwind_mode && lust_unw_mine()) return;
         }
         start = s_tag == 1 ? s_val + 1 : s_val;
     }
@@ -885,6 +950,10 @@ uint64_t lust_bounds(uint64_t i, uint64_t len, lust_loc loc) LUST_BODY({
         lust_string_push_cstr(&s, " but the index is ");
         lust_fmt_u64(&s, i);
         lust_panic_dyn(&s, loc);
+        /* Unwind mode returns. Handing `i` back would load one past the
+           allocation; on Windows that is a heap fail-fast (exit 127)
+           before the frame can catch the panic. */
+        return 0;
     }
     return i;
 })

@@ -141,8 +141,13 @@ impl Tcc {
         // gives the main thread 8 MiB, which is what the programs under
         // test were written for.
         let stack = if cfg!(windows) && (output == TCC_OUTPUT_EXE || output == TCC_OUTPUT_DLL) { " -Wl,-stack=8388608" } else { "" };
+        // A PE dll exports nothing unless asked. tcc units call the runtime
+        // (inl.h's fast paths are off under __TINYC__), and the warm
+        // executable resolves those calls against libbase. Linux exports
+        // every global from a .so; -rdynamic is that rule for tcc's PE linker.
+        let export = if cfg!(windows) && output == TCC_OUTPUT_DLL { " -rdynamic" } else { "" };
         let opts = CString::new(format!(
-            "{}{stack}",
+            "{}{stack}{export}",
             if debug { "-g -w -fno-asynchronous-unwind-tables" } else { "-w -fno-asynchronous-unwind-tables" }
         ))
         .unwrap();
@@ -280,6 +285,16 @@ fn link_objects(tcc: &Tcc, objs: &[PathBuf], out: &Path) -> Result<(), String> {
             let libm = CString::new("m").unwrap();
             if tcc_add_library(tcc.s, libm.as_ptr()) != 0 {
                 return Err(tcc.fail("load libm"));
+            }
+        }
+        // Socket calls (WSASocketW, getaddrinfo, recv) live in ws2_32.
+        // tcc does not link that import library unless asked; its
+        // ws2_32.def is next to libtcc1.a.
+        #[cfg(windows)]
+        {
+            let ws2 = CString::new("ws2_32").unwrap();
+            if tcc_add_library(tcc.s, ws2.as_ptr()) != 0 {
+                return Err(tcc.fail("load ws2_32"));
             }
         }
         for o in objs {

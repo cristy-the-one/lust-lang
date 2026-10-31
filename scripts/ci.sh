@@ -8,6 +8,9 @@
 #
 # Env knobs: CI_SANITIZE=0 skips step 3, CI_BENCH=0 skips step 5,
 # FUZZ_SECONDS (default 20) is passed to each fuzzer script.
+# LUST_GATE_FILTER is a case-name substring, or a file of substrings,
+# passed to difftest and the other runners that take a filter. A red
+# step is recorded and the rest of the gate still runs.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
@@ -81,56 +84,66 @@ scripts/check-codes.sh
 step "lust-port tool tests"
 scripts/test-lust-port.sh
 
-step "difftest"
-scripts/difftest.sh
-
-step "macro corpus"
-scripts/test-macros.sh
-scripts/test-macro-deps.sh
-
-step "ts-rust kernels and compat fixtures"
-scripts/test-kernels.sh
-
-if [ -e scripts/test-client.sh ]; then
-  step "client tests"
-  scripts/test-client.sh
-fi
-
-step "crate fixture tests"
-scripts/test-crates.sh
-
-step "daemon edit scenarios (warm vs cold vs rustc)"
-python3 scripts/test-daemon-scenarios.py
-
-if [ -e scripts/test-slots.py ]; then
-  step "slot identity tests"
-  python3 scripts/test-slots.py
-fi
-
-if [ "${CI_SANITIZE:-1}" = 1 ]; then
-  step "difftest (sanitize)"
-  SANITIZE=1 scripts/difftest.sh
-else
-  step "difftest (sanitize) SKIPPED (CI_SANITIZE=0)"
-fi
-
-step "fuzz"
-found_fuzz=""
-for f in scripts/fuzz-parse.sh scripts/fuzz-edit.sh scripts/fuzz.sh scripts/fuzz-*.sh fuzz/run.sh; do
-  [ -e "$f" ] || continue
-  case " $found_fuzz " in *" $f "*) continue ;; esac
-  found_fuzz="$found_fuzz $f"
-  echo "running $f (FUZZ_SECONDS=${FUZZ_SECONDS:-20})"
-  FUZZ_SECONDS=${FUZZ_SECONDS:-20} bash "$f"
-done
-if [ -z "$found_fuzz" ]; then
-  echo "no fuzz scripts present yet (scripts/fuzz-*.sh); skipping"
-fi
-
-if [ "${CI_BENCH:-1}" = 1 ]; then
-  step "benchmark smoke"
-  # Row-shape regression check: compare.sh must pair debuginfo=0 rows with a
-  # debuginfo=2 counterpart and confirm identical program output.
+# LUST_GATE_FILTER (a substring, or a file of substrings) limits difftest
+# and the other runners that take a filter. Empty runs the full gate.
+# LUST_FAIL_LOG collects FAIL lines for the Actions annotation and the PR note.
+gate_filter=${LUST_GATE_FILTER:-}
+export LUST_FAIL_LOG=$root/ci-failures.txt
+: > "$LUST_FAIL_LOG"
+failed=()
+# Run a step and remember a failure. set -e would stop at the first red
+# step, so each later suite (macros, kernels, crates, daemon, fuzz) never
+# ran on Windows. The build above still stops the gate: nothing else can
+# run without the compiler.
+run_step() {
+  local name=$1
+  shift
+  step "$name"
+  # The step's own output also goes to a file, so a failure can carry its
+  # evidence into ci-failures.txt (the PR comment and the artifact): the raw
+  # job log is not readable by every agent that works on this branch.
+  local out=$root/ci-step.log
+  set +e
+  "$@" 2>&1 | tee "$out"
+  local st=${PIPESTATUS[0]}
+  set -e
+  if [ "$st" -ne 0 ]; then
+    failed+=("$name")
+    echo "ci: step failed: $name (exit $st)"
+    {
+      printf 'STEP %s exit %s\n' "$name" "$st"
+      echo "--- $name: lines that look like failures (first 40)"
+      grep -a -E -i 'fail|error|mismatch|differ|bad request|panicked|not found|cannot|timed? ?out|expected' "$out" | grep -a -v -E '^(ok|PASS) ' | head -n 40
+      echo "--- $name: last 25 lines"
+      tail -n 25 "$out"
+      echo
+    } >> "$LUST_FAIL_LOG"
+  fi
+}
+macro_corpus() {
+  local st=0
+  scripts/test-macros.sh ${gate_filter:+"$gate_filter"} || st=1
+  scripts/test-macro-deps.sh || st=1
+  return "$st"
+}
+kernel_suite() { scripts/test-kernels.sh ${gate_filter:+"$gate_filter"}; }
+crate_suite() { scripts/test-crates.sh ${gate_filter:+"$gate_filter"}; }
+fuzz_suite() {
+  local f found="" st=0
+  for f in scripts/fuzz-parse.sh scripts/fuzz-edit.sh scripts/fuzz.sh scripts/fuzz-*.sh fuzz/run.sh; do
+    [ -e "$f" ] || continue
+    case " $found " in *" $f "*) continue ;; esac
+    found="$found $f"
+    echo "running $f (FUZZ_SECONDS=${FUZZ_SECONDS:-20})"
+    FUZZ_SECONDS=${FUZZ_SECONDS:-20} bash "$f" || st=1
+  done
+  if [ -z "$found" ]; then
+    echo "no fuzz scripts present yet (scripts/fuzz-*.sh); skipping"
+  fi
+  return "$st"
+}
+bench_suite() {
+  local smoke
   smoke=$(mktemp)
   REPS=1 bench/compare.sh plain 40 | tee "$smoke"
   grep -q "debuginfo=0" "$smoke"
@@ -138,11 +151,36 @@ if [ "${CI_BENCH:-1}" = 1 ]; then
   grep -q "same output: yes" "$smoke"
   rm -f "$smoke"
   python3 bench/run.py --quick --skip-edit-loop --json "$(mktemp -u).json"
-  # The checked-in ts-rust scoreboard must stay valid JSON with rows.
   python3 -c "import json; d = json.load(open('bench/tsrust/baseline.json')); assert d['rows'], 'no rows'"
+}
+
+run_step difftest scripts/difftest.sh ${gate_filter:+"$gate_filter"}
+run_step "macro corpus" macro_corpus
+run_step "ts-rust kernels and compat fixtures" kernel_suite
+if [ -e scripts/test-client.sh ]; then
+  run_step "client tests" scripts/test-client.sh
+fi
+run_step "crate fixture tests" crate_suite
+run_step "daemon edit scenarios (warm vs cold vs rustc)" python3 scripts/test-daemon-scenarios.py
+if [ -e scripts/test-slots.py ]; then
+  run_step "slot identity tests" python3 scripts/test-slots.py
+fi
+if [ "${CI_SANITIZE:-1}" = 1 ]; then
+  run_step "difftest (sanitize)" env SANITIZE=1 scripts/difftest.sh ${gate_filter:+"$gate_filter"}
+else
+  step "difftest (sanitize) SKIPPED (CI_SANITIZE=0)"
+fi
+run_step fuzz fuzz_suite
+if [ "${CI_BENCH:-1}" = 1 ]; then
+  run_step "benchmark smoke" bench_suite
 else
   step "benchmark smoke SKIPPED (CI_BENCH=0)"
 fi
 
 step "done"
+if [ ${#failed[@]} -ne 0 ]; then
+  echo "ci: ${#failed[@]} step(s) failed"
+  printf 'FAILED: %s\n' "${failed[@]}"
+  exit 1
+fi
 echo "ci: all steps passed"

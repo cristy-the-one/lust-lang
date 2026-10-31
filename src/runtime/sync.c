@@ -253,7 +253,8 @@ int lust_arc_take_unique(uint64_t *h) LUST_BODY({
 
 /* ---------- Locks: Mutex and RwLock over a futex word ----------
 
-   A `Mutex<T>` is { uint32_t st; uint8_t poison; T v; } and an `RwLock<T>`
+   A `Mutex<T>` is { uint32_t st; uint8_t poison; T v; } (Windows: st is
+   a uint8_t, rustc's SmallFutex) and an `RwLock<T>` is
    { uint32_t st; uint32_t wn; uint8_t poison; T v; } (cgen/sync.rs). All
    zero is unlocked, so `Mutex::new` in a static needs no constructor. The
    poison flag stays 0: a panic aborts the process. Locking a lock this
@@ -326,7 +327,14 @@ static void lust_futex_wake(uint32_t *p, int n) {
    nanoseconds (callers recompute what is left and loop, so a capped
    or early return is fine). */
 static void lust_futex_wait_for(uint32_t *p, uint32_t v, long rs, long rn) {
-#ifdef LUST_SYS_FUTEX
+#ifdef _WIN32
+    pthread_once(&lust_woa_once, lust_woa_init);
+    uint64_t ms = (uint64_t)rs * 1000ull + (uint64_t)rn / 1000000ull;
+    if (ms == 0) ms = 1;
+    if (ms > 0xffffffffull) ms = 0xffffffffull;
+    if (lust_woa) lust_woa(p, &v, sizeof v, (uint32_t)ms);
+    else SwitchToThread();
+#elif defined(LUST_SYS_FUTEX)
     long rel[2];
     rel[0] = rs;
     rel[1] = rn;
@@ -341,6 +349,18 @@ static void lust_futex_wait_for(uint32_t *p, uint32_t v, long rs, long rn) {
     sched_yield();
 #endif
 }
+#ifdef _WIN32
+/* One-byte WaitOnAddress for rustc's SmallFutex mutex word. */
+static void lust_mutex_wait8(uint8_t *p, uint8_t v) {
+    pthread_once(&lust_woa_once, lust_woa_init);
+    if (lust_woa) lust_woa(p, &v, 1, 0xffffffffu);
+    else SwitchToThread();
+}
+static void lust_mutex_wake8(uint8_t *p) {
+    pthread_once(&lust_woa_once, lust_woa_init);
+    if (lust_wake1) lust_wake1(p);
+}
+#endif
 #endif
 
 /* Poisoning (panic=unwind): the `poison` byte of a Mutex or RwLock. Bit 0
@@ -380,7 +400,50 @@ static uint32_t lust_lock_spin(uint32_t *st, uint32_t busy) {
 }
 
 /* Mutex states: 0 unlocked, 1 locked, 2 locked with waiters (Drepper's
-   futex mutex, as std's: spin first, then mark waiters and sleep). */
+   futex mutex, as std's: spin first, then mark waiters and sleep).
+   Windows waits on one byte (SmallFutex / WaitOnAddress size 1). A
+   channel's `uint32_t` lock uses the same entry; only its low byte
+   moves, which is the whole state. */
+#ifdef _WIN32
+static uint8_t lust_lock_spin8(uint8_t *st, uint8_t busy) {
+    uint8_t s;
+    for (int i = 0; i < 100; i++) {
+        __atomic_load(st, &s, 0);
+        if (s != busy) return s;
+        lust_lock_pause();
+    }
+    __atomic_load(st, &s, 0);
+    return s;
+}
+void lust_mutex_lock(void *stp) LUST_BODY({
+    uint8_t *st = (uint8_t *)stp;
+    uint8_t zero = 0, one = 1, two = 2, old;
+    if (__atomic_compare_exchange(st, &zero, &one, 0, 2, 0)) return;
+    uint8_t s = lust_lock_spin8(st, 1);
+    if (s == 0) {
+        if (__atomic_compare_exchange(st, &s, &one, 0, 2, 0)) return;
+    }
+    for (;;) {
+        if (s != 2) {
+            __atomic_exchange(st, &two, &old, 2);
+            if (old == 0) return;
+        }
+        lust_mutex_wait8(st, 2);
+        s = lust_lock_spin8(st, 1);
+    }
+})
+int lust_mutex_trylock(void *stp) LUST_BODY({
+    uint8_t *st = (uint8_t *)stp;
+    uint8_t zero = 0, one = 1;
+    return __atomic_compare_exchange(st, &zero, &one, 0, 2, 0);
+})
+void lust_mutex_unlock(void *stp) LUST_BODY({
+    uint8_t *st = (uint8_t *)stp;
+    uint8_t zero = 0, old;
+    __atomic_exchange(st, &zero, &old, 3);
+    if (old == 2) lust_mutex_wake8(st);
+})
+#else
 void lust_mutex_lock(uint32_t *st) LUST_BODY({
     uint32_t zero = 0, one = 1, two = 2, old;
     if (__atomic_compare_exchange(st, &zero, &one, 0, 2, 0)) return;
@@ -409,6 +472,7 @@ void lust_mutex_unlock(uint32_t *st) LUST_BODY({
     __atomic_exchange(st, &zero, &old, 3);
     if (old == 2) lust_futex_wake(st, 1);
 })
+#endif
 
 /* RwLock: st is the reader count, or LUST_RW_WRITER while written; st[1]
    (wn) counts sleepers. Every step is SeqCst, so an unlock that reads
@@ -530,6 +594,11 @@ typedef struct lust_JoinHdr {
     lust_Scope *scope; /* 0 for thread::spawn */
     uint32_t panicked; /* the thread ended by a panic; `payload` is its Box<dyn Any + Send> */
     lust_dyn payload;
+    /* The packet allocation (`lust_alloc`). On Windows an over-aligned
+       return value makes this an `_aligned_malloc` block; `free` of it
+       fail-fasts. 0 means the caller did not record them (plain `free`). */
+    uint64_t pkt_bytes;
+    uint64_t pkt_align;
 } lust_JoinHdr;
 
 /* A JoinHdr's thread id as the pthread calls take it. The field is an
@@ -621,7 +690,8 @@ static void lust_packet_free(lust_JoinHdr *h) {
     uint32_t one = 1;
     if (sc && h->panicked) __atomic_store(&sc->panicked, &one, 5);
     lust_thread_info_release(h->th);
-    free(h);
+    if (h->pkt_bytes) lust_dealloc(h, h->pkt_bytes, h->pkt_align ? h->pkt_align : 1);
+    else free(h);
     if (sc && __atomic_sub_fetch(&sc->live, 1, 5) == 0) lust_futex_wake(&sc->live, 0x7fffffff);
 }
 
@@ -1343,7 +1413,7 @@ static void lust_chan_push(lust_Chan *c, const void *v) {
         uint64_t nc = c->bufcap ? c->bufcap * 2 : 4;
         uint8_t *nb = (uint8_t *)lust_alloc(nc * c->esize, c->ealign);
         for (uint64_t i = 0; i < c->len; i++) memcpy(nb + i * c->esize, c->buf + ((c->head + i) % c->bufcap) * c->esize, c->esize);
-        if (c->bufcap && c->esize) free(c->buf);
+        if (c->bufcap && c->esize) lust_dealloc(c->buf, c->bufcap * c->esize, c->ealign);
         c->buf = nb;
         c->bufcap = nc;
         c->head = 0;
@@ -1366,7 +1436,7 @@ static void lust_chan_drain(lust_Chan *c) {
 }
 static void lust_chan_free(lust_Chan *c) {
     lust_chan_drain(c);
-    if (c->bufcap && c->esize) free(c->buf);
+    if (c->bufcap && c->esize) lust_dealloc(c->buf, c->bufcap * c->esize, c->ealign);
     free(c);
 }
 #endif

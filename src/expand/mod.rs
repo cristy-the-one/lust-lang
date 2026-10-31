@@ -692,7 +692,20 @@ impl ClientView {
     pub fn shown(&self, path: &str) -> String {
         match &self.shown_root {
             Some((abs, shown)) => match std::path::Path::new(path).strip_prefix(abs) {
-                Ok(rest) => shown.join(rest).to_string_lossy().into_owned(),
+                Ok(rest) => {
+                    // rustc keeps the separator of the root it was given.
+                    // `Path::join` on Windows would turn `D:/a/pass` plus the
+                    // file into `D:/a/pass\file.rs`.
+                    let base = shown.to_string_lossy();
+                    let slash = !base.contains('\\');
+                    let rest = if slash { rest.to_string_lossy().replace('\\', "/") } else { rest.to_string_lossy().into_owned() };
+                    let sep = if slash { '/' } else { '\\' };
+                    if base.is_empty() || base.ends_with('/') || base.ends_with('\\') {
+                        format!("{base}{rest}")
+                    } else {
+                        format!("{base}{sep}{rest}")
+                    }
+                }
                 Err(_) => path.to_string(),
             },
             None => path.to_string(),

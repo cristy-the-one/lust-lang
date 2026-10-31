@@ -869,19 +869,58 @@ pub fn sibling_tool(exe: &Path, name: &str) -> PathBuf {
     }
 }
 
-fn file_identity(m: std::fs::Metadata) -> String {
+fn file_identity(path: &Path, m: std::fs::Metadata) -> String {
     #[cfg(unix)]
     {
+        let _ = path;
         use std::os::unix::fs::MetadataExt;
         format!("{:x}.{:x}.{:x}.{:x}.{:x}", m.dev(), m.ino(), m.size(), m.mtime(), m.mtime_nsec())
     }
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
-        // `file_index` is still unstable. Size plus the two FILETIME stamps
-        // (100 ns) change when the binary is replaced.
-        format!("{:x}.{:x}.{:x}", m.file_size(), m.creation_time(), m.last_write_time())
+        // Size and the two FILETIME stamps are not enough: a copy keeps the
+        // write time, and NTFS "tunneling" gives a file created under a name
+        // that was just renamed away the old file's creation time (the
+        // rebuilt-daemon scenario does exactly that). The volume serial and
+        // file index (the inode) do change; `file_index` is still unstable
+        // in std, so they come from GetFileInformationByHandle.
+        let (vol, idx) = win_file_index(path).unwrap_or((0, 0));
+        format!("{vol:x}.{idx:x}.{:x}.{:x}.{:x}", m.file_size(), m.creation_time(), m.last_write_time())
     }
+}
+
+/// The volume serial number and the 64-bit file index of `path`.
+#[cfg(windows)]
+fn win_file_index(path: &Path) -> Option<(u32, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        attributes: u32,
+        creation_time: [u32; 2],
+        last_access_time: [u32; 2],
+        last_write_time: [u32; 2],
+        volume_serial_number: u32,
+        file_size_high: u32,
+        file_size_low: u32,
+        number_of_links: u32,
+        file_index_high: u32,
+        file_index_low: u32,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandle(h: *mut std::ffi::c_void, info: *mut ByHandleFileInformation) -> i32;
+    }
+    let f = std::fs::File::open(path).ok()?;
+    let mut info = std::mem::MaybeUninit::<ByHandleFileInformation>::zeroed();
+    // SAFETY: a valid open handle and a writable struct of the documented layout.
+    let ok = unsafe { GetFileInformationByHandle(f.as_raw_handle() as *mut std::ffi::c_void, info.as_mut_ptr()) };
+    if ok == 0 {
+        return None;
+    }
+    // SAFETY: the call succeeded, so it filled the struct.
+    let info = unsafe { info.assume_init() };
+    Some((info.volume_serial_number, ((info.file_index_high as u64) << 32) | info.file_index_low as u64))
 }
 
 /// A path field from the wire. The bytes are `OsStr::as_encoded_bytes` from
@@ -977,7 +1016,7 @@ pub fn build_id() -> &'static str {
     static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     ID.get_or_init(|| {
         let core = std::env::current_exe().map(|e| sibling_tool(&e, "lust-core"));
-        let file = core.and_then(std::fs::metadata).map_or_else(|_| "-".to_string(), file_identity);
+        let file = core.and_then(|c| std::fs::metadata(&c).map(|m| file_identity(&c, m))).unwrap_or_else(|_| "-".to_string());
         format!("{}.{file}", env!("LUST_BUILD_HASH"))
     })
 }

@@ -248,10 +248,12 @@ fn ldflags(spec: &CcSpec, debug: bool) -> Vec<String> {
     if spec.cmd.first().is_some_and(|c| is_zig(c)) {
         v.push("-lunwind".into());
     }
+    // Windows has no libm and no libpthread. The CRT already exports the
+    // math functions the float methods call; the rest are in float.c.
     if !spec.triple.contains("windows") {
         v.push("-pthread".into());
+        v.push("-lm".into());
     }
-    v.push("-lm".into());
     // Extra link flags, for measurement (for example section GC or hot/cold text grouping).
     if let Ok(extra) = std::env::var("LUST_RELEASE_LDFLAGS") {
         v.extend(extra.split_whitespace().map(str::to_string));

@@ -43,6 +43,34 @@ if (-not (Test-Path (Join-Path $src '.git'))) {
 git -C $src fetch --quiet --depth 1 origin $commit
 git -C $src checkout --quiet --force $commit
 
+# PE using_regs(0) is true: a zero-sized struct is returned as a byte, and
+# the caller stores that byte on top of a live local. Every lust `()` return
+# hits this, including the panic hook. Size 0 is not 1, 2, 4, or 8, so the
+# Win64 ABI passes it by pointer; a 0-byte copy does not clobber the frame.
+function Patch-PeZeroSizeReturn {
+    $gen = Join-Path $src 'x86_64-gen.c'
+    $utf8 = New-Object System.Text.UTF8Encoding $false
+    $text = [System.IO.File]::ReadAllText($gen)
+    $nl = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
+    $old = 'static int using_regs(int size)' + $nl + '{' + $nl + '    return !(size > 8 || (size & (size - 1)));' + $nl + '}'
+    if (-not $text.Contains($old)) {
+        throw 'x86_64-gen.c: PE using_regs() is not the size-0 bug this build patches; refusing to build tcc.'
+    }
+    $new = @(
+        'static int using_regs(int size)'
+        '{'
+        '    /* Size 0 is not a register value. using_regs(0) was true, so a'
+        '       zero-sized struct came back as a byte and the caller stored'
+        '       that byte over a live local. */'
+        '    if (size <= 0)'
+        '        return 0;'
+        '    return !(size > 8 || (size & (size - 1)));'
+        '}'
+    ) -join $nl
+    [System.IO.File]::WriteAllText($gen, $text.Replace($old, $new), $utf8)
+}
+Patch-PeZeroSizeReturn
+
 $rtFwd = ((Join-Path $out 'lib\tcc') -replace '\\', '/')
 @(
     '#define TCC_VERSION "0.9.28rc"'

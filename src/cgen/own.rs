@@ -316,9 +316,11 @@ impl FnGen<'_, '_> {
             _ => {}
         }
         // `Mutex<dyn Tr>::lock` and `is_poisoned`: the futex word is the
-        // lock's first word, the poison byte the fifth.
+        // lock's first word. The poison byte follows it: offset 4 after a
+        // `u32` futex, offset 1 after Windows's `u8` futex.
         if tys.first() == Some(&CTy::DynLock(false)) {
             let v = &vals[0];
+            let poff = if cfg!(windows) { 1 } else { 4 };
             return Some(match b {
                 B::Sync(S::MutexLock) => {
                     let guard = CTy::DynLock(true);
@@ -329,18 +331,18 @@ impl FnGen<'_, '_> {
                     let (f, e) = (variant_field(self.p, &res, &t, 0, 0), variant_field(self.p, &res, &t, 1, 0));
                     let _ = writeln!(
                         self.out,
-                        "    lust_dyn {g} = {v}; lust_mutex_lock((uint32_t *){g}.data); lust_poison_enter((uint8_t *){g}.data + 4);"
+                        "    lust_dyn {g} = {v}; lust_mutex_lock((void *){g}.data); lust_poison_enter((uint8_t *){g}.data + {poff});"
                     );
                     let _ = writeln!(
                         self.out,
-                        "    {} {t}; if (((uint8_t *){g}.data)[4] & 1) {{ {} {e} = {g}; }} else {{ {} {f} = {g}; }}",
+                        "    {} {t}; if (((uint8_t *){g}.data)[{poff}] & 1) {{ {} {e} = {g}; }} else {{ {} {f} = {g}; }}",
                         ctype(&res),
                         disc_set(self.p, &res, &t, 1),
                         disc_set(self.p, &res, &t, 0)
                     );
                     t
                 }
-                B::Sync(S::LockIsPoisoned) => format!("((uint8_t)(((uint8_t *)({v}).data)[4] & 1))"),
+                B::Sync(S::LockIsPoisoned) => format!("((uint8_t)(((uint8_t *)({v}).data)[{poff}] & 1))"),
                 _ => return None,
             });
         }
@@ -669,22 +671,27 @@ pub(super) fn dyn_guard_drop(t: &CTy, protos: &mut String, defs: &mut String) {
     let (mn, ct) = (mangle(t), ctype(t));
     let body = match t {
         CTy::DynGuard(m) => format!("((int64_t *)p->data)[0] {}= 1;", if *m { "+" } else { "-" }),
-        _ => "lust_poison_leave((uint8_t *)p->data + 4); lust_mutex_unlock((uint32_t *)p->data);".into(),
+        _ => {
+            let poff = if cfg!(windows) { 1 } else { 4 };
+            format!("lust_poison_leave((uint8_t *)p->data + {poff}); lust_mutex_unlock((void *)p->data);")
+        }
     };
     let _ = writeln!(protos, "void drop_{mn}({ct} *p);");
     let _ = writeln!(defs, "void drop_{mn}({ct} *p) {{\n  {body}\n}}\n");
 }
 
 /// The byte offset of the value inside a `Mutex` whose value's vtable is
-/// `vt`: after the `u32` futex word and the poison byte, at the value's
-/// alignment (cgen/sync.rs `cell_words`).
+/// `vt`: after the futex word and the poison byte (`u32` + `u8` = 5, or
+/// two `u8`s = 2 on Windows), at the value's alignment.
 fn lock_off(vt: &str) -> String {
-    format!("((5 + (uint64_t)(uintptr_t){vt}[2] - 1) & ~((uint64_t)(uintptr_t){vt}[2] - 1))")
+    let header = if cfg!(windows) { 2 } else { 5 };
+    format!("(({header} + (uint64_t)(uintptr_t){vt}[2] - 1) & ~((uint64_t)(uintptr_t){vt}[2] - 1))")
 }
 
 /// The alignment of a `Mutex` whose value's vtable is `vt`.
 fn lock_align(vt: &str) -> String {
-    format!("((uint64_t)(uintptr_t){vt}[2] > 4 ? (uint64_t)(uintptr_t){vt}[2] : 4)")
+    let min = if cfg!(windows) { 1 } else { 4 };
+    format!("((uint64_t)(uintptr_t){vt}[2] > {min} ? (uint64_t)(uintptr_t){vt}[2] : {min})")
 }
 
 /// The dyn place of the value in the `Mutex<dyn Tr>` (or its guard)

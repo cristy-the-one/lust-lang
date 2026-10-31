@@ -14,8 +14,10 @@
 
 /* Resolves a host name with getaddrinfo (AF_UNSPEC, SOCK_STREAM, as
    std's lookup): appends one address record per result, with `port`
-   set on each, and returns the count. On failure returns -1 and the
-   Vec holds the gai_strerror text instead. */
+   set on each, and returns the count. On Unix a failure returns -1
+   and the Vec holds the gai_strerror text. On Windows a failure
+   returns -WSAGetLastError() and the Vec is left empty; std maps
+   that with from_raw_os_error, as rustc's cvt_gai does. */
 int32_t lust_sys_net_resolve(const uint8_t *host, uint64_t hostlen, uint64_t port, lust_Vec *out);
 /* socket + SO_REUSEADDR + bind + listen(128) for one address record:
    the fd or -errno. On success the local address record is appended. */

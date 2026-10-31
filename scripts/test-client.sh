@@ -76,9 +76,19 @@ check() { local name=$1; shift; if "$@" >/dev/null 2>&1; then ok "$name"; else b
 sock() { local f; for f in "$1"/.lust-daemon-*.sock "$1"/.lust-daemon-*.sock.lock; do [ -e "$f" ] && { echo "${f%.lock}"; return; }; done; echo "$1/.lust-daemon-none.sock"; }
 
 stop_daemon() { # stop_daemon <dir>
-  local pid
+  local pid i
   pid=$(cat "$(sock "$1").lock" 2>/dev/null) || return 0
-  [ -n "$pid" ] && kill "$pid" 2>/dev/null
+  [ -n "$pid" ] || return 0
+  if [ "$win" = 1 ]; then
+    # Git bash's kill does not reach a Windows pid. Removing the address
+    # file is the daemon's graceful stop (it removes its temp dir too);
+    # TerminateProcess only if it is still there after 5 s.
+    rm -f "$(sock "$1")"
+    for i in $(seq 1 50); do pid_alive "$pid" || return 0; sleep 0.1; done
+    kill_hard "$pid"
+    return 0
+  fi
+  kill "$pid" 2>/dev/null
   return 0
 }
 cleanup() {
@@ -91,11 +101,19 @@ trap cleanup EXIT
 # loads_base <exe> : true when <exe> loads libbase.so, so a daemon built it. ldd output is
 # captured first: `ldd | grep -q` under pipefail fails when grep exits at the match and ldd
 # takes SIGPIPE on its next line (the `race` flake: the binary was right, the check was not).
+# On Windows a warm build links statically (compile.rs `static_warm`), so the binary
+# shows nothing: the client's route log (LUST_ROUTE_LOG) says which way its last build
+# of that output name went.
+export LUST_ROUTE_LOG=$work/route.log
+if [ "$win" = 1 ]; then LUST_ROUTE_LOG=$(cygpath -m "$LUST_ROUTE_LOG"); fi
 loads_base() {
   local bin=$1
   [ -f "$bin" ] || bin=$1.exe
   if [ "$win" = 1 ]; then
-    python3 -c 'import sys; d=open(sys.argv[1],"rb").read(); sys.exit(0 if b"libbase" in d else 1)' "$bin"
+    local name last
+    name=$(basename "$1")
+    last=$(awk -v n="$name" '$2 == n || $2 == n ".exe" { r = $1 } END { print r }' "$LUST_ROUTE_LOG" 2>/dev/null)
+    [ "$last" = daemon ]
     return
   fi
   local out
@@ -228,7 +246,7 @@ check "idle: daemon starts" wait_socket "$d"
 ipid=$(cat "$(sock "$d").lock" 2>/dev/null)
 gone=0
 for i in $(seq 1 100); do
-  if ! kill -0 "$ipid" 2>/dev/null; then gone=1; break; fi
+  if ! pid_alive "$ipid"; then gone=1; break; fi
   sleep 0.1
 done
 check "idle: daemon exits after the idle span" test $gone -eq 1
@@ -246,9 +264,17 @@ saved_tmpdir=${TMPDIR:-}
 saved_temp=${TEMP:-}
 saved_tmp=${TMP:-}
 export TMPDIR=$work/td; mkdir -p "$TMPDIR"
-# Rust's temp_dir on Windows reads TMP/TEMP, not TMPDIR, and wants a Windows path.
+# Rust's temp_dir on Windows reads TMP/TEMP, not TMPDIR. A mixed path
+# (forward slashes) survives Git bash's rewrite of backslash paths in
+# the environment of a native executable, and the exclusion stops a
+# second conversion. GetTempPath accepts the mixed form.
 if [ "$win" = 1 ]; then
-  export TEMP=$(cygpath -w "$TMPDIR") TMP=$TEMP
+  export TEMP=$(cygpath -m "$TMPDIR")
+  export TMP=$TEMP
+  case ";${MSYS2_ENV_CONV_EXCL:-};" in
+    *";TEMP;"*) ;;
+    *) export MSYS2_ENV_CONV_EXCL="${MSYS2_ENV_CONV_EXCL:+$MSYS2_ENV_CONV_EXCL;}TEMP;TMP" ;;
+  esac
 fi
 wait_gone() { # wait_gone <path>
   local i
@@ -257,7 +283,7 @@ wait_gone() { # wait_gone <path>
 }
 wait_dead_pid() { # wait_dead_pid <pid>
   local i
-  for i in $(seq 1 100); do kill -0 "$1" 2>/dev/null || return 0; sleep 0.05; done
+  for i in $(seq 1 100); do pid_alive "$1" || return 0; sleep 0.05; done
   return 1
 }
 # warm_build <dir> <out> : cold build (starts a daemon), then a daemon build to <out>.
@@ -304,12 +330,13 @@ if wait_gone "$TMPDIR/lust-daemon-$pid"; then ok "temp idle: temp dir removed on
 d=$(fresh tmpkill); daemon_dirs+=("$d")
 warm_build "$d" warm2
 pid=$(cat "$(sock "$d").lock" 2>/dev/null)
-kill -9 "$pid" 2>/dev/null
+kill_hard "$pid"
 wait_dead_pid "$pid" >/dev/null
 check "temp kill: temp dir left by SIGKILL" test -d "$TMPDIR/lust-daemon-$pid"
 mkdir -p "$TMPDIR/lust-daemon-4000000002" "$TMPDIR/lust-4000000002"
 touch "$TMPDIR/lust-daemon-4000000002/x.o" "$TMPDIR/lust-rustc-check-4000000002.rmeta"
-mkdir -p "$TMPDIR/lust-daemon-$$"
+mypid=$(self_pid)
+mkdir -p "$TMPDIR/lust-daemon-$mypid"
 d2=$(fresh tmpsweep); daemon_dirs+=("$d2")
 (cd "$d2" && "$lust" check hello.rs) >/dev/null 2>&1
 wait_socket "$d2" >/dev/null
@@ -319,15 +346,24 @@ if wait_gone "$TMPDIR/lust-daemon-4000000002" && wait_gone "$TMPDIR/lust-4000000
 else
   bad "temp sweep: dead-pid lust dirs and files swept" "a dead entry remains"
 fi
-check "temp sweep: live-pid dir kept" test -d "$TMPDIR/lust-daemon-$$"
-rm -rf "$TMPDIR/lust-daemon-$$"
+check "temp sweep: live-pid dir kept" test -d "$TMPDIR/lust-daemon-$mypid"
+rm -rf "$TMPDIR/lust-daemon-$mypid"
 check "temp sweep: kept binary still runs after sweep" test "$(runb "$d/warm2")" = "hello 42"
 stop_daemon "$d2"; sleep 0.3
 # A cold one-shot build leaves no temp dir either (the cached runtime
 # object file is intentional; only directories count here).
 d=$(fresh tmpcold)
 (cd "$d" && LUST_NO_DAEMON=1 "$lust" build hello.rs -o cold1) >/dev/null 2>&1
-if [ -z "$(find "$TMPDIR" -mindepth 1 -type d -print -quit)" ]; then ok "temp cold: no temp dir after a one-shot build"; else bad "temp cold: no temp dir after a one-shot build" "a dir remains in TMPDIR"; fi
+# A daemon stopped just above may still be removing its own dir (a Windows
+# graceful stop is the address file going away), so wait a little, and name
+# whatever is left.
+left=""
+for i in $(seq 1 50); do
+  left=$(find "$TMPDIR" -mindepth 1 -type d -print 2>/dev/null | head -n 5 | tr '\n' ' ')
+  [ -z "$left" ] && break
+  sleep 0.1
+done
+if [ -z "$left" ]; then ok "temp cold: no temp dir after a one-shot build"; else bad "temp cold: no temp dir after a one-shot build" "left in TMPDIR: $left"; fi
 check "temp cold: binary runs" test "$(runb "$d/cold1")" = "hello 42"
 if [ -n "$saved_tmpdir" ]; then export TMPDIR=$saved_tmpdir; else unset TMPDIR; fi
 if [ "$win" = 1 ]; then

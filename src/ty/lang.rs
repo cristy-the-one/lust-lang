@@ -648,6 +648,8 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
     // tv_nsec (W-STD-C; runtime/stdc.c). Monotonic for `Instant`,
     // realtime for `SystemTime`.
     IntrinsicDef { name: "clock_now_raw", c_symbol: "lust_clock_now_raw", params: &[], ret: S::U128, allowed: ONLY_STD, implemented: true },
+    // QueryPerformanceFrequency, for Windows Instant's one-tick epsilon.
+    IntrinsicDef { name: "qpc_freq", c_symbol: "lust_qpc_freq", params: &[], ret: S::U64, allowed: ONLY_STD, implemented: true },
     IntrinsicDef {
         name: "system_time_raw",
         c_symbol: "lust_system_time_raw",

@@ -719,10 +719,19 @@ pub fn path_package_dir(id: &str) -> Option<PathBuf> {
             i += 1;
         }
     }
+    // `file:///C:/proj` decodes to `/C:/proj`. Cargo's id is that URL.
+    // Windows paths drop the slash in front of the drive letter; leaving
+    // it makes the id miss the manifest dir whenever more than one build
+    // script ran (a dependency's script is a second message).
+    let path_bytes: &[u8] = if cfg!(windows) && out.len() >= 3 && out[0] == b'/' && out[1].is_ascii_alphabetic() && out[2] == b':' {
+        &out[1..]
+    } else {
+        &out
+    };
     // SAFETY: a `file://` path is a byte string. On Unix that is the OsStr.
     // On Windows Cargo writes the path as UTF-8 percent-encoding, so the
     // decoded bytes are UTF-8 and WTF-8 accepts them.
-    Some(PathBuf::from(unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(&out) }.to_os_string()))
+    Some(PathBuf::from(unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(path_bytes) }.to_os_string()))
 }
 
 /// `dir/cargo`, or `dir/cargo.exe` on Windows. The file must be executable
@@ -1170,6 +1179,12 @@ mod tests {
         assert_eq!(d("path+file:///w/pc%2541#x@1.0.0").as_deref(), Some("/w/pc%41"));
         assert_eq!(d("a 0.1.0 (path+file:///w/sp%20ace)").as_deref(), Some("/w/sp ace"));
         assert_eq!(d("registry+https://github.com/rust-lang/crates.io-index#serde@1.0.0"), None);
+        let drive = d("path+file:///C:/Users/a%20b#p@0.1.0");
+        if cfg!(windows) {
+            assert_eq!(drive.as_deref(), Some("C:/Users/a b"));
+        } else {
+            assert_eq!(drive.as_deref(), Some("/C:/Users/a b"));
+        }
     }
 
     use super::*;

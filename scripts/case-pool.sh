@@ -86,9 +86,22 @@ mask_stderr() { sed -E -e 's#\\#/#g' -e "s/^thread '([^']*)' \([0-9]+\) /thread 
 mask_stdout() { sed -e "s|$1|@CASE@|g" -e "s|$root|@ROOT@|g" "$2"; }
 
 # report ok|bad <name> [msg]: a case's result. Runs inside the case's subshell, in its dir.
+# A failure is a GitHub Actions annotation (`::error::`) and, when LUST_FAIL_LOG
+# is set, one line in that file so the job can publish it without the raw log.
 report() {
   echo "$1" >st
-  [ "$1" = ok ] || echo "FAIL $2: $3"
+  [ "$1" = ok ] && return 0
+  echo "FAIL $2: $3"
+  # Keep the annotation on one line; a newline would end the command.
+  local one
+  one=$(printf '%s' "$3" | tr '\n' ' ' | head -c 800)
+  echo "::error title=${2}::${one}"
+  if [ -n "${LUST_FAIL_LOG:-}" ]; then
+    printf 'FAIL %s: %s\n' "$2" "$one" >> "$LUST_FAIL_LOG"
+  fi
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    printf -- '- `%s`: %s\n' "$2" "$one" >> "$GITHUB_STEP_SUMMARY"
+  fi
 }
 
 # rustc_oracle build|run <file> <rustc flags...>: runs rustc on <file> in the case dir and
@@ -165,7 +178,18 @@ run_all() {
     name=$(basename "$f" .rs)
     [[ "$f" == */unwind/* ]] && name="unwind-$name"
     [[ "$f" == */release/* ]] && name="release-$name"
-    [[ -n "$filter" && "$name" != *"$filter"* ]] && continue
+    if [ -n "$filter" ]; then
+      if [ -f "$filter" ]; then
+        local pat hit=0
+        while IFS= read -r pat || [ -n "$pat" ]; do
+          [ -z "$pat" ] && continue
+          [[ "$name" == *"$pat"* ]] && hit=1 && break
+        done < "$filter"
+        [ "$hit" = 1 ] || continue
+      else
+        [[ "$name" == *"$filter"* ]] || continue
+      fi
+    fi
     m=$((m + 1))
     (( (m - 1) % shard_n == shard_k )) || continue
     if [ $running -ge "$jobs" ]; then wait -n; running=$((running - 1)); fi

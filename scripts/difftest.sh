@@ -79,7 +79,7 @@ if ! command -v timeout >/dev/null 2>&1; then
   echo "FAIL: the timeout command is required for per-case timeouts"
   exit 1
 fi
-filter=${1:-}
+filter=${LUST_GATE_FILTER:-${1:-}}
 oracle_args=()
 source "$root/scripts/case-pool.sh"
 
@@ -150,9 +150,12 @@ sanitize_case() {
   # case runs its own abort path (ASan warns once; that line is ignored).
   local leaks=1
   [ "${PANIC:-}" = unwind ] && leaks=0
-  ASAN_OPTIONS=detect_leaks=$leaks:allocator_may_return_null=1 run_to "./$name.san" >"$name.san.out" 2>"$name.san.err"; st=$?
+  # The full Unicode scan (unicode_props_hash) is a few seconds unsanitized
+  # and has gone past the 10s run limit under ASan on a busy runner.
+  local san_run=${SAN_RUN_TIMEOUT:-60}
+  ASAN_OPTIONS=detect_leaks=$leaks:allocator_may_return_null=1 timeout "$san_run" "./$name.san" >"$name.san.out" 2>"$name.san.err"; st=$?
   if [ $leaks = 1 ] && grep -q "LeakSanitizer" "$name.san.err" && grep -q "panicked at" "$name.san.err"; then
-    ASAN_OPTIONS=detect_leaks=0:allocator_may_return_null=1 run_to "./$name.san" >"$name.san.out" 2>"$name.san.err"; st=$?
+    ASAN_OPTIONS=detect_leaks=0:allocator_may_return_null=1 timeout "$san_run" "./$name.san" >"$name.san.out" 2>"$name.san.err"; st=$?
   fi
   # UBSan prints "file:line:col: runtime error"; Rust's own "fatal runtime
   # error: stack overflow" (panic_stack_overflow) is program output.
@@ -161,7 +164,7 @@ sanitize_case() {
     return 1
   fi
   if [ "$st" -ne "$want" ]; then
-    if [ "$st" -eq 124 ] && [ "$want" -ne 124 ]; then echo "sanitized build timed out after ${run_timeout}s"
+    if [ "$st" -eq 124 ] && [ "$want" -ne 124 ]; then echo "sanitized build timed out after ${san_run}s"
     else echo "sanitized build exit status $st, want $want: $(head -2 "$name.san.err" | tr '\n' ' ')"; fi
     return 1
   fi
@@ -358,7 +361,7 @@ pass_case() {
   rs=$(cat rustc.rs)
   run_to "./$name.lust" >"$name.lust.out" 2>"$name.lust.stderr"; ls=$?
   if [ $rs -ne $ls ]; then
-    report bad "$name" "exit status rustc=$rs lust=$ls"
+    report bad "$name" "exit status rustc=$rs lust=$ls: $(head -3 "$name.lust.stderr" | tr '\n' ' ')"
   elif ! cmp -s rustc.out <(mask_stdout "$f" "$name.lust.out"); then
     report bad "$name" "stdout differs:"; diff rustc.out <(mask_stdout "$f" "$name.lust.out") | head -10
   elif ! cmp -s <(mask_stderr rustc.stderr | no_frames) <(lust_stderr "$f" "$name.lust.stderr" | no_frames); then

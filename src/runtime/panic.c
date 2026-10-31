@@ -16,6 +16,19 @@
 #include <sys/syscall.h>
 #endif
 
+#ifdef _WIN32
+/* rustc 1.99 abort_internal: __fastfail(FAST_FAIL_FATAL_APP_EXIT).
+   msvcrt abort() is exit code 3. Git bash reports this fail-fast
+   (STATUS_STACK_BUFFER_OVERRUN) as 127, which is rustc's status for a
+   nested panic, a thread-local drop panic, and an allocation failure.
+   An uncaught unwind panic still returns 101 from main; it does not
+   come through here. */
+__attribute__((noreturn)) void lust_fast_abort(void) {
+    __asm__ __volatile__("movl $7, %ecx\n\tint $0x29");
+    for (;;) {}
+}
+#endif
+
 /* The OS thread id Rust's default hook prints (`thread::current_os_id`). */
 static unsigned long long lust_os_tid(void) {
 #ifdef _WIN32
@@ -247,7 +260,21 @@ static void lust_abort_hooked(lust_exc *ex, const uint8_t *msg, uint64_t len, co
    text), then `ex` pending. */
 static void lust_unw_raise_exc(lust_exc *ex, const uint8_t *msg, uint64_t len, const char *file, uint32_t line, uint32_t col) {
     lust_unw_state *s = lust_unw_get();
-    if (s->pending) return;
+    /* A panic while one is already pending is a panic during cleanup.
+       Linux takes the first exception before the drop, so this does not
+       run there. On Windows the drop still sees it pending: print this
+       panic (count >= 2 asks for the backtrace header) and fail-fast
+       the way rustc does, instead of dropping the message. */
+    if (s->pending) {
+#ifdef _WIN32
+        if (!s->in_hook) s->count++;
+        lust_run_hook(ex, msg, len, file, line, col, s->count, &s->in_hook);
+        fflush(stderr);
+        abort();
+#else
+        return;
+#endif
+    }
     if (!s->in_hook) s->count++;
     lust_run_hook(ex, msg, len, file, line, col, s->count, &s->in_hook);
 #ifndef __TINYC__
@@ -366,14 +393,20 @@ int32_t lust_unw_mine(void) LUST_BODY({
 })
 
 /* A destructor that cleanup called ended with a new exception: Rust's
-   nounwind "panic in a destructor during cleanup", then abort. */
+   nounwind "panic in a destructor during cleanup", then abort.
+   Windows rustc prints that line and then `__fastfail`s, which does not
+   flush it, so a pipe never sees it. Printing it here (this fflush)
+   is the extra text in `panicloc_io_bufwriter_over`. The panics that
+   ran first are already flushed by `lust_default_hook`. */
 void lust_unw_cleanup_abort(void) LUST_BODY({
+#ifndef _WIN32
     const uint8_t *tn;
     uint64_t tl;
     lust_cur_thread_name(&tn, &tl);
     fprintf(stderr, "\nthread '%.*s' (%llu) panicked at " LUST_STD_SRC "core/src/panicking.rs:233:5:\npanic in a destructor during cleanup\nthread caused non-unwinding panic. aborting.\n",
             (int)tl, (const char *)tn, lust_os_tid());
     fflush(stderr);
+#endif
     abort();
 })
 
@@ -1121,8 +1154,85 @@ static void lust_stack_guard_init(void) {
     sigaction(SIGBUS, &sa, NULL);
 }
 #elif defined(LUST_IMPL)
+#ifdef _WIN32
+/* Windows has no SIGSEGV guard page we can catch with sigaltstack.
+   A vectored handler sees STATUS_STACK_OVERFLOW, prints Rust's line,
+   and lets the default action terminate so the process status stays
+   the one bash already reports for that exception. */
+static LONG CALLBACK lust_win_overflow(EXCEPTION_POINTERS *ep) {
+    if (!ep || !ep->ExceptionRecord) return 0; /* EXCEPTION_CONTINUE_SEARCH */
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code == 0xC0000005u) {
+        /* An access violation is a lust bug. One line on stderr so the
+           difftest failure names the faulting address. */
+        char msg[80];
+        uintptr_t a = ep->ExceptionRecord->ExceptionInformation && ep->ExceptionRecord->NumberParameters > 1
+            ? (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1] : 0;
+        int m = 0;
+        const char *head = "access violation at 0x";
+        while (*head) msg[m++] = *head++;
+        for (int s = (int)(sizeof(uintptr_t) * 2 - 1); s >= 0; s--) msg[m++] = "0123456789abcdef"[(a >> (s * 4)) & 0xf];
+        msg[m++] = '\n';
+        HANDLE err = GetStdHandle((DWORD)-12);
+        DWORD wrote = 0;
+        WriteFile(err, msg, (DWORD)m, &wrote, 0);
+        return 0;
+    }
+    if (code != 0xC00000FDu) return 0;
+    const uint8_t *name = (const uint8_t *)"main";
+    uint64_t name_len = 4;
+    const uint8_t *got;
+    uint64_t got_len;
+    lust_cur_thread_name(&got, &got_len);
+    if (got && got_len && !(got_len == 9 && got[0] == '<')) {
+        name = got;
+        name_len = got_len;
+    }
+    char msg[160];
+    int m = 0;
+    const char *head = "\nthread '", *mid = "' (", *tail = ") has overflowed its stack\n";
+    while (*head && m < (int)sizeof msg - 1) msg[m++] = *head++;
+    for (uint64_t i = 0; i < name_len && m < (int)sizeof msg - 1; i++) msg[m++] = (char)name[i];
+    while (*mid && m < (int)sizeof msg - 1) msg[m++] = *mid++;
+    char tid[24];
+    int n = 0;
+    unsigned long t = (unsigned long)GetCurrentThreadId();
+    do { tid[n++] = (char)('0' + t % 10); t /= 10; } while (t && n < (int)sizeof tid);
+    while (n && m < (int)sizeof msg - 1) msg[m++] = tid[--n];
+    while (*tail && m < (int)sizeof msg - 1) msg[m++] = *tail++;
+    HANDLE err = GetStdHandle((DWORD)-12);
+    DWORD wrote = 0;
+    WriteFile(err, msg, (DWORD)m, &wrote, 0);
+    /* rustc's handler prints, then __fastfail. Returning here makes bash
+       report the raw stack-overflow exception as 139. */
+    lust_fast_abort();
+}
+/* The handler runs on the overflowed stack, in what is left after the
+   guard page: without a reserve it can fault again (another overflow, or
+   an access violation while it formats), and the process dies with the
+   raw exception (bash: 139) instead of Rust's line and exit 127. std
+   reserves 0x5000 bytes per thread with SetThreadStackGuarantee (its
+   `stack_overflow::Handler::new`); so does each lust thread. */
+static void lust_win_stack_guarantee(void) {
+    typedef BOOL (WINAPI *sg_fn)(PULONG);
+    sg_fn sg = (sg_fn)GetProcAddress(GetModuleHandleA("kernel32.dll"), "SetThreadStackGuarantee");
+    ULONG size = 0x5000;
+    if (sg) sg(&size);
+}
+static void lust_stack_guard_init(void) {
+    typedef PVOID (WINAPI *add_fn)(ULONG, LONG (CALLBACK *)(EXCEPTION_POINTERS *));
+    add_fn add = (add_fn)GetProcAddress(GetModuleHandleA("kernel32.dll"), "AddVectoredExceptionHandler");
+    if (add) add(1, lust_win_overflow);
+    lust_win_stack_guarantee();
+}
+#else
 static void lust_stack_guard_init(void) {}
+#endif
+#ifdef _WIN32
+static void lust_thread_guard_init(uintptr_t *lo, uintptr_t *hi, void **alt) { (void)lo; (void)hi; (void)alt; lust_win_stack_guarantee(); }
+#else
 static void lust_thread_guard_init(uintptr_t *lo, uintptr_t *hi, void **alt) { (void)lo; (void)hi; (void)alt; }
+#endif
 static void lust_thread_guard_fini(void *alt) { (void)alt; }
 #endif
 

@@ -2,12 +2,28 @@ name: CI
 
 # There is no git remote yet, so this workflow has never run. It is kept
 # valid (actionlint) and runs the same scripts/ci.sh gate as a dev box.
+# A feature-branch commit is tested by pull_request only. push on every
+# branch was starting a second full run of the same SHA.
 on:
   push:
+    branches: [next]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      gate_filter:
+        description: 'Case-name substring, or a file of substrings (LUST_GATE_FILTER)'
+        required: false
+        type: string
+
+# A new push to this ref replaces the run already going. Two full gates
+# were stacking on the same branch.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
+  pull-requests: write
 
 jobs:
   linux-x86_64:
@@ -38,7 +54,22 @@ jobs:
       - name: Run CI gate
         env:
           LUST_TCC_HOME: ${{ github.workspace }}/third_party/tcc
+          LUST_GATE_FILTER: ${{ github.event.inputs.gate_filter }}
         run: bash scripts/ci.sh
+      - name: Publish gate failures
+        if: failure()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: bash scripts/publish-ci-failures.sh
+      - name: Upload gate failure list
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-failures-linux
+          path: ci-failures.txt
+          if-no-files-found: ignore
 
   windows-x86_64:
     runs-on: windows-latest
@@ -70,11 +101,26 @@ jobs:
         shell: pwsh
         env:
           LUST_TCC_HOME: ${{ github.workspace }}/third_party/tcc
+          LUST_GATE_FILTER: ${{ github.event.inputs.gate_filter }}
         run: |
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
           Import-Module "$vs\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
           Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64'
           bash scripts/ci.sh
+      - name: Publish gate failures
+        if: failure()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: bash scripts/publish-ci-failures.sh
+      - name: Upload gate failure list
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-failures-windows
+          path: ci-failures.txt
+          if-no-files-found: ignore
       - name: Pack the Windows release zip
         if: success()
         shell: pwsh
@@ -88,7 +134,10 @@ jobs:
             dist/*.zip
             dist/*.sha256
 
+  # macOS is out of scope for now (tcc Mach-O, libbase.so, BSD userland).
+  # The job stays in the file so it can be turned back on by deleting `if: false`.
   macos-arm64:
+    if: false
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4

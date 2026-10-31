@@ -912,6 +912,11 @@ int lust_dmap_finish_ne(lust_DebugMap *d, lust_loc loc) {
 
 void lust_fmt_failed(uint32_t what, lust_loc loc) {
     (void)loc;
+    /* A panicking fmt impl sets the error flag so later pieces are
+       skipped. That flag is not a formatting error: Rust propagates
+       the panic already pending. Raising this message on top of it
+       fail-fasts on Windows (exit 127) instead of unwinding to 101. */
+    if (lust_f_unwinding()) return;
     /* Rust raises these inside std, so they report std's location. */
     if (what == 1) lust_panic_std("a Display implementation returned an error unexpectedly: Error", "alloc/src/string.rs:2953:14");
     else if (what == 0) lust_panic_std("a formatting trait implementation returned an error when the underlying stream did not: Error", "alloc/src/fmt.rs:657:14");

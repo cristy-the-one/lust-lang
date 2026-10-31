@@ -3,6 +3,13 @@
 #endif
 
 #ifdef _WIN32
+/* QueryPerformanceFrequency: Windows Instant's epsilon is one tick. */
+uint64_t lust_qpc_freq(void) {
+    LARGE_INTEGER freq;
+    QueryPerformanceFrequency(&freq);
+    return freq.QuadPart > 0 ? (uint64_t)freq.QuadPart : 1;
+}
+
 /* QueryPerformanceCounter as a (sec, nsec) pair, and the system
    FILETIME (100 ns ticks since 1601) shifted to the Unix epoch. */
 lust_u128 lust_clock_now_raw(void) {
@@ -30,6 +37,9 @@ uint32_t lust_fmt_align(lust_Formatter *f) {
     return f->align;
 }
 #else
+uint64_t lust_qpc_freq(void) {
+    return 0;
+}
 /* One clock reading as the u128 the time intrinsics return. */
 static lust_u128 lust_clock_read(clockid_t clock) {
     struct timespec ts;

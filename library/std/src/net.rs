@@ -1270,6 +1270,10 @@ fn resolve_host(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
     let mut raw: Vec<u8> = Vec::new();
     let n = core::intrinsics::sys_net_resolve(host.as_bytes(), port as u64, &mut raw);
     if n < 0 {
+        // rustc's Windows lookup reports WSAGetLastError(), not gai_strerror.
+        if cfg!(windows) {
+            return Err(os_err(-n));
+        }
         return Err(lookup_error(core::str::from_utf8(&raw).unwrap_or("")));
     }
     let mut out: Vec<SocketAddr> = Vec::new();
@@ -1541,13 +1545,23 @@ impl TcpStream {
 
     /// Connects to one socket address with a timeout.
     pub fn connect_timeout(addr: &SocketAddr, timeout: core::time::Duration) -> io::Result<TcpStream> {
-        if timeout == core::time::Duration::ZERO {
-            return Err(zero_timeout_err());
-        }
+        // Unix rejects a zero timeout before connect. Windows rustc
+        // connects first: an immediate success is Ok, and WouldBlock
+        // with a zero timeout is the invalid-input error.
+        let us = if timeout == core::time::Duration::ZERO {
+            if !cfg!(windows) {
+                return Err(zero_timeout_err());
+            }
+            0
+        } else {
+            timeout_us(timeout)
+        };
         let mut raw: Vec<u8> = Vec::new();
-        let fd = core::intrinsics::sys_net_tcp_connect_timeout(&pack_addr(addr), timeout_us(timeout), &mut raw);
+        let fd = core::intrinsics::sys_net_tcp_connect_timeout(&pack_addr(addr), us, &mut raw);
         if fd == -10000 {
             Err(io::Error::new(io::ErrorKind::TimedOut, "connection timed out"))
+        } else if fd == -10001 {
+            Err(zero_timeout_err())
         } else if fd < 0 {
             Err(os_err(-fd))
         } else {

@@ -370,6 +370,29 @@ fn image_run(reqs: &[driver::Request], dir: &std::path::Path) -> Vec<driver::Res
 }
 
 fn main() {
+    // Windows fixes the main thread's stack when the image is linked.
+    // A 256 MiB reserve still overflowed const-eval, so the compiler runs
+    // on a thread that asks for `pool::STACK_SIZE` itself.
+    #[cfg(windows)]
+    {
+        let started = std::thread::Builder::new()
+            .name("lust-main".into())
+            .stack_size(pool::STACK_SIZE)
+            .spawn(run)
+            .unwrap_or_else(|e| {
+                eprintln!("error: cannot start the compiler thread: {e}");
+                std::process::exit(1);
+            });
+        if let Err(payload) = started.join() {
+            std::panic::resume_unwind(payload);
+        }
+        return;
+    }
+    #[cfg(not(windows))]
+    run();
+}
+
+fn run() {
     // A re-executed image process (src/image.rs) runs with randomization
     // off and an arena variable: its children get neither.
     image::process_start();

@@ -9,6 +9,7 @@
 // Rust's `atomic::Ordering` discriminant and panic on the orderings
 // Rust's methods reject.
 use super::*;
+use super::{win_heap_align, win_heap_slot};
 use crate::check::sync::SyncOp;
 use crate::ty::sync::{AtomicVal, SyncTy};
 
@@ -46,6 +47,9 @@ pub(super) fn sync_ctype(k: SyncTy, e: &CTy) -> String {
 /// `st` (the futex word), then `wn` (an RwLock's sleepers) and `poison`.
 pub(super) fn cell_words(k: SyncTy) -> &'static [IntTy] {
     match k {
+        // Windows `Mutex` is a `SmallFutex` (`AtomicU8`) plus the poison
+        // flag (`AtomicBool`), both align 1. Other hosts keep the 4-byte futex.
+        SyncTy::Mutex if cfg!(windows) => &[IntTy::U8, IntTy::U8],
         SyncTy::Mutex => &[IntTy::U32, IntTy::U8],
         SyncTy::RwLock => &[IntTy::U32, IntTy::U32, IntTy::U8],
         _ => &[IntTy::U32],
@@ -1345,24 +1349,49 @@ impl FnGen<'_, '_> {
                 self.spill_by_ptr(out, &pts, &mut args);
                 let v = self.tmp();
                 let call = self.slots.callee(self.p, *f);
+                let align = c_size_align(self.p, &rt).1;
+                let ct = ctype(&rt);
                 if ret_is_large(self.p, *f) {
                     let pre: String = args.iter().map(|a| format!(", {a}")).collect();
-                    let _ = writeln!(out, "  {} {v}; {call}(&{v}{pre});", ctype(&rt));
+                    if win_heap_align(align) {
+                        let slot = win_heap_slot(&v, &ct, align);
+                        let _ = writeln!(out, "  {slot}; {call}(&(*{v}_p){pre});");
+                        format!("(*{v}_p)")
+                    } else {
+                        let _ = writeln!(out, "  {ct} {v}; {call}(&{v}{pre});");
+                        v
+                    }
+                } else if win_heap_align(align) {
+                    let slot = win_heap_slot(&v, &ct, align);
+                    let _ = writeln!(out, "  {slot}; *{v}_p = {call}({});", args.join(", "));
+                    format!("(*{v}_p)")
                 } else {
-                    let _ = writeln!(out, "  {} {v} = {call}({});", ctype(&rt), args.join(", "));
+                    let _ = writeln!(out, "  {ct} {v} = {call}({});", args.join(", "));
+                    v
                 }
-                v
             }
             Callee::DynOnce(r, word) => {
                 self.note_held(r);
                 let v = self.tmp();
                 let rt = ctype(r);
+                let align = c_size_align(self.p, r).1;
                 if ret_by_out(self.p, r) {
-                    let _ = writeln!(out, "  {rt} {v}; ((void (*)({rt} *, void *))({env}.vt[{word}]))(&{v}, {env}.data);");
+                    if win_heap_align(align) {
+                        let slot = win_heap_slot(&v, &rt, align);
+                        let _ = writeln!(out, "  {slot}; ((void (*)({rt} *, void *))({env}.vt[{word}]))(&(*{v}_p), {env}.data);");
+                        format!("(*{v}_p)")
+                    } else {
+                        let _ = writeln!(out, "  {rt} {v}; ((void (*)({rt} *, void *))({env}.vt[{word}]))(&{v}, {env}.data);");
+                        v
+                    }
+                } else if win_heap_align(align) {
+                    let slot = win_heap_slot(&v, &rt, align);
+                    let _ = writeln!(out, "  {slot}; *{v}_p = (({rt} (*)(void *))({env}.vt[{word}]))({env}.data);");
+                    format!("(*{v}_p)")
                 } else {
                     let _ = writeln!(out, "  {rt} {v} = (({rt} (*)(void *))({env}.vt[{word}]))({env}.data);");
+                    v
                 }
-                v
             }
             Callee::DynRef(r, params) => {
                 self.note_held(r);
@@ -1384,25 +1413,50 @@ impl FnGen<'_, '_> {
                 tys.extend(kept.iter().map(|t| param_ctype(self.p, t)));
                 let pre: String = vals.iter().map(|a| format!(", {a}")).collect();
                 let (v, rt, k, tys) = (self.tmp(), ctype(r), crate::check::object::VT_HEADER, tys.join(", "));
+                let align = c_size_align(self.p, r).1;
                 if ret_by_out(self.p, r) {
-                    let _ = writeln!(out, "  {rt} {v}; ((void (*)({rt} *, {tys}))({env}.vt[{k}]))(&{v}, {env}.data{pre});");
+                    if win_heap_align(align) {
+                        let slot = win_heap_slot(&v, &rt, align);
+                        let _ = writeln!(out, "  {slot}; ((void (*)({rt} *, {tys}))({env}.vt[{k}]))(&(*{v}_p), {env}.data{pre});");
+                        format!("(*{v}_p)")
+                    } else {
+                        let _ = writeln!(out, "  {rt} {v}; ((void (*)({rt} *, {tys}))({env}.vt[{k}]))(&{v}, {env}.data{pre});");
+                        v
+                    }
+                } else if win_heap_align(align) {
+                    let slot = win_heap_slot(&v, &rt, align);
+                    let _ = writeln!(out, "  {slot}; *{v}_p = (({rt} (*)({tys}))({env}.vt[{k}]))({env}.data{pre});");
+                    format!("(*{v}_p)")
                 } else {
                     let _ = writeln!(out, "  {rt} {v} = (({rt} (*)({tys}))({env}.vt[{k}]))({env}.data{pre});");
+                    v
                 }
-                v
             }
             Callee::Ptr(ft) => {
                 let CTy::FnPtr(ps, r) = ft else { unreachable!("a fn pointer type") };
                 let mut args = args.to_vec();
                 self.spill_by_ptr(out, ps, &mut args);
                 let v = self.tmp();
+                let ct = ctype(r);
+                let align = c_size_align(self.p, r).1;
                 if ret_by_out(self.p, r) {
                     let pre: String = args.iter().map(|a| format!(", {a}")).collect();
-                    let _ = writeln!(out, "  {} {v}; {env}(&{v}{pre});", ctype(r));
+                    if win_heap_align(align) {
+                        let slot = win_heap_slot(&v, &ct, align);
+                        let _ = writeln!(out, "  {slot}; {env}(&(*{v}_p){pre});");
+                        format!("(*{v}_p)")
+                    } else {
+                        let _ = writeln!(out, "  {ct} {v}; {env}(&{v}{pre});");
+                        v
+                    }
+                } else if win_heap_align(align) {
+                    let slot = win_heap_slot(&v, &ct, align);
+                    let _ = writeln!(out, "  {slot}; *{v}_p = {env}({});", args.join(", "));
+                    format!("(*{v}_p)")
                 } else {
-                    let _ = writeln!(out, "  {} {v} = {env}({});", ctype(r), args.join(", "));
+                    let _ = writeln!(out, "  {ct} {v} = {env}({});", args.join(", "));
+                    v
                 }
-                v
             }
         }
     }
@@ -1512,7 +1566,7 @@ impl FnGen<'_, '_> {
             };
             let _ = writeln!(
                 self.out,
-                "    {pk} *{h} = (void *)lust_alloc(sizeof({pk}), _Alignof({pk})); {h}->h.run = {run}; {h}->h.drop_ret = {drop}; {h}->h.scope = {scope}; {h}->env = {env}; lust_ThreadBuilder bv_ = {bv}; int32_t {e2} = lust_thread_spawn_builder(&{h}->h, &bv_); drop_{}(&bv_); {} {t}; if ({e2} == 0) {{ {} {okv} = &{h}->h; }} else {{ {drop_env2}lust_dealloc((void*){h}, sizeof({pk}), _Alignof({pk})); {} {errv} = ({}){{ }}; {osf} = {e2}; {} }}",
+                "    {pk} *{h} = (void *)lust_alloc(sizeof({pk}), _Alignof({pk})); {h}->h.pkt_bytes = sizeof({pk}); {h}->h.pkt_align = _Alignof({pk}); {h}->h.run = {run}; {h}->h.drop_ret = {drop}; {h}->h.scope = {scope}; {h}->env = {env}; lust_ThreadBuilder bv_ = {bv}; int32_t {e2} = lust_thread_spawn_builder(&{h}->h, &bv_); drop_{}(&bv_); {} {t}; if ({e2} == 0) {{ {} {okv} = &{h}->h; }} else {{ {drop_env2}lust_dealloc((void*){h}, sizeof({pk}), _Alignof({pk})); {} {errv} = ({}){{ }}; {osf} = {e2}; {} }}",
                 mangle(&CTy::Sync(SyncTy::ThreadBuilder, Box::new(CTy::Unit))),
                 ctype(&res),
                 disc_set(self.p, &res, &t, 0),
@@ -1524,7 +1578,7 @@ impl FnGen<'_, '_> {
         }
         let _ = writeln!(
             self.out,
-            "    {pk} *{h} = (void *)lust_alloc(sizeof({pk}), _Alignof({pk})); {h}->h.run = {run}; {h}->h.drop_ret = {drop}; {h}->h.scope = {scope}; {h}->env = {env}; lust_thread_spawn(&{h}->h, {loc});"
+            "    {pk} *{h} = (void *)lust_alloc(sizeof({pk}), _Alignof({pk})); {h}->h.pkt_bytes = sizeof({pk}); {h}->h.pkt_align = _Alignof({pk}); {h}->h.run = {run}; {h}->h.drop_ret = {drop}; {h}->h.scope = {scope}; {h}->env = {env}; lust_thread_spawn(&{h}->h, {loc});"
         );
         format!("(&{h}->h)")
     }

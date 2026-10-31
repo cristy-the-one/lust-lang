@@ -37,7 +37,10 @@ def resolve(current: pathlib.Path, name: str, path_attr: str | None) -> pathlib.
 def inline(path: pathlib.Path, seen: tuple[pathlib.Path, ...]) -> str:
     if path in seen:
         raise SystemExit(f"module cycle at {path}")
-    text = path.read_text()
+    # The committed amalgams are UTF-8 with LF. Windows' locale encoding
+    # (cp1252) rejects bytes in the kernel sources, and text mode would
+    # write CR LF.
+    text = path.read_text(encoding="utf-8")
 
     def repl(m: re.Match) -> str:
         indent, _attr, path_attr, vis, name = m.groups()
@@ -64,8 +67,9 @@ def main() -> None:
     )
     body = inline(root, ())
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(header + body)
-    print(f"wrote {out} ({(header + body).count(chr(10))} lines)")
+    text = (header + body).replace("\r\n", "\n").replace("\r", "\n")
+    out.write_bytes(text.encode("utf-8"))
+    print(f"wrote {out} ({text.count(chr(10))} lines)")
 
 
 if __name__ == "__main__":

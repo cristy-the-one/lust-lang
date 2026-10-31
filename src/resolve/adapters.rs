@@ -59,6 +59,8 @@ pub const ADAPTER_PACKAGES: &[&str] = &[
     "libm",
     "base64",
     "sha2",
+    "quick-xml",
+    "zip",
 ];
 
 /// One adapter crate, read from its manifest.

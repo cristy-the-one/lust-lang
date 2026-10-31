@@ -1,0 +1,17 @@
+# Lust adapter crate (docs/ARCH.md section 3.6). Dev builds compile this
+# crate in place of the registry package zip 9.2.0; release builds use
+# the real crate through Cargo. The driver checks `version` against the
+# resolved package and the metadata against src/resolve/adapters.rs.
+[package]
+name = "zip"
+version = "9.2.0"
+edition = "2024"
+publish = false
+
+[package.metadata.lust]
+adapter = 1
+# Stored and Deflated entries, with deflate bytes from the flate2 adapter
+# (`deflate-flate2` / raw DEFLATE, not zlib-rs or zopfli). `_deflate-any`
+# is the feature `deflate-flate2` turns on. AES, bzip2, zstd, lzma, and
+# the `time` feature are not implemented.
+features = ["deflate-flate2", "_deflate-any"]

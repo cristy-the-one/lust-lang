@@ -5,11 +5,12 @@
 // and messages for the corrupt forms. Decoding is canonical,
 // so every valid stream gives upstream's bytes.
 //
-// The write side: `write::GzEncoder` only, a port of upstream's
-// encoder over a copy of miniz_oxide 0.9.1's deflate source
-// (`miniz/`, the backend upstream's default `rust_backend` uses),
-// so the gzip bytes equal upstream's. Every other encoder, the
-// `bufread` module, and `GzBuilder` are absent and reject (README).
+// The write side: `write::GzEncoder`, `write::ZlibEncoder`, and
+// `write::DeflateEncoder`, a port of upstream's encoders over a copy
+// of miniz_oxide 0.9.1's deflate source (`miniz/`, the backend
+// upstream's default `rust_backend` uses), so the compressed bytes
+// equal upstream's. The `bufread` module and `GzBuilder` are absent
+// and reject (README).
 //
 // The first read pulls the whole input through (the decoders
 // ts-rust feeds are byte slices); a decode error still returns

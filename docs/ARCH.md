@@ -1659,7 +1659,7 @@ library/alloc/   heap types: String, Vec, Box, Rc, Arc, collections,
                  format!, Cow, BTreeMap
 library/std/     OS: fs, io, env, process, path, time, thread, sync,
                  panic runtime hooks, prelude
-library/deps/    adapter crates (3.6): indexmap, smallvec, rustc-hash, libm, base64, sha2
+library/deps/    adapter crates (3.6): indexmap, smallvec, rustc-hash, libm, base64, sha2, quick-xml, zip
 ```
 
 Lust compiles these crates with lust itself, once per
@@ -2132,6 +2132,8 @@ clear error, not a silent mismatch.
 | `libm` | Source port of libm 0.2.16 for the float maths a slicer calls (sqrt, trig, exp, log, pow, rounding, fmod). Kernels follow the real crate. | Bit compare vs 0.2.16, including signed zero, subnormals, inf, NaN, and arguments near multiples of pi/2. |
 | `base64` | Source encode and decode for the four general-purpose engines (standard and URL-safe, padded and unpadded). | Byte compare vs 0.22.1, including decode errors. |
 | `sha2` | Source SHA-256 (`new`, `update`, `finalize`, `digest`). | Digests vs 0.10.9, including multi-chunk updates. |
+| `quick-xml` | Source reader and writer for the 0.42.0 default feature set: events, attributes, entities, and the escaping writer. | Event trace and writer bytes vs 0.42.0, including a seeded random corpus. |
+| `zip` | Source stored and Deflated archives on top of the flate2 raw encoder (`deflate-flate2`, no `time` feature). | Archive bytes and read-back vs 9.2.0, including a seeded random corpus. |
 
 Adapter code is user-level lust. It goes through the
 same check and mono as any crate. It may use

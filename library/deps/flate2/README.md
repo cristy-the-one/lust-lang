@@ -3,7 +3,8 @@
 Lust adapter crate (docs/ARCH.md section 3.6) for the parts
 ts-rust uses: the read side (diagnostics_loc.rs decodes locale
 data with MultiGzDecoder), `write::GzEncoder` (pprof.rs writes
-the CPU profile), and `write::ZlibEncoder` (layergraph.rs). Gate: `scripts/test-adapters.sh flate2`.
+the CPU profile), `write::ZlibEncoder` (layergraph.rs), and
+`write::DeflateEncoder` (raw deflate, used by the zip adapter). Gate: `scripts/test-adapters.sh flate2`.
 
 ## Implemented, same results as upstream
 
@@ -34,6 +35,10 @@ the CPU profile), and `write::ZlibEncoder` (layergraph.rs). Gate: `scripts/test-
   same Writer and a zlib-wrapped miniz compressor (header and Adler-32
   trailer from the miniz copy). Not here: `reset`, `new_with_compress`,
   `Debug`. ts-rust's layergraph.rs encodes mermaid URLs with it.
+- `write::DeflateEncoder`: the raw-deflate twin of `ZlibEncoder`
+  (`new`, `get_ref`, `get_mut`, `try_finish`, `finish`, `total_in`,
+  `total_out`, `Write`, `Read`). Zip's `deflate-flate2` entries are
+  this stream. Not here: `reset`.
 - `Compression`.
 - A unit without a backend feature (`rust_backend` or
   `miniz_oxide`) fails to build, as upstream does.
@@ -49,10 +54,8 @@ the CPU profile), and `write::ZlibEncoder` (layergraph.rs). Gate: `scripts/test-
 
 ## Rejected (lust error, never a different answer)
 
-- Every encoder but `write::GzEncoder` (`DeflateEncoder`,
-  `ZlibEncoder`, the read and bufread encoders), the write-side
-  decoders, `GzBuilder`, `Debug` of `GzEncoder` (upstream prints
-  its internal state), the `bufread` module,
-  `Compress`/`Decompress`, and the low-level types.
+- The read and bufread encoders, the write-side decoders, `GzBuilder`,
+  `Debug` of the encoders (upstream prints its internal state), the
+  `bufread` module, `Compress`/`Decompress`, and the low-level types.
 - `bufread` decoders, `Decompress` and the low-level types,
   `Crc` and `GzBuilder` helpers, and layout queries.

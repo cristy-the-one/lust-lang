@@ -1,0 +1,15 @@
+# Lust adapter crate (docs/ARCH.md section 3.6). Dev builds compile this
+# crate in place of the registry package quick-xml 0.42.0; release builds
+# use the real crate through Cargo. The driver checks `version` against
+# the resolved package and the metadata against src/resolve/adapters.rs.
+[package]
+name = "quick-xml"
+version = "0.42.0"
+edition = "2024"
+publish = false
+
+[package.metadata.lust]
+adapter = 1
+# Default features are empty upstream. Serde, tokio, and encoding_rs are
+# not implemented; enabling them is L0508.
+features = ["default"]

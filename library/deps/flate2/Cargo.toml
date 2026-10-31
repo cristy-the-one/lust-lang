@@ -10,8 +10,8 @@ publish = false
 
 [package.metadata.lust]
 adapter = 1
-# The read side over the adapter's own inflate, and write::GzEncoder
-# and write::ZlibEncoder over a copy of miniz_oxide 0.9.1's deflate (the
-# rust_backend compressor). The backend feature names change nothing in this
-# surface. Other encoders and the bufread module are not here.
+# The read side over the adapter's own inflate, and write::GzEncoder,
+# write::ZlibEncoder, and write::DeflateEncoder over a copy of miniz_oxide
+# 0.9.1's deflate (the rust_backend compressor). The backend feature names
+# change nothing in this surface. The bufread module is not here.
 features = ["default", "rust_backend", "any_impl", "miniz_oxide", "runtime_detection"]

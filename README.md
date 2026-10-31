@@ -291,7 +291,7 @@ Supported today:
 - Closures, iterator chains, `?` on `Option` and `Result`, `let`-else, `if let` chains, labeled blocks.
 - Derives: `Debug`, `Clone`, `Copy`, `PartialEq`, `Eq`, `PartialOrd`, `Ord`, `Hash`, `Default`.
 - Std: a std written in lust source (`library/std`, `library/core`, `library/alloc`) plus a C runtime. `HashMap`, `BTreeMap`, `VecDeque`, formatting with specs, `std::fs`, `std::io`, `std::env`, `std::process`, threads, `thread::scope`, `mpsc`, panics with unwinding and `catch_unwind`.
-- Dependencies: 20 adapter crates in `library/deps` stand in for crates.io packages (`indexmap`, `smallvec`, `memchr`, `rustc-hash`, `num-bigint`, `bumpalo`, `flate2`, `jiff`, `base64`, `sha2`, and others). Each must give the same output as the real crate. `base64` 0.22.1 covers the standard and URL-safe engines (`encode` / `decode`). `sha2` 0.10.9 covers SHA-256 (`new`, `update`, `finalize`, `digest`).
+- Dependencies: 22 adapter crates in `library/deps` stand in for crates.io packages (`indexmap`, `smallvec`, `memchr`, `rustc-hash`, `num-bigint`, `bumpalo`, `flate2`, `jiff`, `base64`, `sha2`, `quick-xml`, `zip`, and others). Each must give the same output as the real crate. `base64` 0.22.1 covers the standard and URL-safe engines (`encode` / `decode`). `sha2` 0.10.9 covers SHA-256 (`new`, `update`, `finalize`, `digest`). `quick-xml` 0.42.0 covers the reader events and the escaping writer. `zip` 9.2.0 covers stored and Deflated entries, with deflate bytes from the `flate2` adapter.
 - Borrow checking: moves, initialization, NLL-style loans, two-phase borrows, and a restricted region model for lifetimes.
 
 Not supported yet. Each gives an error code:

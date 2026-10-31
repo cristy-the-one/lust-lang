@@ -8,11 +8,12 @@
 // are the same, also when it fails or returns short writes.
 //
 // `write::ZlibEncoder` is upstream's zlib/write.rs over the same Writer
-// with a zlib-wrapped `Compress`. Only the GzEncoder and ZlibEncoder
-// surfaces are here: no `Debug` (upstream derives it over its internal
-// state), no `GzBuilder`, no `ZlibEncoder::reset` or `new_with_compress`
-// (no public `Compress`), and no other encoder or write-side decoder.
-// Code that names them rejects.
+// with a zlib-wrapped `Compress`. `write::DeflateEncoder` is the same
+// Writer with a raw `Compress` (no zlib header, no Adler trailer), which
+// is the encoder `zip` writes Deflated entries with. No `Debug` (upstream
+// derives it over its internal state), no `GzBuilder`, no `reset` or
+// `new_with_compress` (no public `Compress`). The read and bufread
+// encoders are not here. Code that names them rejects.
 
 use std::io::{self, Read, Write};
 
@@ -494,6 +495,76 @@ impl<W: Write> Write for ZlibEncoder<W> {
 }
 
 impl<W: Read + Write> Read for ZlibEncoder<W> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.get_mut().read(buf)
+    }
+}
+
+/// A raw DEFLATE encoder, or compressor.
+///
+/// This structure implements a [`Write`] interface and takes a stream of
+/// uncompressed data, writing the compressed data to the wrapped writer.
+/// The bytes are raw deflate: no zlib header and no Adler-32 trailer.
+pub struct DeflateEncoder<W: Write> {
+    inner: Writer<W>,
+}
+
+impl<W: Write> DeflateEncoder<W> {
+    /// Creates a new encoder which will write compressed data to the stream
+    /// given at the given compression level.
+    ///
+    /// When this encoder is dropped or unwrapped the final pieces of data will
+    /// be flushed.
+    pub fn new(w: W, level: Compression) -> DeflateEncoder<W> {
+        DeflateEncoder { inner: Writer::new(w, Compress::new(level, false)) }
+    }
+
+    /// Acquires a reference to the underlying writer.
+    pub fn get_ref(&self) -> &W {
+        self.inner.get_ref()
+    }
+
+    /// Acquires a mutable reference to the underlying writer.
+    ///
+    /// Note that mutating the output/input state of the stream may corrupt this
+    /// object, so care must be taken when using this method.
+    pub fn get_mut(&mut self) -> &mut W {
+        self.inner.get_mut()
+    }
+
+    /// Attempt to finish this output stream, writing out final chunks of data.
+    pub fn try_finish(&mut self) -> io::Result<()> {
+        self.inner.finish()
+    }
+
+    /// Consumes this encoder, flushing the output stream.
+    pub fn finish(mut self) -> io::Result<W> {
+        self.inner.finish()?;
+        Ok(self.inner.take_inner())
+    }
+
+    /// Returns the number of bytes that have been written to this compressor.
+    pub fn total_in(&self) -> u64 {
+        self.inner.data.total_in
+    }
+
+    /// Returns the number of bytes that the compressor has produced.
+    pub fn total_out(&self) -> u64 {
+        self.inner.data.total_out
+    }
+}
+
+impl<W: Write> Write for DeflateEncoder<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<W: Read + Write> Read for DeflateEncoder<W> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.get_mut().read(buf)
     }

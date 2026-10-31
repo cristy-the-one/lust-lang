@@ -154,12 +154,12 @@ bench_suite() {
   python3 -c "import json; d = json.load(open('bench/tsrust/baseline.json')); assert d['rows'], 'no rows'"
 }
 
-# base64 and sha2 are lust source adapters. The oracle is the real crate,
-# so the registry has to hold those exact versions before the offline
-# adapter run. LUST_STRICT makes a mismatched digest fail the step.
+# base64, sha2, quick-xml, and zip are lust source adapters. The oracle is
+# the real crate, so the registry has to hold those exact versions before
+# the offline adapter run. LUST_STRICT makes a mismatched digest fail the step.
 adapter_oracles() {
   local name proj st=0
-  for name in base64 sha2; do
+  for name in base64 sha2 quick-xml zip; do
     proj=$(mktemp -d)
     mkdir -p "$proj/src"
     echo 'fn main() {}' >"$proj/src/main.rs"
@@ -174,7 +174,7 @@ adapter_oracles() {
   done
   return "$st"
 }
-run_step "base64 and sha2 adapters" adapter_oracles
+run_step "base64, sha2, quick-xml, and zip adapters" adapter_oracles
 run_step difftest scripts/difftest.sh ${gate_filter:+"$gate_filter"}
 run_step "macro corpus" macro_corpus
 run_step "ts-rust kernels and compat fixtures" kernel_suite

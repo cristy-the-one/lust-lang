@@ -51,6 +51,8 @@ the upstream features it implements, and its exact-layout types.
 | deps/bumpalo | Adapter for 3.20.3: the Bump subset of leak_arena.rs with upstream's chunk bookkeeping (deps/bumpalo/README.md). | W-DEPS |
 | deps/base64 | Adapter for 0.22.1: standard and URL-safe `encode` / `decode` (deps/base64/README.md). | W-DEPS |
 | deps/sha2 | Adapter for 0.10.9: SHA-256 `new`, `update`, `finalize`, `digest` (deps/sha2/README.md). | W-DEPS |
+| deps/quick-xml | Adapter for 0.42.0: reader events and the escaping writer (deps/quick-xml/README.md). | W-DEPS |
+| deps/zip | Adapter for 9.2.0: stored and Deflated entries over the flate2 encoder (deps/zip/README.md). | W-DEPS |
 
 ## The std platform crate (W-SHIM)
 

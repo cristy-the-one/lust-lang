@@ -58,6 +58,8 @@ pub const ADAPTER_PACKAGES: &[&str] = &[
     "jiff",
     "base64",
     "sha2",
+    "quick-xml",
+    "zip",
 ];
 
 /// One adapter crate, read from its manifest.

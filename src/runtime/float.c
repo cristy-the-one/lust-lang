@@ -1637,6 +1637,47 @@ float fmaf(float x, float y, float z) {
     if (!ready) { fn = (float (*)(float, float, float))lust_ucrt_sym("fmaf"); ready = 1; }
     return fn ? fn(x, y, z) : x * y + z;
 }
+double exp2(double x) {
+    static double (*fn)(double);
+    static int ready;
+    if (!ready) { fn = (double (*)(double))lust_ucrt_sym("exp2"); ready = 1; }
+    return fn ? fn(x) : pow(2.0, x);
+}
+float exp2f(float x) {
+    static float (*fn)(float);
+    static int ready;
+    if (!ready) { fn = (float (*)(float))lust_ucrt_sym("exp2f"); ready = 1; }
+    return fn ? fn(x) : powf(2.0f, x);
+}
+double expm1(double x) {
+    static double (*fn)(double);
+    static int ready;
+    if (!ready) { fn = (double (*)(double))lust_ucrt_sym("expm1"); ready = 1; }
+    return fn ? fn(x) : exp(x) - 1.0;
+}
+float expm1f(float x) {
+    static float (*fn)(float);
+    static int ready;
+    if (!ready) { fn = (float (*)(float))lust_ucrt_sym("expm1f"); ready = 1; }
+    return fn ? fn(x) : expf(x) - 1.0f;
+}
+double log1p(double x) {
+    static double (*fn)(double);
+    static int ready;
+    if (!ready) { fn = (double (*)(double))lust_ucrt_sym("log1p"); ready = 1; }
+    return fn ? fn(x) : log(1.0 + x);
+}
+float log1pf(float x) {
+    static float (*fn)(float);
+    static int ready;
+    if (!ready) { fn = (float (*)(float))lust_ucrt_sym("log1pf"); ready = 1; }
+    return fn ? fn(x) : logf(1.0f + x);
+}
+/* Rust's Windows std calls msvcrt's `_hypot` and `_hypotf` for hypot. */
+double __cdecl _hypot(double, double);
+float __cdecl _hypotf(float, float);
+double hypot(double x, double y) { return _hypot(x, y); }
+float hypotf(float x, float y) { return _hypotf(x, y); }
 double copysign(double x, double y) { return _copysign(x, y); }
 float copysignf(float x, float y) { return _copysignf(x, y); }
 float fabsf(float x) {

@@ -256,6 +256,22 @@ pub enum Builtin {
     FloatIsSignNegative,
     FloatToBits,
     FloatCopysign,
+    FloatSin,
+    FloatCos,
+    FloatTan,
+    FloatAsin,
+    FloatAcos,
+    FloatAtan,
+    FloatSinh,
+    FloatCosh,
+    FloatTanh,
+    FloatExp2,
+    FloatExpM1,
+    FloatLn1p,
+    FloatToRadians,
+    FloatToDegrees,
+    FloatAtan2,
+    FloatHypot,
     F32FromBits,
     F64FromBits,
     CharLenUtf8,
@@ -1112,6 +1128,9 @@ pub enum Builtin {
 /// Every builtin the primitive method tables (`int_method`,
 /// `float_method`, `char_method`, `str_method`, and the String
 /// and bool arms of `prim_assoc_sig`) can return must be here.
+/// The float methods `float_method` resolves, for the L0104 fix text.
+const FLOAT_METHODS: &str = "abs, signum, floor, ceil, round, trunc, fract, recip, sqrt, powi, powf, exp, exp2, exp_m1, ln, ln_1p, log, log2, log10, mul_add, min, max, copysign, hypot, sin, cos, tan, asin, acos, atan, atan2, sinh, cosh, tanh, to_radians, to_degrees, is_nan, is_finite, is_infinite, is_sign_positive, is_sign_negative, to_bits, from_bits";
+
 pub(crate) const PRIM_VALUE_BUILTINS: &[Builtin] = &[
     Builtin::Abs, Builtin::BitWidth, Builtin::BoolThenSome, Builtin::BorrowingSub, Builtin::CarryingAdd, Builtin::CarryingMul,
     Builtin::CarryingMulAdd, Builtin::CastSigned, Builtin::CastUnsigned, Builtin::CharEncodeUtf16, Builtin::CharEncodeUtf8, Builtin::CharFromDigit,
@@ -1122,7 +1141,7 @@ pub(crate) const PRIM_VALUE_BUILTINS: &[Builtin] = &[
     Builtin::CharToUppercase, Builtin::CheckedAbs, Builtin::CheckedAdd, Builtin::CheckedDiv, Builtin::CheckedIsqrt, Builtin::CheckedMul,
     Builtin::CheckedNeg, Builtin::CheckedNextMultipleOf, Builtin::CheckedPow, Builtin::CheckedRem, Builtin::CheckedShl, Builtin::CheckedShr,
     Builtin::CheckedSignedDiff, Builtin::CheckedSub, Builtin::ConvStrBytes, Builtin::CountOnes, Builtin::CountZeros, Builtin::DivCeil,
-    Builtin::DivEuclid, Builtin::FloatAbs, Builtin::FloatCeil, Builtin::FloatCopysign, Builtin::FloatExp, Builtin::FloatFloor,
+    Builtin::DivEuclid, Builtin::FloatAbs, Builtin::FloatCeil, Builtin::FloatCopysign, Builtin::FloatSin, Builtin::FloatCos, Builtin::FloatTan, Builtin::FloatAsin, Builtin::FloatAcos, Builtin::FloatAtan, Builtin::FloatSinh, Builtin::FloatCosh, Builtin::FloatTanh, Builtin::FloatExp2, Builtin::FloatExpM1, Builtin::FloatLn1p, Builtin::FloatToRadians, Builtin::FloatToDegrees, Builtin::FloatAtan2, Builtin::FloatHypot, Builtin::FloatExp, Builtin::FloatFloor,
     Builtin::FloatFract, Builtin::FloatIsFinite, Builtin::FloatIsInfinite, Builtin::FloatIsNan, Builtin::FloatIsSignNegative, Builtin::FloatIsSignPositive,
     Builtin::FloatLn, Builtin::FloatLog, Builtin::FloatLog10, Builtin::FloatLog2, Builtin::FloatMax, Builtin::FloatMin,
     Builtin::FloatMulAdd, Builtin::FloatPowf, Builtin::FloatPowi, Builtin::FloatRecip, Builtin::FloatRound, Builtin::FloatSignum,
@@ -17758,12 +17777,15 @@ impl<'p> Ctx<'p> {
                     return ERROR;
                 }
                 let tn = self.tn(base);
-                self.err(
-                    "L0104",
-                    name_span,
-                    format!("no method `{}` on type `{tn}`", self.name(name)),
-                    "Check the method name. The prototype supports a small std subset (see README).",
-                );
+                // A float lists what it has: a recipe host or an agent cannot run
+                // `lust capabilities`, and guessing costs a build round each.
+                let is_float = { let d = self.deep(base); matches!(self.kind(d), TyKind::Float(_)) || self.kind(d).is_float_infer() };
+                let fix = if is_float {
+                    format!("Float methods lust has: {FLOAT_METHODS}. Constants are in `std::f64::consts` (PI, TAU, E, FRAC_PI_2, ...).")
+                } else {
+                    "Check the method name. `lust capabilities --summary` lists the std subset lust supports.".to_string()
+                };
+                self.err("L0104", name_span, format!("no method `{}` on type `{tn}`", self.name(name)), fix);
                 ERROR
             }
         }
@@ -18377,6 +18399,57 @@ impl<'p> Ctx<'p> {
         }
         if n == k.copysign {
             return Some((B::FloatCopysign, Autoref::None, vec![t], t));
+        }
+        // Trigonometry and kin (`sin`, `atan2`, `hypot`, ...): the C math
+        // library's functions, which std calls too (cmath), so the bits
+        // match rustc's on the same platform.
+        if n == k.sin {
+            return un(B::FloatSin);
+        }
+        if n == k.cos {
+            return un(B::FloatCos);
+        }
+        if n == k.tan {
+            return un(B::FloatTan);
+        }
+        if n == k.asin {
+            return un(B::FloatAsin);
+        }
+        if n == k.acos {
+            return un(B::FloatAcos);
+        }
+        if n == k.atan {
+            return un(B::FloatAtan);
+        }
+        if n == k.sinh {
+            return un(B::FloatSinh);
+        }
+        if n == k.cosh {
+            return un(B::FloatCosh);
+        }
+        if n == k.tanh {
+            return un(B::FloatTanh);
+        }
+        if n == k.exp2 {
+            return un(B::FloatExp2);
+        }
+        if n == k.exp_m1 {
+            return un(B::FloatExpM1);
+        }
+        if n == k.ln_1p {
+            return un(B::FloatLn1p);
+        }
+        if n == k.to_radians {
+            return un(B::FloatToRadians);
+        }
+        if n == k.to_degrees {
+            return un(B::FloatToDegrees);
+        }
+        if n == k.atan2 {
+            return Some((B::FloatAtan2, Autoref::None, vec![t], t));
+        }
+        if n == k.hypot {
+            return Some((B::FloatHypot, Autoref::None, vec![t], t));
         }
         if n == k.is_nan {
             return Some((B::FloatIsNan, Autoref::None, vec![], BOOL));

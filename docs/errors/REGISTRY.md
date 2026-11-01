@@ -54,7 +54,8 @@ prints "reserved, not yet emitted".
 | L0524 | cfg and attributes | W-MACRO | in use | Built-in attribute with a malformed input or on a target Rust does not permit |
 | L0525-L0529 | cfg and attributes | W-MACRO | reserved | |
 | L0530-L0531 | Crate session | W-RESOLVE | in use | L0530 unsupported edition, L0531 unsupported deny-level lint |
-| L0532-L0539 | Crate session | W-DRIVER | reserved | |
+| L0532 | Crate session | W-DRIVER | in use | Refused in a `--sandbox` build (check/sandbox.rs) |
+| L0533-L0539 | Crate session | W-DRIVER | reserved | |
 | L0540 | Known-value checks | check | in use | Arithmetic operation will overflow (rustc `arithmetic_overflow`) |
 | L0541 | Known-value checks | check | in use | Operation will panic at runtime (rustc `unconditional_panic`) |
 | L0542 | Known-value checks | W-THREADS | in use | Invalid atomic memory ordering (rustc `invalid_atomic_ordering`) |

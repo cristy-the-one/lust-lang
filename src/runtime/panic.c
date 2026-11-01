@@ -7,6 +7,8 @@
 #ifdef LUST_IMPL
 #ifndef _WIN32
 #include <unistd.h>
+#else
+#include <io.h>
 #endif
 #include <errno.h>
 #include <signal.h>
@@ -1241,6 +1243,11 @@ static void lust_thread_guard_fini(void *alt) { (void)alt; }
 void lust_rt_init(void) LUST_BODY({
 #ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);
+#else
+    /* Rust writes stderr's bytes as they are. msvcrt's text mode made
+       each \n of eprintln!, a panic, or io::stderr() a \r\n. Stdout
+       goes through WriteFile (lust_stdout_write_soft), already raw. */
+    _setmode(_fileno(stderr), 0x8000 /* _O_BINARY */);
 #endif
     lust_stack_guard_init();
 })

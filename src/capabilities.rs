@@ -1837,12 +1837,43 @@ fn json_groups(groups: &[(String, Vec<String>)]) -> String {
 }
 
 /// Entry point for `lust capabilities`. Returns the process exit code.
+/// `lust capabilities --summary`: what a model writing code for lust most
+/// needs to know, short enough to put in a prompt (under 1,500 tokens).
+/// The refusals come from `REJECTED`, so the summary cannot drift from the
+/// probes; fallbacks no known program reaches and `lust test` details are
+/// left out.
+pub fn summary() -> String {
+    let mut out = String::from(
+        "lust checks and builds a subset of Rust 2024. A program lust accepts behaves exactly as under rustc; \
+         a program outside the subset is refused with an L-code, never compiled differently.\n\
+         Write plain safe Rust: structs, enums, traits, generics, closures, iterators, Vec, String, HashMap, \
+         BTreeMap, VecDeque, BinaryHeap, Option, Result and `?`, f64 math. Errors come as JSON with `--json`; \
+         apply the edits marked `auto` before rewriting by hand. `lust explain L####` explains a code.\n\
+         Refused:\n",
+    );
+    for (what, code) in REJECTED {
+        if what.contains("fallback") || what.contains("lust test") || what.contains("#[test]") {
+            continue;
+        }
+        out.push_str(&format!("- {what} ({code})\n"));
+    }
+    out.push_str(
+        "With --sandbox: the program reads stdin and writes stdout and stderr only; std::fs, std::net, std::env, \
+         std::os, std::process other than exit, thread spawning and include_str! are refused (L0532).\n",
+    );
+    out
+}
+
 pub fn run(args: &[String]) -> i32 {
     let json = match args {
         [] => false,
         [a] if a == "--json" => true,
+        [a] if a == "--summary" => {
+            print!("{}", summary());
+            return 0;
+        }
         _ => {
-            eprintln!("usage: lust capabilities [--json]");
+            eprintln!("usage: lust capabilities [--json | --summary]");
             return 2;
         }
     };
@@ -1961,4 +1992,15 @@ pub fn run(args: &[String]) -> i32 {
         println!("diagnostic codes ({}): run `lust explain <code>`", codes.len());
     }
     0
+}
+
+#[cfg(test)]
+mod summary_tests {
+    /// The summary stays prompt-sized: about 4 characters a token.
+    #[test]
+    fn summary_is_short() {
+        let s = super::summary();
+        assert!(s.len() < 6_000, "capabilities --summary is {} bytes", s.len());
+        assert!(s.contains("(L0404)") && s.contains("(L0532)"));
+    }
 }

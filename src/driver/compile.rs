@@ -3765,6 +3765,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     program.unwind = !session_key.profile.panic_abort;
     program.overflow_checks = session_key.profile.overflow_checks;
     program.debug_assertions = session_key.profile.debug_assertions;
+    program.sandbox = session_key.profile.sandbox;
     // Unwind tables need a C compiler with -fexceptions and a C++ driver, never tcc: a
     // release driver build uses them, one-shot or from a persistent session such as a
     // front image (LUST_UNWIND_TABLES=0 turns them off); --emit-c in a one-shot process

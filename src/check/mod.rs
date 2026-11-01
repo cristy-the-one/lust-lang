@@ -51,6 +51,7 @@ pub mod tryfrom;
 pub mod ufcs;
 pub mod usefulness;
 pub mod sync;
+pub mod sandbox;
 pub mod unwind;
 mod use_caps;
 pub mod variance;
@@ -2473,6 +2474,17 @@ pub(crate) fn check_fn_with<'p>(p: &'p Program, fid: LocalDefId, lints: bool) ->
     {
         errs.push(d);
     }
+    // `--sandbox`: a user body's std paths to OS services and its thread
+    // spawns (check/sandbox.rs). Runs with or without lints: a mono-only
+    // check of a user body still must not reach codegen unrefused.
+    if p.sandbox
+        && errs.is_empty()
+        && !std_body
+        && p.fn_shipped_crate(fid).is_none()
+        && let Some(d) = sandbox::check_body(p, fid, &ck)
+    {
+        errs.push(d);
+    }
     // An instance request past rustc's type-length limit is its
     // post-mono error (a doubling arg, `f::<((T, T), (T, T))>`); mono
     // never snapshots one (generics::snapshot_ty).
@@ -3119,12 +3131,50 @@ fn int_shape(name: &str) -> Option<(u32, bool)> {
     })
 }
 
-/// Whether `value as to` keeps every value of `from` (a widening cast).
+/// Float type width by its written name. An unsuffixed float literal
+/// (`{float}`) is `f64` unless something else fixes it, as in rustc.
+fn float_width(name: &str) -> Option<u32> {
+    match name {
+        "f32" => Some(32),
+        "f64" | "{float}" => Some(64),
+        _ => None,
+    }
+}
+
+/// True for an integer type name, including an unsuffixed literal's
+/// `{integer}` (rustc's fallback is `i32`).
+fn int_like_name(name: &str) -> bool {
+    name == "{integer}" || int_shape(name).is_some()
+}
+
+/// Whether `value as to` keeps every value of `from`: a widening integer
+/// cast, an integer into a float whose mantissa holds all its values
+/// (16-bit into `f32`, 32-bit into `f64`), or `f32` into `f64`. An
+/// `{integer}` counts as `i32`. `usize`/`isize` never count as lossless.
 fn lossless_cast(from: &str, to: &str) -> bool {
+    let from = if from == "{integer}" { "i32" } else { from };
+    if let Some(tw) = float_width(to) {
+        return match (int_shape(from), float_width(from)) {
+            (Some((fw, _)), _) => fw > 0 && fw <= if tw == 32 { 16 } else { 32 },
+            (_, Some(fw)) => fw <= tw,
+            _ => false,
+        };
+    }
     match (int_shape(from), int_shape(to)) {
         (Some((fw, fs)), Some((tw, ts))) if fw > 0 && tw > 0 => (fs == ts && fw <= tw) || (!fs && ts && fw < tw),
         _ => false,
     }
+}
+
+/// The type name a cast to `to` writes (`{float}` is `f64`).
+fn cast_target(to: &str) -> &str {
+    if to == "{float}" { "f64" } else { to }
+}
+
+/// True when both names are numeric and a cast or a float literal can
+/// turn one into the other (shifts aside: any integer shift amount is fine).
+fn numeric_pair(from: &str, to: &str) -> bool {
+    (int_like_name(from) || float_width(from).is_some()) && (int_shape(to).is_some() || float_width(to).is_some())
 }
 
 impl<'p> Ctx<'p> {
@@ -3136,10 +3186,57 @@ impl<'p> Ctx<'p> {
     /// which cannot change the value; a narrowing one is offered, not applied.
     fn err_cast(&mut self, code: &'static str, span: Span, msg: String, fix: String, at: Span, from: &str, to: &str) {
         let auto = lossless_cast(from, to);
+        let to = cast_target(to);
         let d = Diag::new(code, span, msg, fix)
             .with_edit(crate::diag::Edit { start: at.lo, end: at.lo, replacement: "(".to_string(), auto })
             .with_edit(crate::diag::Edit { start: at.hi, end: at.hi, replacement: format!(") as {to}"), auto });
         self.errs.push(d);
+    }
+    /// True when the expression written at `at` in this body is an
+    /// unsuffixed decimal integer literal, or its negation: `4`, `-4`.
+    /// A literal in another radix or with `_` (its text is longer than
+    /// its decimal value) is not, so `4.0` is never written after `0x4`.
+    fn decimal_int_lit_at(&self, at: Span) -> bool {
+        let def = self.p.fn_def(self.fid);
+        let ast = &self.p.ast;
+        (def.exprs.0..def.exprs.1).any(|i| {
+            if ast.expr_spans[i as usize] != at {
+                return false;
+            }
+            let lit = match &ast.exprs[i as usize] {
+                Expr::Unary { op: UnOp::Neg, expr } => *expr,
+                _ => ExprId(i),
+            };
+            match ast.exprs[lit.0 as usize] {
+                Expr::Int(v, None) => {
+                    let s = ast.expr_spans[lit.0 as usize];
+                    (s.hi - s.lo) as usize == v.to_string().len()
+                }
+                _ => false,
+            }
+        })
+    }
+    /// A numeric mismatch with its fix edit: an integer literal where a
+    /// float goes becomes a float literal (`4` to `4.0`, always `auto`:
+    /// the value is the same); any other numeric value gets
+    /// `(value) as T`, `auto` only when the cast keeps every value
+    /// (`lossless_cast`). The value is the expression written at `at`, of
+    /// type `from`; `to` is the type it must have.
+    fn err_numeric(&mut self, code: &'static str, span: Span, msg: String, at: Span, from: &str, to: &str) {
+        if float_width(to).is_some() && from == "{integer}" && self.decimal_int_lit_at(at) {
+            let d = Diag::new(code, span, msg, "Write the number as a float literal: `4` becomes `4.0`.")
+                .with_edit(crate::diag::Edit { start: at.hi, end: at.hi, replacement: ".0".to_string(), auto: true });
+            self.errs.push(d);
+            return;
+        }
+        let fix = format!("Cast it: write `(value) as {}`.", cast_target(to));
+        if from == "{integer}" && float_width(to).is_some() {
+            // lust refuses `as` from a still-open `{integer}` into a float
+            // (L0116), so no edit: a cast there would not check either.
+            self.err(code, span, msg, fix);
+            return;
+        }
+        self.err_cast(code, span, msg, fix, at, from, to);
     }
     /// True when this body already has an error and `t` still holds an
     /// unresolved inference variable: as rustc's "tainted by errors"
@@ -6685,9 +6782,8 @@ impl<'p> Ctx<'p> {
         } else {
             format!("Change the value to type `{e}`, or change the expected type.")
         };
-        if int_shape(&e).is_some() && int_shape(&f).is_some() {
-            let fix = format!("Cast it: write `(value) as {e}`.");
-            self.err_cast("L0110", span, format!("mismatched types: expected `{e}`, found `{f}`"), fix, span, &f, &e);
+        if numeric_pair(&f, &e) {
+            self.err_numeric("L0110", span, format!("mismatched types: expected `{e}`, found `{f}`"), span, &f, &e);
             return;
         }
         self.err("L0110", span, format!("mismatched types: expected `{e}`, found `{f}`"), fix);
@@ -9989,7 +10085,7 @@ impl<'p> Ctx<'p> {
                     || ref_cast
                     || match (self.kind(t), self.kind(target)) {
                         // An integer of unknown type stays open: later uses decide it (default i32).
-                        (k, TyKind::Int(_)) if k.is_int_infer() => true,
+                        (k, TyKind::Int(_) | TyKind::Float(_)) if k.is_int_infer() => true,
                         (k, TyKind::Float(_) | TyKind::Int(_)) if k.is_float_infer() => true,
                         (_, TyKind::Int(_)) if enum_cast => true,
                         (TyKind::Int(_) | TyKind::Bool | TyKind::Char, TyKind::Int(_)) => true,
@@ -10016,7 +10112,7 @@ impl<'p> Ctx<'p> {
                         "L0116",
                         span,
                         format!("cannot cast `{a}` as `{b}`"),
-                        "Lust allows `as` between integers, from bool and char to integers, from u8 to char, and between raw pointers and integers.",
+                        "Lust allows `as` between integers and floats, from bool and char to integers, from u8 to char, and between raw pointers and integers.",
                     );
                 }
                 target
@@ -19194,17 +19290,9 @@ impl<'p> Ctx<'p> {
                 return UNIT;
             }
             let (a, b) = (self.tn(lt), self.tn(rt));
-            if int_shape(&a).is_some() && int_shape(&b).is_some() && !matches!(op, BinOp::Shl | BinOp::Shr) {
+            if numeric_pair(&b, &a) && !matches!(op, BinOp::Shl | BinOp::Shr) {
                 let at = self.span(rhs);
-                self.err_cast(
-                    "L0113",
-                    span,
-                    format!("cannot apply `{}=` to `{a}` and `{b}`", op.symbol()),
-                    format!("Cast the right side: write `(rhs) as {a}`."),
-                    at,
-                    &b,
-                    &a,
-                );
+                self.err_numeric("L0113", span, format!("cannot apply `{}=` to `{a}` and `{b}`", op.symbol()), at, &b, &a);
             } else {
                 self.err(
                     "L0113",
@@ -19312,10 +19400,20 @@ impl<'p> Ctx<'p> {
             } else {
                 "Both operands must have the same type, and the type must support this operator."
             };
-            if int_shape(&a).is_some() && int_shape(&b).is_some() && !matches!(op, Shl | Shr) {
+            let msg = format!("cannot apply `{}` to `{a}` and `{b}`", op.symbol());
+            let lhs = match cx.p.ast.expr(e) {
+                Expr::Binary { lhs, .. } => Some(*lhs),
+                _ => None,
+            };
+            if matches!(op, Shl | Shr) {
+                cx.err("L0113", span, msg, fix);
+            } else if a == "{integer}" && float_width(&b).is_some() && let Some(lhs) = lhs.filter(|&l| cx.decimal_int_lit_at(cx.span(l))) {
+                // `2 * x` with `x: f64`: the literal on the left becomes `2.0`.
+                let at = cx.span(lhs);
+                cx.err_numeric("L0113", span, msg, at, &a, &b);
+            } else if numeric_pair(&b, &a) {
                 let at = cx.span(rhs);
-                let fix = format!("Cast the right operand: write `(rhs) as {a}`.");
-                cx.err_cast("L0113", span, format!("cannot apply `{}` to `{a}` and `{b}`", op.symbol()), fix, at, &b, &a);
+                cx.err_numeric("L0113", span, msg, at, &b, &a);
             } else {
                 cx.err("L0113", span, format!("cannot apply `{}` to `{a}` and `{b}`", op.symbol()), fix);
             }

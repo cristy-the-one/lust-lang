@@ -187,6 +187,10 @@ pub struct CfgEnv {
     /// The panic strategy is unwind (`-C panic=unwind`): `cfg(panic)`
     /// in the host facts below.
     pub panic_unwind: bool,
+    /// A `--sandbox` build of user code: `include!`, `include_str!` and
+    /// `include_bytes!` refuse to read a file (L0532), and `env!` and
+    /// `option_env!` see no variable. Shipped crates never set it.
+    pub sandbox: bool,
 }
 
 impl CfgEnv {
@@ -678,7 +682,10 @@ pub fn expand_builtin(st: &mut Expander, name: &str, call: &Call, depth: u32) ->
             let Some((var, _)) = literal_string(st, &expanded) else {
                 return Err(bad(format!("{name}! takes one string literal")));
             };
-            let value = st.env_lookup(&var);
+            // A `--sandbox` build sees no variable: the program cannot carry a
+            // host value in. Cargo and the compiler still run with the client's
+            // environment (they need its PATH).
+            let value = if st.ctx.cfg.sandbox { None } else { st.env_lookup(&var) };
             st.read_dep_env(&var, value.as_deref());
             match (name, value) {
                 ("env", Some(v)) => Ok(vec![st.str_tree(&v, span)]),
@@ -817,6 +824,14 @@ fn concat_value(st: &Expander, trees: &[Tt]) -> Option<String> {
 /// The `include!` family (ARCH 6.4): files read at expand time.
 fn include_macro(st: &mut Expander, name: &str, call: &Call, depth: u32) -> Result<Vec<Tt>, Diag> {
     let span = call.span;
+    if st.ctx.cfg.sandbox {
+        return Err(Diag::new(
+            "L0532",
+            span,
+            format!("`{name}!` reads a file, and this build is sandboxed"),
+            "A `--sandbox` build reads no file at compile time. Put the data in the source, or read it from stdin at run time.",
+        ));
+    }
     let args = split_args(&call.inner);
     if args.len() != 1 {
         return Err(err(C_CALL, span, format!("{name}! takes one path"), "Write one string literal path."));

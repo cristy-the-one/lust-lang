@@ -107,7 +107,8 @@ for s0, e0, r in sorted({(e["start"], e["end"], e["replacement"]) for d in errs 
 open(sys.argv[3], "wb").write(src)
 PYEOF
 check diag-numeric-edits $? "see the python assert above"
-"$lust" run "$work/num_fixed.rs" > "$work/num_fixed.out" 2>&1; check diag-numeric-edits-apply $? "the program with every edit applied must build and run: $(head -3 "$work/num_fixed.out")"
+"$lust" build "$work/num_fixed.rs" -o "$work/num_fixed.lbin" > "$work/num_fixed.out" 2>&1 && "$work/num_fixed.lbin" > "$work/num_fixed.out" 2>&1
+check diag-numeric-edits-apply $? "the program with every edit applied must build and run: $(head -3 "$work/num_fixed.out")"
 if command -v rustc >/dev/null 2>&1; then
   rustc --edition 2024 -A warnings -o "$work/num_fixed.bin" "$work/num_fixed.rs" >/dev/null 2>&1 && "$work/num_fixed.bin" > "$work/num_fixed.rout" 2>&1
   cmp -s "$work/num_fixed.out" "$work/num_fixed.rout"; check diag-numeric-edits-rustc $? "rustc must accept the fixed program and print the same"

@@ -47,14 +47,41 @@ pub fn find_shim() -> Result<PathBuf, String> {
     ))
 }
 
+/// Escape `path` so it is one C string literal. A NUL cannot be written
+/// inside a C string (an octal `\000` would end it too), so that is an error.
+/// Other bytes that would end or break the literal are escaped: quotes,
+/// backslashes, and controls. Controls use three-digit octal, not `\x`,
+/// because `\x` keeps consuming hex digits.
+fn escape_c_string(path: &str) -> Result<String, String> {
+    if path.bytes().any(|b| b == 0) {
+        return Err("shim path cannot be baked into the loader (interior NUL)".into());
+    }
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || c == '\u{7f}' => {
+                let b = c as u32;
+                out.push('\\');
+                out.push(char::from(b'0' + ((b >> 6) as u8)));
+                out.push(char::from(b'0' + (((b >> 3) & 7) as u8)));
+                out.push(char::from(b'0' + ((b & 7) as u8)));
+            }
+            c => out.push(c),
+        }
+    }
+    Ok(out)
+}
+
 /// C source of the loader. `windows` selects `LoadLibraryW`.
 pub fn loader_source(windows: bool) -> Result<String, String> {
     let shim = find_shim()?;
     let path = shim.to_str().ok_or_else(|| format!("shim path {} is not UTF-8", shim.display()))?;
-    if path.contains('"') || path.contains('\n') || path.contains('\0') {
-        return Err(format!("shim path {} cannot be baked into the loader", shim.display()));
-    }
-    let escaped = path.replace('\\', "\\\\");
+    let escaped = escape_c_string(path).map_err(|e| format!("{e}: {}", shim.display()))?;
     let body = if windows { LOADER_WIN } else { LOADER_POSIX };
     Ok(body.replace("@SHIM@", &escaped))
 }
@@ -310,3 +337,64 @@ lust_str lust_occt_h_last_error(void) {
     return r;
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct Restore(Option<std::ffi::OsString>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            // SAFETY: tests serialize on ENV_LOCK, and this restores the previous value.
+            unsafe {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("LUST_OCCT_SHIM", v),
+                    None => std::env::remove_var("LUST_OCCT_SHIM"),
+                }
+            }
+        }
+    }
+
+    fn set_shim(path: &std::path::Path) -> Restore {
+        let prev = std::env::var_os("LUST_OCCT_SHIM");
+        // SAFETY: tests serialize on ENV_LOCK.
+        unsafe { std::env::set_var("LUST_OCCT_SHIM", path) };
+        Restore(prev)
+    }
+
+    #[test]
+    fn review_fix_c_string_escapes_quote_backslash_and_controls() {
+        let s = super::escape_c_string("a\"b\\c\n\r\t\u{1}\u{7f}").unwrap();
+        assert_eq!(s, "a\\\"b\\\\c\\n\\r\\t\\001\\177");
+        assert!(super::escape_c_string("a\0b").is_err());
+        assert_eq!(super::escape_c_string("/opt/liblust_occt.so").unwrap(), "/opt/liblust_occt.so");
+        assert_eq!(super::escape_c_string("C:\\occt\\lib.so").unwrap(), "C:\\\\occt\\\\lib.so");
+    }
+
+    /// A real shim path containing `"` is embedded as a C string escape, on
+    /// both the POSIX and Windows loader templates.
+    #[cfg(unix)]
+    #[test]
+    fn review_fix_loader_escapes_quote_in_shim_path() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("lust-occt-{}-a\"b", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shim = dir.join("liblust_occt.so");
+        std::fs::write(&shim, b"not a real shim").unwrap();
+        let _restore = set_shim(&shim);
+        let path = shim.to_str().unwrap();
+        let escaped = super::escape_c_string(path).unwrap();
+        assert!(escaped.contains("\\\""), "{escaped}");
+        for windows in [false, true] {
+            let src = super::loader_source(windows).unwrap();
+            let needle = format!("\"{escaped}\"");
+            assert!(src.contains(&needle), "windows={windows} missing {needle}");
+            assert!(!src.contains("@SHIM@"));
+            assert!(!src.contains(path), "raw path with an unescaped quote leaked into the loader");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

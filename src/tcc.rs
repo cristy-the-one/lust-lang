@@ -388,41 +388,142 @@ pub fn link(objs: &[PathBuf], out: &Path, debug: bool) -> Result<(), String> {
     link_executable(&tcc, objs, out)
 }
 
-/// Where the cached runtime object for this compiler and these options lives.
+/// File name of the cached runtime object for this compiler and these options.
 /// The key is the compiler build hash (it covers `src/runtime`), the debug
 /// flag, the tcc library path, and the compile options. A hit does not
 /// rebuild the runtime source. Stale entries are left for the OS to clean.
-fn runtime_object_path(debug: bool) -> PathBuf {
+fn runtime_object_name(debug: bool) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     env!("LUST_BUILD_HASH").hash(&mut h);
     debug.hash(&mut h);
     tcc_paths().0.hash(&mut h);
     "opts:no-asynchronous-unwind-tables".hash(&mut h);
-    std::env::temp_dir().join(format!("lust-runtime-{:016x}.o", h.finish()))
+    format!("lust-runtime-{:016x}.o", h.finish())
 }
 
-/// The runtime unit compiled to an object once per lust build, cached in the temp directory.
-/// The first link of a later process reuses the object. A miss compiles `runtime_unit`.
+#[cfg(unix)]
+unsafe extern "C" {
+    fn geteuid() -> u32;
+}
+
+#[cfg(unix)]
+fn euid() -> u32 {
+    // SAFETY: geteuid has no arguments and cannot fail.
+    unsafe { geteuid() }
+}
+
+/// Directory that holds the cached runtime object. On Unix this is a
+/// per-user directory (mode 0700, owned by the effective uid) so another
+/// account cannot plant a file under the predictable object name in the
+/// shared temp directory. If that directory exists but is not ours, or is
+/// group- or world-writable, a fresh private directory is used instead.
+/// Windows temp directories are already per-user; the object keeps its
+/// previous name directly in the temp directory.
+fn runtime_cache_dir() -> Result<PathBuf, String> {
+    #[cfg(not(unix))]
+    {
+        return Ok(std::env::temp_dir());
+    }
+    #[cfg(unix)]
+    {
+        let preferred = std::env::temp_dir().join(format!("lust-runtime-{}", euid()));
+        if trusted_cache_dir(&preferred) || create_private_dir(&preferred) {
+            return Ok(preferred);
+        }
+        for n in 0..8 {
+            let fresh = std::env::temp_dir().join(format!("lust-runtime-{}-{}-{n}", euid(), std::process::id()));
+            if trusted_cache_dir(&fresh) || create_private_dir(&fresh) {
+                return Ok(fresh);
+            }
+        }
+        Err("cannot create a private runtime cache directory".into())
+    }
+}
+
+#[cfg(unix)]
+fn trusted_cache_dir(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::symlink_metadata(path) else { return false };
+    meta.is_dir() && meta.uid() == euid() && meta.mode() & 0o022 == 0
+}
+
+#[cfg(unix)]
+fn create_private_dir(path: &Path) -> bool {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(0o700).create(path).is_ok() && trusted_cache_dir(path)
+}
+
+/// True when `path` is a regular file this process may load as the cached
+/// runtime object. On Unix it must be owned by the effective uid and not
+/// group- or world-writable; a symlink is not trusted. On Windows the temp
+/// directory is per-user, so a regular file is enough.
+fn runtime_object_reusable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(meta) = std::fs::symlink_metadata(path) else { return false };
+        return meta.is_file() && meta.uid() == euid() && meta.mode() & 0o022 == 0;
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
+}
+
+#[cfg(unix)]
+fn owner_only_file(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+
+/// The runtime unit compiled to an object once per lust build.
+/// The first link of a later process reuses the object only when that file
+/// passes `runtime_object_reusable`. A planted or group/world-writable file
+/// is ignored and the object is written to a fresh path. A miss compiles
+/// `runtime_unit` under a private name and renames it into place.
 pub fn cached_runtime_object(debug: bool) -> Result<PathBuf, String> {
-    let obj = runtime_object_path(debug);
-    if obj.is_file() {
+    let dir = runtime_cache_dir()?;
+    let obj = dir.join(runtime_object_name(debug));
+    if runtime_object_reusable(&obj) {
         return Ok(obj);
     }
-    let runtime_src = crate::cgen::runtime_unit();
+    let tag = if debug { "g" } else { "o" };
     // Build under a private name, then rename, so two lust processes never see a half object.
-    let tmp = std::env::temp_dir().join(format!("lust-runtime-{}-{}.o", std::process::id(), if debug { "g" } else { "o" }));
+    let tmp = dir.join(format!("lust-runtime-{}-{tag}.o", std::process::id()));
+    let runtime_src = crate::cgen::runtime_unit();
     compile_units(&[(tmp.clone(), runtime_src)], debug)?;
-    match std::fs::rename(&tmp, &obj) {
-        Ok(()) => {}
-        // Another process won the race (or the rename failed): use the file that is there,
-        // else keep our own copy.
-        Err(_) if obj.exists() => {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        Err(_) => return Ok(tmp),
+    #[cfg(unix)]
+    owner_only_file(&tmp);
+    // Recheck: another process may have published a trusted object while we compiled.
+    if runtime_object_reusable(&obj) {
+        let _ = std::fs::remove_file(&tmp);
+        return Ok(obj);
     }
-    Ok(obj)
+    match std::fs::rename(&tmp, &obj) {
+        Ok(()) => {
+            if runtime_object_reusable(&obj) {
+                Ok(obj)
+            } else {
+                // The shared name failed the owner check after publish. Keep the
+                // object we just wrote, under a name that is not the planted one.
+                let fresh = dir.join(format!("lust-runtime-{}-{tag}-fresh.o", std::process::id()));
+                if std::fs::rename(&obj, &fresh).is_ok() && runtime_object_reusable(&fresh) {
+                    Ok(fresh)
+                } else {
+                    Err(format!("runtime cache {} failed the owner check", obj.display()))
+                }
+            }
+        }
+        // The other process published a file we may load.
+        Err(_) if runtime_object_reusable(&obj) => {
+            let _ = std::fs::remove_file(&tmp);
+            Ok(obj)
+        }
+        // The shared name is planted or not a file. Keep our private object.
+        Err(_) if runtime_object_reusable(&tmp) => Ok(tmp),
+        Err(e) => Err(format!("cannot publish the runtime object {}: {e}", obj.display())),
+    }
 }
 
 /// Compiles `units` (C sources; object paths are ignored) plus the cached runtime object into
@@ -638,5 +739,112 @@ mod tests {
         assert!(!super::lone_thread());
         drop(tx);
         parked.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    fn set_mode(path: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// Group- and world-writable objects, and symlinks, are not reusable.
+    /// Owner-readable modes 0644 and 0600 are.
+    #[cfg(unix)]
+    #[test]
+    fn review_fix_runtime_object_mode() {
+        let dir = std::env::temp_dir().join(format!("lust-rt-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("obj.o");
+        std::fs::write(&file, b"x").unwrap();
+        set_mode(&file, 0o644);
+        assert!(super::runtime_object_reusable(&file));
+        set_mode(&file, 0o600);
+        assert!(super::runtime_object_reusable(&file));
+        set_mode(&file, 0o666);
+        assert!(!super::runtime_object_reusable(&file));
+        set_mode(&file, 0o664);
+        assert!(!super::runtime_object_reusable(&file));
+        set_mode(&file, 0o622);
+        assert!(!super::runtime_object_reusable(&file));
+        let link = dir.join("link.o");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(!super::runtime_object_reusable(&link));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_fix_runtime_cache_dir_is_private() {
+        let dir = super::runtime_cache_dir().unwrap();
+        assert!(super::trusted_cache_dir(&dir), "{}", dir.display());
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::symlink_metadata(&dir).unwrap();
+        assert_eq!(meta.uid(), super::euid());
+        assert_eq!(meta.mode() & 0o022, 0);
+    }
+
+    /// The cache path is process-global. These tests plant files there.
+    #[cfg(unix)]
+    static RUNTIME_CACHE_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A file we own, mode 0600, is returned as-is. Its bytes are not a real
+    /// object; reuse must not recompile over them.
+    #[cfg(unix)]
+    #[test]
+    fn review_fix_trusted_runtime_object_is_reused() {
+        let _guard = RUNTIME_CACHE_TEST.lock().unwrap();
+        let dir = super::runtime_cache_dir().unwrap();
+        let obj = dir.join(super::runtime_object_name(false));
+        if obj.is_dir() {
+            std::fs::remove_dir_all(&obj).unwrap();
+        }
+        std::fs::write(&obj, b"sentinel-trusted").unwrap();
+        set_mode(&obj, 0o600);
+        let got = super::cached_runtime_object(false).unwrap();
+        assert_eq!(got, obj);
+        assert_eq!(std::fs::read(&got).unwrap(), b"sentinel-trusted");
+        let _ = std::fs::remove_file(&obj);
+    }
+
+    /// A world-writable file at the cache path is not loaded. The rebuild
+    /// replaces it (we own it, so the rename can) with a private object.
+    #[cfg(unix)]
+    #[test]
+    fn review_fix_world_writable_runtime_object_is_rebuilt() {
+        let _guard = RUNTIME_CACHE_TEST.lock().unwrap();
+        let dir = super::runtime_cache_dir().unwrap();
+        let obj = dir.join(super::runtime_object_name(false));
+        if obj.is_dir() {
+            std::fs::remove_dir_all(&obj).unwrap();
+        }
+        std::fs::write(&obj, b"planted-sentinel").unwrap();
+        set_mode(&obj, 0o666);
+        assert!(!super::runtime_object_reusable(&obj));
+        let got = super::cached_runtime_object(false).unwrap();
+        let bytes = std::fs::read(&got).unwrap();
+        assert_ne!(bytes, b"planted-sentinel");
+        assert!(bytes.len() > 16);
+        assert!(super::runtime_object_reusable(&got), "{}", got.display());
+    }
+
+    /// When the cache name is not a file we can replace, the compiled object
+    /// is kept under a different path and the planted path is not returned.
+    #[cfg(unix)]
+    #[test]
+    fn review_fix_planted_directory_is_not_used_as_runtime_object() {
+        let _guard = RUNTIME_CACHE_TEST.lock().unwrap();
+        let dir = super::runtime_cache_dir().unwrap();
+        let obj = dir.join(super::runtime_object_name(false));
+        let _ = std::fs::remove_file(&obj);
+        let _ = std::fs::remove_dir_all(&obj);
+        std::fs::create_dir(&obj).unwrap();
+        let got = super::cached_runtime_object(false).unwrap();
+        assert_ne!(got, obj);
+        assert!(got.is_file(), "{}", got.display());
+        assert!(super::runtime_object_reusable(&got), "{}", got.display());
+        assert!(std::fs::read(&got).unwrap().len() > 16);
+        let _ = std::fs::remove_dir_all(&obj);
+        let _ = std::fs::remove_file(&got);
     }
 }

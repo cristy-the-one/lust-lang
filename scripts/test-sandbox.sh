@@ -62,7 +62,7 @@ if LUST_SANDBOX_PROBE=set LUST_NO_DAEMON=1 "$lust" build --sandbox "$root/tests/
     if cmp -s "$work/allowed.out" "$work/allowed.rout" && cmp -s "$work/allowed.stderr" "$work/allowed.rstderr" && [ $code -eq $rcode ]; then
       report ok allowed-rustc-parity
     else
-      report bad allowed-rustc-parity "lust: $code $(cat "$work/allowed.out"); rustc: $rcode $(cat "$work/allowed.rout")"
+      report bad allowed-rustc-parity "lust: exit $code, out $(od -c "$work/allowed.out" | head -3 | tr '\n' ' '), err $(od -c "$work/allowed.stderr" | head -3 | tr '\n' ' '); rustc: exit $rcode, out $(od -c "$work/allowed.rout" | head -3 | tr '\n' ' '), err $(od -c "$work/allowed.rstderr" | head -3 | tr '\n' ' ')"
     fi
   fi
   [ $code -eq 3 ] && grep -qx '2 5 None true rs' "$work/allowed.out" && report ok allowed-runs || report bad allowed-runs "exit $code, out $(cat "$work/allowed.out")"

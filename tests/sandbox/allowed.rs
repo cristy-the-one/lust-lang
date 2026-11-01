@@ -13,9 +13,10 @@ fn main() {
     }
     std::thread::sleep(std::time::Duration::from_millis(1));
     let t = std::time::Instant::now();
-    let p = Path::new("/a/b.rs");
+    // Relative on every platform: "/a/b.rs" has no drive, so it is not absolute on Windows.
+    let p = Path::new("a/b.rs");
     let mut out = std::io::stdout().lock();
-    writeln!(out, "{lines} {words} {:?} {} {}", option_env!("LUST_SANDBOX_PROBE"), p.is_absolute(), p.extension().unwrap().to_str().unwrap()).unwrap();
+    writeln!(out, "{lines} {words} {:?} {} {}", option_env!("LUST_SANDBOX_PROBE"), p.is_relative(), p.extension().unwrap().to_str().unwrap()).unwrap();
     eprintln!("elapsed is small: {}", t.elapsed().as_secs() < 5);
     drop(out);
     if words > 3 {

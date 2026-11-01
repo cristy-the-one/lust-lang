@@ -10085,7 +10085,7 @@ impl<'p> Ctx<'p> {
                     || ref_cast
                     || match (self.kind(t), self.kind(target)) {
                         // An integer of unknown type stays open: later uses decide it (default i32).
-                        (k, TyKind::Int(_)) if k.is_int_infer() => true,
+                        (k, TyKind::Int(_) | TyKind::Float(_)) if k.is_int_infer() => true,
                         (k, TyKind::Float(_) | TyKind::Int(_)) if k.is_float_infer() => true,
                         (_, TyKind::Int(_)) if enum_cast => true,
                         (TyKind::Int(_) | TyKind::Bool | TyKind::Char, TyKind::Int(_)) => true,
@@ -10112,7 +10112,7 @@ impl<'p> Ctx<'p> {
                         "L0116",
                         span,
                         format!("cannot cast `{a}` as `{b}`"),
-                        "Lust allows `as` between integers, from bool and char to integers, from u8 to char, and between raw pointers and integers.",
+                        "Lust allows `as` between integers and floats, from bool and char to integers, from u8 to char, and between raw pointers and integers.",
                     );
                 }
                 target

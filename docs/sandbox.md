@@ -34,6 +34,20 @@ A sandboxed build is its own daemon session (`ProfileFlags::sandbox` is
 part of the session key), so its warm state and cached objects never mix
 with a normal build of the same file.
 
+## Reading a failure
+
+A host reads a failed run from the exit status and stderr; nothing in
+the program's stdout is lust's.
+
+| Exit status | stderr | Meaning |
+|---|---|---|
+| 101 | `thread 'main' (<tid>) panicked at <file>:<line>:<col>:` then the message | A panic. The line is rustc's, byte for byte (rule zero), so a host parses one format for both builds. `<file>` is the path as the build command named it. |
+| 101 | `error[L0532]: this program was built with --sandbox and tried to use <family>` | The codegen stop (above). Nothing ran past it. |
+| any other | whatever the program wrote | `std::process::exit(n)`, or a signal (killed by the host on a time limit). |
+
+Check and build errors come before any run, as JSON with `--json`, each
+with its `edits`.
+
 ## What it does not do
 
 - It does not limit time or memory. The host kills a program that runs

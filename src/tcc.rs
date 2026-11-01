@@ -399,10 +399,48 @@ fn runtime_object_path(debug: bool) -> PathBuf {
     debug.hash(&mut h);
     tcc_paths().0.hash(&mut h);
     "opts:no-asynchronous-unwind-tables".hash(&mut h);
-    std::env::temp_dir().join(format!("lust-runtime-{:016x}.o", h.finish()))
+    runtime_cache_dir().join(format!("lust-runtime-{:016x}.o", h.finish()))
 }
 
-/// The runtime unit compiled to an object once per lust build, cached in the temp directory.
+/// A directory only this user writes, for the runtime object: every
+/// program lust links reuses that object, so a file another user could
+/// place there first would run in all of them. `%LOCALAPPDATA%\lust` on
+/// Windows, `$XDG_CACHE_HOME/lust` or `~/.cache/lust` elsewhere. With no
+/// such variable, a `lust-cache-<uid>` directory in the temp directory
+/// (not `lust-<digits>`, which the daemon's temp sweep takes for a dead
+/// process's), made
+/// mode 0700 and used only while this user owns it; else the temp
+/// directory itself, as before.
+fn runtime_cache_dir() -> PathBuf {
+    let var = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    #[cfg(windows)]
+    let home = var("LOCALAPPDATA").map(|d| d.join("lust"));
+    #[cfg(not(windows))]
+    let home = var("XDG_CACHE_HOME").map(|d| d.join("lust")).or_else(|| var("HOME").map(|d| d.join(".cache").join("lust")));
+    if let Some(d) = home
+        && std::fs::create_dir_all(&d).is_ok()
+    {
+        return d;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        unsafe extern "C" {
+            fn getuid() -> u32;
+        }
+        // SAFETY: getuid takes no argument and cannot fail.
+        let uid = unsafe { getuid() };
+        let d = std::env::temp_dir().join(format!("lust-cache-{uid}"));
+        let _ = std::fs::DirBuilder::new().mode(0o700).create(&d);
+        if std::fs::symlink_metadata(&d).is_ok_and(|m| m.is_dir() && m.uid() == uid && m.mode() & 0o022 == 0) {
+            return d;
+        }
+    }
+    std::env::temp_dir()
+}
+
+/// The runtime unit compiled to an object once per lust build, cached in this user's cache
+/// directory (`runtime_cache_dir`).
 /// The first link of a later process reuses the object. A miss compiles `runtime_unit`.
 pub fn cached_runtime_object(debug: bool) -> Result<PathBuf, String> {
     let obj = runtime_object_path(debug);
@@ -411,7 +449,7 @@ pub fn cached_runtime_object(debug: bool) -> Result<PathBuf, String> {
     }
     let runtime_src = crate::cgen::runtime_unit();
     // Build under a private name, then rename, so two lust processes never see a half object.
-    let tmp = std::env::temp_dir().join(format!("lust-runtime-{}-{}.o", std::process::id(), if debug { "g" } else { "o" }));
+    let tmp = obj.with_file_name(format!("lust-runtime-{}-{}.o", std::process::id(), if debug { "g" } else { "o" }));
     compile_units(&[(tmp.clone(), runtime_src)], debug)?;
     match std::fs::rename(&tmp, &obj) {
         Ok(()) => {}

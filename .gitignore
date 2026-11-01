@@ -6,6 +6,7 @@
 .lust-daemon*.sock
 .lust-daemon*.sock.lock
 /tests/cargo-proj/target
+/tests/occt/lust/target
 /tests/cargo-proj/Cargo.lock
 __pycache__/
 /bench/slices/items/target

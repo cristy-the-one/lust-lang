@@ -5,9 +5,16 @@
 // reads packages, targets, dependencies (kind, rename, target cfg), and the
 // resolve nodes. Per-unit features come from the resolve nodes when the
 // graph shape makes them exact (one workspace member, no dependencies),
-// and otherwise from one cached `cargo check --message-format=json` run
-// for the same request, whose compiler-artifact messages carry the exact
-// feature set of each selected unit.
+// A single workspace member whose packages have no dev-dependencies,
+// build-dependencies, target-specific dependencies, or
+// `required-features` takes those features from the resolve nodes:
+// `cargo metadata` and `cargo check` agree, so the check probe does
+// not run. Anything else still uses one cached
+// `cargo check --message-format=json` run for the same request, whose
+// compiler-artifact messages carry the exact feature set of each
+// selected unit. A manifest that is one package plus path dependencies,
+// with no features and no build script, is read directly and does not
+// run `cargo metadata`; any uncertainty falls back to metadata.
 //
 // The graph key is the full resolver input: every ancestor `Cargo.toml`
 // plus `Cargo.lock`, the requested package and target, the requested
@@ -208,6 +215,9 @@ pub struct TargetInfo {
     /// The `test = false`-style target flags; `test_flag` is Cargo's
     /// `test` key, which baselines runners turn off (section 1.1).
     pub test_flag: bool,
+    /// True when the target sets `required-features`. Those units can
+    /// carry a feature set the resolve node does not name on its own.
+    pub required_features: bool,
 }
 
 /// One resolved dependency of a package, before kind/target filtering.
@@ -528,6 +538,16 @@ pub fn load_graph(req: &GraphRequest) -> Result<std::sync::Arc<CrateGraph>, Stri
     {
         return Ok(g.clone());
     }
+    if let Some(mut graph) = simple_path_graph(req) {
+        let watch = watch_dirs(req, &graph.packages);
+        let stamp = watch_stamp(&watch);
+        let mut h = FxHasher::default();
+        (key, stamp).hash(&mut h);
+        (graph.key, graph.watch, graph.stamp) = (h.finish(), watch, stamp);
+        let graph = std::sync::Arc::new(graph);
+        graph_cache().lock().unwrap().insert(key, graph.clone());
+        return Ok(graph);
+    }
     // The stamp is taken before metadata runs, over the dirs the last
     // graph watched (else the named manifest's dir), so an edit made
     // while Cargo runs moves the stamp. When metadata names a path
@@ -679,6 +699,7 @@ fn run_metadata(req: &GraphRequest, key: u64) -> Result<CrateGraph, String> {
                     src_path: PathBuf::from(t.get("src_path").and_then(|v| v.as_str()).unwrap_or("")),
                     edition: t.get("edition").and_then(|v| v.as_str()).unwrap_or("2015").to_string(),
                     test_flag: t.get("test").map(|v| v.as_bool()).unwrap_or(true),
+                    required_features: t.get("required-features").is_some_and(|v| !v.as_arr().is_empty()),
                 })
                 .collect(),
             dependencies,
@@ -946,11 +967,418 @@ pub fn dep_target_matches(env: &CfgEnv, target: Option<&str>, interner: &crate::
     }
 }
 
+/// True when every unit's features are the resolve node's features.
+/// `cargo metadata` unifies a multi-member workspace, and a dev-dependency,
+/// a build-dependency, a target-specific dependency, or `required-features`
+/// can give `cargo check` a different set. None of those: the probe is skipped.
+fn features_follow_metadata(graph: &CrateGraph) -> bool {
+    if graph.workspace_members.len() > 1 {
+        return false;
+    }
+    graph.packages.iter().all(|p| {
+        p.targets.iter().all(|t| !t.required_features)
+            && p.dependencies.iter().all(|d| d.kind != "dev" && d.kind != "build" && d.target.is_none())
+    })
+}
+
+/// A `#` outside quotes ends a TOML comment.
+fn toml_code(line: &str) -> &str {
+    let mut quote = None;
+    for (i, c) in line.char_indices() {
+        match (quote, c) {
+            (None, '"' | '\'') => quote = Some(c),
+            (Some(q), _) if c == q => quote = None,
+            (None, '#') => return line[..i].trim_end(),
+            _ => {}
+        }
+    }
+    line.trim_end()
+}
+
+fn toml_string(line: &str) -> Option<String> {
+    let v = line.split_once('=')?.1.trim();
+    if let Some(rest) = v.strip_prefix(['"', '\'']) {
+        let quote = v.as_bytes()[0] as char;
+        return Some(rest.split(quote).next()?.to_string());
+    }
+    Some(v.trim_end_matches(|c: char| c == ',' || c.is_whitespace()).to_string())
+}
+
+/// One package read without Cargo. `None` means the manifest is not the
+/// shape `simple_path_graph` handles.
+struct SimpleManifest {
+    name: String,
+    version: String,
+    edition: String,
+    description: Option<String>,
+    homepage: Option<String>,
+    license: Option<String>,
+    license_file: Option<String>,
+    repository: Option<String>,
+    readme: Option<String>,
+    rust_version: Option<String>,
+    lib_name: Option<String>,
+    lib_path: Option<String>,
+    saw_lib: bool,
+    bins: Vec<(String, Option<String>)>,
+    saw_bin: bool,
+    /// Dependency name as written, and the dependency directory.
+    deps: Vec<(String, PathBuf)>,
+}
+
+fn ancestor_has_workspace(manifest: &Path) -> bool {
+    let Some(start) = manifest.parent().and_then(|d| d.parent()) else { return false };
+    for dir in start.ancestors() {
+        let Ok(text) = std::fs::read_to_string(dir.join("Cargo.toml")) else { continue };
+        let found = text.lines().any(|raw| {
+            let line = toml_code(raw).trim();
+            let Some(head) = line.strip_prefix('[') else { return false };
+            let name = head.trim_end_matches(']').trim();
+            name == "workspace" || name.starts_with("workspace.")
+        });
+        if found {
+            return true;
+        }
+    }
+    false
+}
+
+fn project_cargo_config(manifest: &Path) -> bool {
+    manifest.parent().into_iter().flat_map(Path::ancestors).any(|d| d.join(".cargo/config.toml").is_file() || d.join(".cargo/config").is_file())
+}
+
+fn dir_has_entries(dir: &Path) -> bool {
+    std::fs::read_dir(dir).ok().and_then(|mut rd| rd.next()).is_some()
+}
+
+/// Parses a manifest that is safe to turn into a graph without Cargo.
+/// `None` if any line is outside that shape.
+fn parse_simple_manifest(dir: &Path) -> Option<SimpleManifest> {
+    let manifest = dir.join("Cargo.toml");
+    if dir.join("build.rs").is_file() {
+        return None;
+    }
+    let text = std::fs::read_to_string(&manifest).ok()?;
+    let mut section = String::new();
+    let mut name = None;
+    let mut version = None;
+    let mut edition = None;
+    let mut description = None;
+    let mut homepage = None;
+    let mut license = None;
+    let mut license_file = None;
+    let mut repository = None;
+    let mut readme = None;
+    let mut rust_version = None;
+    let mut lib_name = None;
+    let mut lib_path = None;
+    let mut saw_lib = false;
+    let mut bins: Vec<(String, Option<String>)> = Vec::new();
+    let mut saw_bin = false;
+    let mut deps: Vec<(String, PathBuf)> = Vec::new();
+    let mut workspace_keys = false;
+    for raw in text.lines() {
+        let line = toml_code(raw).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with("[[") {
+            let name = line.trim_matches(|c| c == '[' || c == ']').trim();
+            if name != "bin" {
+                return None;
+            }
+            section = "bin".into();
+            saw_bin = true;
+            bins.push((String::new(), None));
+            continue;
+        }
+        if let Some(head) = line.strip_prefix('[') {
+            let name = head.trim_end_matches(']').trim().replace(' ', "");
+            let ok = matches!(
+                name.as_str(),
+                "package" | "dependencies" | "lib" | "workspace" | "lints" | "lints.rust"
+            ) || name.starts_with("package.metadata")
+                || name.starts_with("lints.");
+            if !ok {
+                return None;
+            }
+            section = name;
+            if section == "lib" {
+                saw_lib = true;
+            }
+            continue;
+        }
+        let Some((k, _)) = line.split_once('=') else { return None };
+        let key = k.trim();
+        if key.contains("workspace") {
+            return None;
+        }
+        match section.as_str() {
+            "package" => match key {
+                "name" => name = toml_string(line),
+                "version" => version = toml_string(line),
+                "edition" => edition = toml_string(line),
+                "description" => description = toml_string(line),
+                "homepage" => homepage = toml_string(line),
+                "license" => license = toml_string(line),
+                "license-file" => license_file = toml_string(line),
+                "repository" => repository = toml_string(line),
+                "readme" => readme = toml_string(line),
+                "rust-version" => rust_version = toml_string(line),
+                // `default-run` changes which bin Cargo selects. That is
+                // outside this reader, so the manifest falls back.
+                "publish" | "documentation" => {}
+                "build" => {
+                    if toml_string(line).as_deref() != Some("false") {
+                        return None;
+                    }
+                }
+                "autobins" | "autolibs" | "autoexamples" | "autotests" | "autobenches" => {
+                    if toml_string(line).as_deref() != Some("true") {
+                        return None;
+                    }
+                }
+                "authors" | "keywords" | "categories" | "include" | "exclude" | "links" => return None,
+                _ => return None,
+            },
+            "dependencies" => {
+                let body = line.split_once('=')?.1.trim();
+                let body = body.strip_prefix('{')?.trim_end().trim_end_matches('}');
+                let mut path = None;
+                for part in body.split(',') {
+                    let part = part.trim();
+                    if part.is_empty() {
+                        continue;
+                    }
+                    let (ik, _) = part.split_once('=')?;
+                    match ik.trim() {
+                        "path" => path = toml_string(part),
+                        _ => return None,
+                    }
+                }
+                let path = path?;
+                let dep_dir = dir.join(path);
+                if !dep_dir.join("Cargo.toml").is_file() {
+                    return None;
+                }
+                deps.push((key.to_string(), dep_dir));
+            }
+            "lib" => match key {
+                "name" => lib_name = toml_string(line),
+                "path" => lib_path = toml_string(line),
+                _ => return None,
+            },
+            "bin" => {
+                let bin = bins.last_mut()?;
+                match key {
+                    "name" => bin.0 = toml_string(line)?,
+                    "path" => bin.1 = toml_string(line),
+                    _ => return None,
+                }
+            }
+            "workspace" => workspace_keys = true,
+            _ if section.starts_with("package.metadata") || section.starts_with("lints") => {}
+            _ => return None,
+        }
+    }
+    if workspace_keys {
+        return None;
+    }
+    let name = name?;
+    let version = version?;
+    let edition = edition?;
+    if dir_has_entries(&dir.join("examples")) || dir_has_entries(&dir.join("tests")) || dir_has_entries(&dir.join("benches")) {
+        return None;
+    }
+    if saw_bin && dir_has_entries(&dir.join("src/bin")) {
+        return None;
+    }
+    Some(SimpleManifest {
+        name,
+        version,
+        edition,
+        description,
+        homepage,
+        license,
+        license_file,
+        repository,
+        readme,
+        rust_version,
+        lib_name,
+        lib_path,
+        saw_lib,
+        bins,
+        saw_bin,
+        deps,
+    })
+}
+
+fn path_package_id(dir: &Path, name: &str, version: &str) -> String {
+    format!("path+file://{}#{name}@{version}", dir.display())
+}
+
+fn simple_targets(pkg: &SimpleManifest, dir: &Path) -> Option<Vec<TargetInfo>> {
+    let mut targets = Vec::new();
+    let edition = pkg.edition.clone();
+    if pkg.saw_bin && dir.join("src/main.rs").is_file() {
+        let main = dir.join("src/main.rs");
+        let listed = pkg.bins.iter().any(|(_, p)| p.as_ref().is_some_and(|rel| dir.join(rel) == main));
+        if !listed {
+            return None;
+        }
+    }
+    if pkg.saw_lib || dir.join("src/lib.rs").is_file() {
+        let path = match &pkg.lib_path {
+            Some(p) => dir.join(p),
+            None => dir.join("src/lib.rs"),
+        };
+        if !path.is_file() {
+            return None;
+        }
+        targets.push(TargetInfo {
+            kind: vec!["lib".into()],
+            crate_types: vec!["lib".into()],
+            name: pkg.lib_name.clone().unwrap_or_else(|| pkg.name.clone()),
+            src_path: path,
+            edition: edition.clone(),
+            test_flag: true,
+            required_features: false,
+        });
+    }
+    if pkg.saw_bin {
+        for (name, path) in &pkg.bins {
+            if name.is_empty() {
+                return None;
+            }
+            let path = match path {
+                Some(p) => dir.join(p),
+                None => return None,
+            };
+            if !path.is_file() {
+                return None;
+            }
+            targets.push(TargetInfo {
+                kind: vec!["bin".into()],
+                crate_types: vec!["bin".into()],
+                name: name.clone(),
+                src_path: path,
+                edition: edition.clone(),
+                test_flag: true,
+                required_features: false,
+            });
+        }
+    } else if dir.join("src/main.rs").is_file() {
+        targets.push(TargetInfo {
+            kind: vec!["bin".into()],
+            crate_types: vec!["bin".into()],
+            name: pkg.name.clone(),
+            src_path: dir.join("src/main.rs"),
+            edition: edition.clone(),
+            test_flag: true,
+            required_features: false,
+        });
+    }
+    if let Ok(rd) = std::fs::read_dir(dir.join("src/bin")) {
+        for e in rd.flatten() {
+            let path = e.path();
+            let name = if path.extension().is_some_and(|x| x == "rs") {
+                path.file_stem().and_then(|s| s.to_str()).map(str::to_string)
+            } else if path.join("main.rs").is_file() {
+                path.file_name().and_then(|s| s.to_str()).map(str::to_string)
+            } else {
+                return None;
+            };
+            let Some(name) = name else { return None };
+            let src = if path.is_file() { path } else { path.join("main.rs") };
+            targets.push(TargetInfo {
+                kind: vec!["bin".into()],
+                crate_types: vec!["bin".into()],
+                name,
+                src_path: src,
+                edition: edition.clone(),
+                test_flag: true,
+                required_features: false,
+            });
+        }
+    }
+    (!targets.is_empty()).then_some(targets)
+}
+
+fn push_simple_package(dir: &Path, packages: &mut Vec<PackageInfo>, stack: &mut Vec<PathBuf>) -> Option<()> {
+    if stack.iter().any(|d| d == dir) {
+        return None;
+    }
+    if packages.len() > 32 {
+        return None;
+    }
+    if packages.iter().any(|p| p.manifest_path.parent() == Some(dir)) {
+        return Some(());
+    }
+    stack.push(dir.to_path_buf());
+    let parsed = parse_simple_manifest(dir)?;
+    let targets = simple_targets(&parsed, dir)?;
+    let mut dependencies = Vec::new();
+    let mut children = Vec::new();
+    for (dep_name, dep_dir) in &parsed.deps {
+        let child = parse_simple_manifest(dep_dir)?;
+        dependencies.push(DepInfo {
+            name: dep_name.clone(),
+            rename: None,
+            kind: "normal".into(),
+            target: None,
+            pkg: Some(path_package_id(dep_dir, &child.name, &child.version)),
+        });
+        children.push(dep_dir.clone());
+    }
+    packages.push(PackageInfo {
+        id_repr: path_package_id(dir, &parsed.name, &parsed.version),
+        name: parsed.name,
+        version: parsed.version,
+        edition: parsed.edition,
+        manifest_path: dir.join("Cargo.toml"),
+        authors: Vec::new(),
+        description: parsed.description,
+        homepage: parsed.homepage,
+        license: parsed.license,
+        license_file: parsed.license_file,
+        repository: parsed.repository,
+        readme: parsed.readme,
+        rust_version: parsed.rust_version,
+        source: None,
+        targets,
+        dependencies,
+        features: Vec::new(),
+        resolved_features: Vec::new(),
+    });
+    for child in children {
+        push_simple_package(&child, packages, stack)?;
+    }
+    stack.pop();
+    Some(())
+}
+
+/// The graph of a one-package manifest whose dependencies are path-only,
+/// with no features and no build script. `None` means "unsure": the caller
+/// runs `cargo metadata`.
+fn simple_path_graph(req: &GraphRequest) -> Option<CrateGraph> {
+    if !req.features.is_empty() || req.all_features || !req.default_features || req.package.is_some() {
+        return None;
+    }
+    if ancestor_has_workspace(&req.manifest_path) || project_cargo_config(&req.manifest_path) {
+        return None;
+    }
+    let root_dir = req.manifest_path.parent()?.to_path_buf();
+    let mut packages = Vec::new();
+    push_simple_package(&root_dir, &mut packages, &mut Vec::new())?;
+    let members = vec![packages[0].id_repr.clone()];
+    Some(CrateGraph { key: 0, watch: Vec::new(), stamp: 0, workspace_root: root_dir, packages, workspace_members: members })
+}
+
 /// Picks one unit from the graph: the package (by name, or the one whose
 /// manifest the request names) and the target (kind plus name). The
-/// unit's features prefer the `cargo check` dry run; for a graph with a
-/// single workspace member and no dependencies the resolve-node features
-/// are exact and no check runs.
+/// unit's features are the resolve-node features when
+/// `features_follow_metadata` says those are the features `cargo check`
+/// would report. Otherwise they prefer the `cargo check` dry run.
 pub fn select_unit(
     graph: &CrateGraph,
     req: &GraphRequest,
@@ -976,8 +1404,7 @@ pub fn select_unit(
         })
         .or_else(|| pkg.targets.iter().find(|t| t.name == target_name))
         .ok_or_else(|| format!("package `{}` has no {target_kind} target named `{target_name}`", pkg.name))?;
-    let simple_graph = graph.workspace_members.len() <= 1 && pkg.dependencies.is_empty();
-    let check_map = if simple_graph { None } else { unit_features_via_check(req, graph) };
+    let check_map = if features_follow_metadata(graph) { None } else { unit_features_via_check(req, graph) };
     let features = check_map
         .as_ref()
         .and_then(|m| m.get(&(pkg.id_repr.clone(), target.name.clone())).cloned())
@@ -1255,6 +1682,58 @@ mod tests {
         assert!(unit.package_id.contains("hello 0.1.0"), "{}", unit.package_id);
         check_edition(&unit).unwrap();
         check_lints(&graph, &unit).unwrap();
+        assert!(features_follow_metadata(&graph), "a one-member package with no deps does not probe");
+        assert!(simple_path_graph(&req).is_some(), "hello is read without cargo metadata");
+    }
+
+    #[test]
+    fn simple_path_graph_reads_a_path_dep_and_refuses_a_registry_dep() {
+        let dir = std::env::temp_dir().join(format!("lust-simple-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dep = dir.join("dep");
+        let app = dir.join("app");
+        std::fs::create_dir_all(dep.join("src")).unwrap();
+        std::fs::create_dir_all(app.join("src")).unwrap();
+        std::fs::write(dep.join("Cargo.toml"), "[package]\nname = \"dep\"\nversion = \"0.0.0\"\nedition = \"2024\"\n").unwrap();
+        std::fs::write(dep.join("src/lib.rs"), "").unwrap();
+        std::fs::write(
+            app.join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n",
+        )
+        .unwrap();
+        std::fs::write(app.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let req = GraphRequest {
+            manifest_path: app.join("Cargo.toml"),
+            package: None,
+            features: vec![],
+            default_features: true,
+            all_features: false,
+            target_triple: String::new(),
+            cargo_net: Default::default(),
+            env: None,
+        };
+        let graph = simple_path_graph(&req).expect("path dep is in the simple shape");
+        assert_eq!(graph.packages.len(), 2);
+        assert!(features_follow_metadata(&graph));
+        let interner = crate::intern::Interner::default();
+        let env = CfgEnv::new("", &[], false, crate::protocol::ProfileFlags::DEV);
+        let unit = select_unit(&graph, &req, "bin", "app", &env, &interner, false).unwrap();
+        assert_eq!(unit.deps.len(), 1);
+        assert_eq!(unit.deps[0].package_name, "dep");
+        assert!(unit.deps[0].features.is_empty());
+        std::fs::write(
+            app.join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\nbase64 = \"=0.22.1\"\n",
+        )
+        .unwrap();
+        assert!(simple_path_graph(&req).is_none(), "a registry dep falls back to cargo metadata");
+        std::fs::write(
+            app.join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n\n[dev-dependencies]\ndep = { path = \"../dep\" }\n",
+        )
+        .unwrap();
+        assert!(simple_path_graph(&req).is_none(), "a dev-dependency falls back to cargo metadata");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

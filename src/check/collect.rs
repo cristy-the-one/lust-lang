@@ -479,6 +479,9 @@ pub struct Program {
     /// first use, with the address of the Ast it indexes: a new Ast, as a
     /// patch sets, builds it again).
     pub(crate) outer_params: std::sync::RwLock<Option<(usize, std::sync::Arc<OuterParams>)>>,
+    /// Set when codegen emits an `occt_*` intrinsic. The driver links
+    /// the loader for this program. Not a reason to rebuild anything else.
+    pub occt_emit: std::sync::atomic::AtomicBool,
 }
 
 impl Program {
@@ -3502,6 +3505,7 @@ pub fn collect_reuse(
         reuse_stamp: 0,
         verified: 0,
         outer_params: Default::default(),
+        occt_emit: std::sync::atomic::AtomicBool::new(false),
     };
     let (ast, interner, known) = (&*ast, &*interner, &*known);
     p.gx.walk_instances = walk_instances;

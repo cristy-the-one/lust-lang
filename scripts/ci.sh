@@ -177,6 +177,8 @@ adapter_oracles() {
   return "$st"
 }
 run_step "base64, sha2, libm, flate2, quick-xml, and zip adapters" adapter_oracles
+# The OCCT oracle skips when the shim cache is absent. CI does not install OCCT.
+run_step "occt shim oracle (skip without the cache)" scripts/occt-oracle.sh
 run_step difftest scripts/difftest.sh ${gate_filter:+"$gate_filter"}
 run_step "macro corpus" macro_corpus
 run_step "ts-rust kernels and compat fixtures" kernel_suite

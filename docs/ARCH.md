@@ -86,9 +86,15 @@ files that apply (`.cargo/config.toml` chain). The driver runs
 `cargo metadata --format-version 1` with those inputs once per
 graph key. `cargo metadata` alone unifies features over the whole
 workspace, which can differ from a `-p ts_goport --bin tsgo`
-build. So the feature set of each selected unit comes from one
+build. When the workspace has one member and no package in the
+graph has a dev-dependency, a build-dependency, a target-specific
+dependency, or `required-features`, the resolve-node features are
+the features `cargo check` would report, and the dry run is skipped.
+Otherwise the feature set of each selected unit comes from one
 cached `cargo check --message-format=json` dry run for the same
-request. The dry run has lust-core as its RUSTC_WRAPPER: build
+request. A manifest that is one package plus path dependencies,
+with no features and no build script, is read in-process.
+`cargo metadata` runs for every other shape. The dry run has lust-core as its RUSTC_WRAPPER: build
 scripts, proc macros, and their dependencies compile for real, and
 every check unit gets an empty dep-info file and no `.rmeta`, so a
 later real check rebuilds it (`src/resolve/probe.rs`). Cargo still
@@ -2134,11 +2140,13 @@ clear error, not a silent mismatch.
 | `sha2` | Source SHA-256 (`new`, `update`, `finalize`, `digest`). | Digests vs 0.10.9, including multi-chunk updates. |
 | `quick-xml` | Source reader and writer for the 0.42.0 default feature set: events, attributes, entities, and the escaping writer. | Event trace and writer bytes vs 0.42.0, including a seeded random corpus. |
 | `zip` | Source stored and Deflated archives on top of the flate2 raw encoder (`deflate-flate2`, no `time` feature). | Archive bytes and read-back vs 9.2.0, including a seeded random corpus. |
+| `occt` | Path-name adapter for the Open CASCADE shim, not a crates.io swap. First slice: session, box, cylinder, tessellate, mesh bytes (`docs/occt-shim.md`). The loader unit is emitted only when an `occt_*` intrinsic is lowered. | Same-shim oracle: rustc `extern "C"` versus the lust intrinsics, status, counts, and raw mesh bytes. Skipped when the shim cache is absent. |
 
 Adapter code is user-level lust. It goes through the
 same check and mono as any crate. It may use
 intrinsics only where the table says (memchr, arena,
-xxh3, ryu-js cores).
+xxh3, ryu-js, and the `occt_*` rows). The OCCT loader is
+not part of the runtime unit.
 
 ### 3.7 Shim crates and the allocator
 

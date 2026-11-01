@@ -73,6 +73,7 @@ pub fn shift_program(p: &mut Program, f: &mut dyn FnMut(Span) -> Span) -> usize 
         reuse_stamp: _,
         verified: _,
         outer_params: _,
+        occt_emit: _,
         const_goals,
     } = p;
     const_goals.iter_mut().for_each(|(_, s)| sp(s));

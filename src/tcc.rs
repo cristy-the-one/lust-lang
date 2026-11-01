@@ -388,25 +388,31 @@ pub fn link(objs: &[PathBuf], out: &Path, debug: bool) -> Result<(), String> {
     link_executable(&tcc, objs, out)
 }
 
-/// The runtime unit compiled to an object once per lust build, cached in the temp directory.
-/// The key is a hash of the runtime source, the debug flag, and the tcc library path: anything
-/// that changes the object's bytes changes the key. Stale entries are left for the OS to clean.
-pub fn cached_runtime_object(runtime_src: &str, debug: bool) -> Result<PathBuf, String> {
+/// Where the cached runtime object for this compiler and these options lives.
+/// The key is the compiler build hash (it covers `src/runtime`), the debug
+/// flag, the tcc library path, and the compile options. A hit does not
+/// rebuild the runtime source. Stale entries are left for the OS to clean.
+fn runtime_object_path(debug: bool) -> PathBuf {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    runtime_src.hash(&mut h);
+    env!("LUST_BUILD_HASH").hash(&mut h);
     debug.hash(&mut h);
     tcc_paths().0.hash(&mut h);
-    // The compile options change the object's bytes too; name the set so
-    // a flag change does not reuse an object built without it.
     "opts:no-asynchronous-unwind-tables".hash(&mut h);
-    let obj = std::env::temp_dir().join(format!("lust-runtime-{:016x}.o", h.finish()));
-    if obj.exists() {
+    std::env::temp_dir().join(format!("lust-runtime-{:016x}.o", h.finish()))
+}
+
+/// The runtime unit compiled to an object once per lust build, cached in the temp directory.
+/// The first link of a later process reuses the object. A miss compiles `runtime_unit`.
+pub fn cached_runtime_object(debug: bool) -> Result<PathBuf, String> {
+    let obj = runtime_object_path(debug);
+    if obj.is_file() {
         return Ok(obj);
     }
+    let runtime_src = crate::cgen::runtime_unit();
     // Build under a private name, then rename, so two lust processes never see a half object.
     let tmp = std::env::temp_dir().join(format!("lust-runtime-{}-{}.o", std::process::id(), if debug { "g" } else { "o" }));
-    compile_units(&[(tmp.clone(), runtime_src.to_string())], debug)?;
+    compile_units(&[(tmp.clone(), runtime_src)], debug)?;
     match std::fs::rename(&tmp, &obj) {
         Ok(()) => {}
         // Another process won the race (or the rename failed): use the file that is there,

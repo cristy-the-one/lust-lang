@@ -418,6 +418,11 @@ pub(crate) struct Caches {
     pub(crate) inst_ids: FxMap<u32, u64>,
     /// Units whose current code is in an overlay object, not in libbase.so.
     pub(crate) overlays: std::collections::BTreeSet<usize>,
+    /// This session lowered an OCCT intrinsic. Later edits keep linking
+    /// the loader even when the adapter unit is not rebuilt.
+    pub(crate) occt_loader: bool,
+    /// The current base library already defines the loader.
+    pub(crate) occt_in_base: bool,
 }
 
 pub struct Session {
@@ -567,6 +572,8 @@ impl Session {
                 overlays: Default::default(),
                 gen_reuse: Default::default(),
                 inst_ids: FxMap::default(),
+                occt_loader: false,
+                occt_in_base: false,
             },
             std_cache: None,
             disk_cache: None,

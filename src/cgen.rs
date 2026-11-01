@@ -6571,6 +6571,25 @@ impl FnGen<'_, '_> {
         }
     }
 
+    /// File-scope prototype for one OCCT loader symbol. Not in `deps.h`.
+fn occt_extern(symbol: &str) -> &'static str {
+    match symbol {
+        "lust_occt_h_session_new" => "extern uint64_t lust_occt_h_session_new(void);",
+        "lust_occt_h_session_free" => "extern void lust_occt_h_session_free(uint64_t);",
+        "lust_occt_h_make_box" => "extern uint64_t lust_occt_h_make_box(uint64_t, double, double, double);",
+        "lust_occt_h_make_cylinder" => "extern uint64_t lust_occt_h_make_cylinder(uint64_t, double, double);",
+        "lust_occt_h_shape_free" => "extern void lust_occt_h_shape_free(uint64_t, uint64_t);",
+        "lust_occt_h_tessellate" => "extern uint64_t lust_occt_h_tessellate(uint64_t, uint64_t, double);",
+        "lust_occt_h_mesh_nverts" => "extern uint64_t lust_occt_h_mesh_nverts(uint64_t);",
+        "lust_occt_h_mesh_ntris" => "extern uint64_t lust_occt_h_mesh_ntris(uint64_t);",
+        "lust_occt_h_mesh_copy" => "extern int32_t lust_occt_h_mesh_copy(uint64_t, lust_Vec *, lust_Vec *);",
+        "lust_occt_h_mesh_free" => "extern void lust_occt_h_mesh_free(uint64_t);",
+        "lust_occt_h_last_status" => "extern int32_t lust_occt_h_last_status(void);",
+        "lust_occt_h_last_error" => "extern lust_str lust_occt_h_last_error(void);",
+        other => panic!("internal: no OCCT prototype for {other}"),
+    }
+}
+
     /// Emits one intrinsic call as a plain runtime call (section 3.2: no
     /// IR node per family, codegen emits the C call direct). This is the
     /// second privilege line behind check: an intrinsic that reaches
@@ -6585,6 +6604,16 @@ impl FnGen<'_, '_> {
             def.name
         );
         assert!(def.implemented, "internal: intrinsic `core::intrinsics::{}` reached codegen with no body", def.name);
+        // OCCT prototypes stay out of the common unit header (deps.h).
+        // The declaration is file-scope, ahead of this function only.
+        if def.name.starts_with("occt_") {
+            self.p.occt_emit.store(true, std::sync::atomic::Ordering::Relaxed);
+            let line = Self::occt_extern(def.c_symbol);
+            if !self.prelude.contains(line) {
+                self.prelude.push_str(line);
+                self.prelude.push('\n');
+            }
+        }
         let mut args: Vec<String> = Vec::new();
         for (o, sig) in ops.iter().zip(def.params) {
             let v = self.operand(o, loc, post).0;

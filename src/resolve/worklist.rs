@@ -1554,7 +1554,11 @@ fn lust_dep_lib_root(name: &str) -> Option<PathBuf> {
 /// or unsupported with a reason that names the crate (L0508). The
 /// class is a property of the resolved package, never of a source
 /// spelling: a path package that happens to be named `indexmap` is
-/// plain lust source. `lust_owned` marks the library's own crates
+/// plain lust source. `occt` is the exception: it is not a crates.io
+/// package, and a dependency of that name is the shim adapter in
+/// `library/deps/occt` (docs/occt-shim.md). That lookup reads the
+/// adapter manifest only. It does not stat the shim cache.
+/// `lust_owned` marks the library's own crates
 /// (adapters and shims): they skip the edition rule and see
 /// `cfg(lust_dev)`. `adapter` carries an adapter's exact-layout list.
 enum DepClass {
@@ -1564,6 +1568,13 @@ enum DepClass {
 
 /// Classifies one dependency unit. See `DepClass`.
 fn classify_dep(dep: &super::cargo::DepUnit) -> DepClass {
+    if dep.package_name == "occt" {
+        return match super::adapters::load("occt") {
+            Ok(Some(a)) => DepClass::Source { root: a.root, lust_owned: true, adapter: Some(a.exact_layout) },
+            Ok(None) => DepClass::Unsupported("dependency crate `occt` has no lust adapter yet".into()),
+            Err(e) => DepClass::Unsupported(format!("the lust adapter for `occt` is broken: {e}")),
+        };
+    }
     if dep.source.is_none() {
         return DepClass::Source { root: dep.lib_src.clone(), lust_owned: false, adapter: None };
     }
@@ -9403,6 +9414,13 @@ mod tests {
                 assert!(!lust_owned && adapter.is_none(), "a path package named indexmap is plain source")
             }
             DepClass::Unsupported(why) => panic!("path package must be source: {why}"),
+        }
+        match classify_dep(&dep_unit("occt", "0.0.0", None)) {
+            DepClass::Source { lust_owned, adapter, root } => {
+                assert!(lust_owned && adapter.is_some(), "a path package named occt is the shim adapter");
+                assert!(root.ends_with("deps/occt/src/lib.rs"), "{}", root.display());
+            }
+            DepClass::Unsupported(why) => panic!("occt path dep is the shim adapter: {why}"),
         }
         // The memchr adapter pins 2.8.2: another version is a mismatch
         // that names both versions, never a silent swap.

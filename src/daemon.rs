@@ -1800,7 +1800,6 @@ mod tests {
         assert_eq!(stale_temp_pid("lust-daemon-"), None);
         assert_eq!(stale_temp_pid("lust-daemon-12a"), None);
         assert_eq!(stale_temp_pid("lust-runtime-0123456789abcdef.o"), None);
-        assert_eq!(stale_temp_pid("lust-cache-1000"), None, "the runtime object's fallback dir (tcc.rs)");
         assert_eq!(stale_temp_pid("other-123"), None);
     }
 

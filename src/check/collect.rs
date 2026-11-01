@@ -443,6 +443,10 @@ pub struct Program {
     /// on, release C keeps the abort of an exhaustive match's otherwise edge
     /// (`cgen::assume_unreachable`). Set by the driver after collection from the session's profile.
     pub debug_assertions: bool,
+    /// `--sandbox` (check/sandbox.rs): check refuses std paths to OS
+    /// services and thread spawns in user source, and codegen turns every
+    /// OS intrinsic call into a stop. Set by the driver from the session's profile.
+    pub sandbox: bool,
     /// panic=unwind with unwind tables (`lust_unwind_mode` 2, runtime/panic.c): codegen gives
     /// each frame with drops one cleanup variable and stores its ladder entry before calls
     /// that can unwind, instead of a flag check after each call. Needs a C compiler with
@@ -3497,6 +3501,7 @@ pub fn collect_reuse(
         unwind: false,
         overflow_checks: true,
         debug_assertions: true,
+        sandbox: false,
         unwind_tables: false,
         regions: Default::default(),
         fp_memo: Default::default(),

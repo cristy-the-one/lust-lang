@@ -6620,6 +6620,20 @@ fn occt_extern(symbol: &str) -> &'static str {
             // A `&[u8]` reaches C as its pointer and its length.
             args.push(if *sig == SigTy::Bytes { format!("({v}).ptr, ({v}).len") } else { v });
         }
+        // `--sandbox` (check/sandbox.rs): an OS intrinsic of a refused
+        // family stops the program before the call. `lust_sandbox_deny`
+        // never returns, so the comma form keeps the call's C type.
+        if self.p.sandbox
+            && let Some(family) = crate::check::sandbox::intrinsic_family(def.name)
+        {
+            let call = self.intrinsic_call(def, &args);
+            return format!("(lust_sandbox_deny({family}), {call})");
+        }
+        self.intrinsic_call(def, &args)
+    }
+
+    /// The C call of one intrinsic row with its argument texts.
+    fn intrinsic_call(&self, def: &lang::IntrinsicDef, args: &[String]) -> String {
         if matches!(def.ret, SigTy::Never | SigTy::Unit) {
             // The C callee returns void (and for `!`, never returns). The
             // comma form still gives the assignment a value of the right

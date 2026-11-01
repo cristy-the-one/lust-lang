@@ -93,6 +93,10 @@ pub struct CfgEnv {
     /// True only while a shipped std or adapter crate resolves: `lust_dev`
     /// is then a known, true flag (section 1.6).
     pub allow_lust_dev: bool,
+    /// The session builds with `--sandbox` (`ProfileFlags::sandbox`). Not a
+    /// cfg name: no `cfg!` sees it. It reaches the expander, where the
+    /// `include!` family refuses to read a file.
+    pub sandbox: bool,
 }
 
 impl CfgEnv {
@@ -113,7 +117,7 @@ impl CfgEnv {
     /// a value that would change code silently beyond what the name says.
     pub fn new(triple: &str, features: &[String], test: bool, profile: ProfileFlags) -> CfgEnv {
         let triple = if triple.is_empty() { crate::protocol::host_triple() } else { triple };
-        let mut env = CfgEnv { features: features.iter().cloned().collect(), ..Default::default() };
+        let mut env = CfgEnv { features: features.iter().cloned().collect(), sandbox: profile.sandbox, ..Default::default() };
         let parts: Vec<&str> = triple.split('-').collect();
         let arch = parts.first().copied().unwrap_or("");
         env.pair("target_arch", arch);

@@ -3,7 +3,7 @@
 //
 // Wire format. Request: a header line with no user data in it,
 //   cmd json timings debug max_errors test default_features all_features
-//   panic_abort overflow_checks debug_assertions feature_count env_count offline locked build
+//   panic_abort overflow_checks debug_assertions feature_count env_count offline locked sandbox build
 // followed by length-prefixed fields, each as "<byte len>\n<bytes>": file, out,
 // emit_c, then the crate selector (package id, manifest path, target kind,
 // target name, crate root, target triple), then one field per feature,
@@ -71,11 +71,19 @@ pub struct ProfileFlags {
     pub panic_abort: bool,
     pub overflow_checks: bool,
     pub debug_assertions: bool,
+    /// `--sandbox`: the program may use stdin, stdout and stderr, and no
+    /// other OS service. Check refuses the std paths to the file system,
+    /// the network, the environment, processes, OS extensions and thread
+    /// spawning (L0532), `include!`, `include_str!` and `include_bytes!`
+    /// read no file, `env!` sees an empty environment, and codegen turns
+    /// every OS intrinsic a std body reaches into a stop (`lust_sandbox_deny`).
+    /// Not a rustc flag: lust's own, for running untrusted generated code.
+    pub sandbox: bool,
 }
 
 impl ProfileFlags {
     /// The dev flags with `-C panic=abort`.
-    pub const DEV: ProfileFlags = ProfileFlags { panic_abort: true, overflow_checks: true, debug_assertions: true };
+    pub const DEV: ProfileFlags = ProfileFlags { panic_abort: true, overflow_checks: true, debug_assertions: true, sandbox: false };
     /// rustc's and Cargo's dev defaults (panics unwind): a single-file compile
     /// and a Cargo dev profile that does not set `panic`.
     pub const DEV_UNWIND: ProfileFlags = ProfileFlags { panic_abort: false, ..ProfileFlags::DEV };
@@ -150,7 +158,7 @@ impl SessionKey {
         let b = |x: bool| if x { "1" } else { "0" };
         let manifest = self.krate.manifest_path.as_ref().map_or_else(|| "-".to_string(), |p| p.to_string_lossy().into_owned());
         format!(
-            "pkg={} manifest={} {}:{} root={} test={} features=[{}] default_features={} all_features={} target={} panic_abort={} overflow_checks={} debug_assertions={} offline={} locked={}",
+            "pkg={} manifest={} {}:{} root={} test={} features=[{}] default_features={} all_features={} target={} panic_abort={} overflow_checks={} debug_assertions={} sandbox={} offline={} locked={}",
             self.krate.package_id,
             manifest,
             self.krate.target_kind,
@@ -164,6 +172,7 @@ impl SessionKey {
             b(self.profile.panic_abort),
             b(self.profile.overflow_checks),
             b(self.profile.debug_assertions),
+            b(self.profile.sandbox),
             b(self.cargo_net.offline),
             b(self.cargo_net.locked),
         )
@@ -372,7 +381,7 @@ pub enum Invocation {
     },
 }
 
-pub const USAGE: &str = "usage: lust <check|build|run> <file.rs> [--json] [--max-errors N] [--timings] [-o out] [-g] [--emit-c prefix] [-- args]\n       lust <check|build|run> <file.rs> [--manifest-path <Cargo.toml>] [--package <name>] [--bin <name> | --lib] [--features <a,b>] [--no-default-features] [--all-features] [--target <triple>] [-C panic=unwind|abort] [-C overflow-checks=on|off] [-C debug-assertions=on|off] [--offline] [--locked] [--frozen]\n       lust build <file.rs> --release | --profile <name> [-o out] [--offline] [--locked] [--frozen]\n       lust build <file.rs> --release | --profile <name> --target <triple> [--target <triple>...] [crate flags] [-o out-or-dir] (lust release driver: zig cc)\n       lust check <file.rs> --rustc\n       lust test <file.rs> [filter] [--json] [--timeout SECONDS] [--max-errors N]\n       lust explain <L####>\n       lust expand <file.rs>\n       lust capabilities [--json]\n       lust daemon\n       lust --version";
+pub const USAGE: &str = "usage: lust <check|build|run> <file.rs> [--json] [--max-errors N] [--timings] [-o out] [-g] [--emit-c prefix] [-- args]\n       lust <check|build|run> <file.rs> [--manifest-path <Cargo.toml>] [--package <name>] [--bin <name> | --lib] [--features <a,b>] [--no-default-features] [--all-features] [--target <triple>] [-C panic=unwind|abort] [-C overflow-checks=on|off] [-C debug-assertions=on|off] [--offline] [--locked] [--frozen] [--sandbox]\n       lust build <file.rs> --release | --profile <name> [-o out] [--offline] [--locked] [--frozen]\n       lust build <file.rs> --release | --profile <name> --target <triple> [--target <triple>...] [crate flags] [-o out-or-dir] (lust release driver: zig cc)\n       lust check <file.rs> --rustc\n       lust test <file.rs> [filter] [--json] [--timeout SECONDS] [--max-errors N]\n       lust explain <L####>\n       lust expand <file.rs>\n       lust capabilities [--json]\n       lust daemon\n       lust --version";
 
 /// Crate-selection flags from the command line, before defaults are filled in.
 #[derive(Clone, Default)]
@@ -647,6 +656,7 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
     // as rustc takes them. None keeps the default.
     let mut panic_abort: Option<bool> = None;
     let (mut overflow_checks, mut debug_assertions): (Option<bool>, Option<bool>) = (None, None);
+    let mut sandbox = false;
     // A rustc boolean option value.
     fn rustc_bool(v: &str) -> Option<bool> {
         match v {
@@ -689,6 +699,7 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
             "--all-features" => crate_flags.all_features = true,
             "--offline" => net.offline = true,
             "--locked" => net.locked = true,
+            "--sandbox" => sandbox = true,
             "--frozen" => net = CargoNet { offline: true, locked: true },
             "-C" => match it.next()?.as_str() {
                 "panic=unwind" => panic_abort = Some(false),
@@ -715,7 +726,7 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
     // Crate-selection flags are lust dev flags today: reject them there rather
     // than build a different crate selection than the user named.
     if rustc {
-        if cmd != "check" || release || profile.is_some() || !run_args.is_empty() || crate_flags.any() || !targets.is_empty() || panic_abort.is_some() || overflow_checks.is_some() || debug_assertions.is_some() {
+        if sandbox || cmd != "check" || release || profile.is_some() || !run_args.is_empty() || crate_flags.any() || !targets.is_empty() || panic_abort.is_some() || overflow_checks.is_some() || debug_assertions.is_some() {
             return None;
         }
         return Some(Invocation::RustcCheck { file: abs(&file) });
@@ -723,7 +734,7 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
     if (release || profile.is_some()) && !targets.is_empty() {
         // The lust release driver: one cold cc request per named target.
         // Crate flags are its inputs, unlike the Cargo release below.
-        if cmd != "build" || !run_args.is_empty() || crate_flags.lib {
+        if sandbox || cmd != "build" || !run_args.is_empty() || crate_flags.lib {
             return None;
         }
         let typed = file.clone();
@@ -776,7 +787,7 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
         return Some(Invocation::ReleaseCc { reqs: Ok(reqs) });
     }
     if release || profile.is_some() {
-        if cmd != "build" || !run_args.is_empty() || emit_c.is_some() || crate_flags.any() || panic_abort.is_some() || overflow_checks.is_some() || debug_assertions.is_some() {
+        if sandbox || cmd != "build" || !run_args.is_empty() || emit_c.is_some() || crate_flags.any() || panic_abort.is_some() || overflow_checks.is_some() || debug_assertions.is_some() {
             return None;
         }
         if release && profile.is_none() {
@@ -805,6 +816,13 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
     if let Some(on) = debug_assertions {
         session.profile.debug_assertions = on;
     }
+    session.profile.sandbox = sandbox;
+    // A sandboxed compile sees no environment: `env!` and `option_env!`
+    // read the client's, so the build cannot copy a host variable in.
+    let mut client = Client::current(&typed);
+    if sandbox {
+        client.env = Some(Vec::new());
+    }
     let req = Request {
         cmd: if cmd == "check" { Cmd::Check } else { Cmd::Build },
         session,
@@ -817,7 +835,7 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
         max_errors,
         run_args: if run { Some(run_args.clone()) } else { None },
         harness: false, cc: false,
-        client: Client::current(&typed),
+        client,
     };
     Some(Invocation::Compile { req, run, args: run_args })
 }
@@ -1036,7 +1054,7 @@ pub fn encode(r: &Request) -> Vec<u8> {
     let s = &r.session;
     let env_count = r.client.env.as_ref().map_or_else(|| "-".to_string(), |e| e.len().to_string());
     let mut out = format!(
-        "{cmd} {} {} {} {} {} {} {} {} {} {} {} {env_count} {} {} {}\n",
+        "{cmd} {} {} {} {} {} {} {} {} {} {} {} {env_count} {} {} {} {}\n",
         b(r.json),
         b(r.timings),
         b(r.debug),
@@ -1050,6 +1068,7 @@ pub fn encode(r: &Request) -> Vec<u8> {
         s.features.len(),
         b(s.cargo_net.offline),
         b(s.cargo_net.locked),
+        b(s.profile.sandbox),
         build_id()
     )
     .into_bytes();
@@ -1082,7 +1101,7 @@ pub fn read_request(r: &mut impl BufRead) -> Result<Request, ReadError> {
         return Err(ReadError::Bad);
     }
     let f: Vec<&str> = head.split_whitespace().collect();
-    if f.len() != 16 || f[15] != build_id() {
+    if f.len() != 17 || f[16] != build_id() {
         // The first word is always a command, so a short header of a known
         // command is a client from before this field.
         return Err(if matches!(f.first(), Some(&"check" | &"build")) { ReadError::OtherBuild } else { ReadError::Bad });
@@ -1144,7 +1163,7 @@ fn read_fields(r: &mut impl BufRead, f: &[&str]) -> Option<Request> {
             default_features: f[6] == "1",
             all_features: f[7] == "1",
             target_triple,
-            profile: ProfileFlags { panic_abort: f[8] == "1", overflow_checks: f[9] == "1", debug_assertions: f[10] == "1" },
+            profile: ProfileFlags { panic_abort: f[8] == "1", overflow_checks: f[9] == "1", debug_assertions: f[10] == "1", sandbox: f[15] == "1" },
             cargo_net: CargoNet { offline: f[13] == "1", locked: f[14] == "1" },
         },
         file,
@@ -1443,6 +1462,7 @@ pub fn cargo_profile(manifest: Option<&Path>, name: &str) -> Result<CargoProfile
             panic_abort: lookup("panic").map_or(false, |v| v == "abort"),
             overflow_checks: lookup("overflow-checks").map_or(!release, |v| v == "true"),
             debug_assertions: lookup("debug-assertions").map_or(!release, |v| v == "true"),
+            sandbox: false,
         },
         opt_level: lookup("opt-level").unwrap_or_else(|| if release { "3" } else { "0" }.into()),
     })
@@ -1962,7 +1982,7 @@ mod tests {
         let m = dir.join("Cargo.toml");
         std::fs::write(&m, "[package]\nname = \"p\"\n\n[profile.goport]\ninherits = \"release\"\nlto = \"fat\"\n\n[profile.chk]\ninherits = \"goport\"\noverflow-checks = true\n\n[profile.a]\ninherits = \"b\"\n[profile.b]\ninherits = \"a\"\n").unwrap();
         let rel = cargo_profile(Some(&m), "release").unwrap();
-        assert_eq!(rel.flags, ProfileFlags { panic_abort: false, overflow_checks: false, debug_assertions: false });
+        assert_eq!(rel.flags, ProfileFlags { panic_abort: false, overflow_checks: false, debug_assertions: false, sandbox: false });
         assert_eq!(rel.opt_level, "3");
         assert_eq!(cargo_profile(Some(&m), "goport").unwrap(), rel, "goport inherits release");
         let chk = cargo_profile(Some(&m), "chk").unwrap();

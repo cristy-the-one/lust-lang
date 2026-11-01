@@ -51,6 +51,7 @@ pub mod tryfrom;
 pub mod ufcs;
 pub mod usefulness;
 pub mod sync;
+pub mod sandbox;
 pub mod unwind;
 mod use_caps;
 pub mod variance;
@@ -2470,6 +2471,17 @@ pub(crate) fn check_fn_with<'p>(p: &'p Program, fid: LocalDefId, lints: bool) ->
     if lints
         && errs.is_empty()
         && let Some(d) = lint_tail(p, fid, &mut ck)
+    {
+        errs.push(d);
+    }
+    // `--sandbox`: a user body's std paths to OS services and its thread
+    // spawns (check/sandbox.rs). Runs with or without lints: a mono-only
+    // check of a user body still must not reach codegen unrefused.
+    if p.sandbox
+        && errs.is_empty()
+        && !std_body
+        && p.fn_shipped_crate(fid).is_none()
+        && let Some(d) = sandbox::check_body(p, fid, &ck)
     {
         errs.push(d);
     }

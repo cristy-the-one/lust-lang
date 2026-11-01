@@ -263,6 +263,8 @@ Known limit: one file builds as `rustc --edition 2024 -C panic=abort -C overflow
 
 `--json` prints one diagnostic per line, each with `code`, `message`, `span`, `fix`, and `edits`. The `fix` text tells the user what to write instead. This format exists for coding agents.
 
+`--sandbox` (on `check`, `build`, `run`) is for code a tool or a model wrote: the program may read stdin and write stdout and stderr, and nothing else. Check refuses std paths to the file system, the network, the environment, processes and threads (L0532), and the built program stops before any other OS call. See [docs/sandbox.md](docs/sandbox.md).
+
 This is a complete lust program. It is also a complete Rust program:
 
 ```rust

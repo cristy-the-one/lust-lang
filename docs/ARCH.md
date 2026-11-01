@@ -5161,7 +5161,7 @@ rationale, the registry is the enforced list.
 | L0501-L0509 | Modules and imports (L0501 import cycle does not settle, L0502 ambiguous module file, L0503 module file not found, L0504 generated name changes an earlier resolution) |
 | L0510-L0519 | Visibility |
 | L0520-L0529 | cfg and attributes (L0520 unknown cfg name, L0521 unknown attribute) |
-| L0530-L0539 | Crate session (L0530 unsupported edition, L0531 unsupported deny-level lint) |
+| L0530-L0539 | Crate session (L0530 unsupported edition, L0531 unsupported deny-level lint, L0532 refused in a `--sandbox` build) |
 | L0601-L0609 | Types and aliases (L0601 alias cycle) |
 | L0610-L0619 | Traits and inference (L0610 type annotations needed or type must be known, L0611 selection overflow, L0612 no impl, L0613 impl parameter not known from trait inputs, L0615 overlapping impls) |
 | L0620-L0629 | Associated items (L0620 GAT) |

@@ -186,6 +186,7 @@ if [ -e scripts/test-client.sh ]; then
   run_step "client tests" scripts/test-client.sh
 fi
 run_step "crate fixture tests" crate_suite
+run_step "sandbox tests" scripts/test-sandbox.sh
 run_step "daemon edit scenarios (warm vs cold vs rustc)" python3 scripts/test-daemon-scenarios.py
 if [ -e scripts/test-slots.py ]; then
   run_step "slot identity tests" python3 scripts/test-slots.py

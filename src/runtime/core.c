@@ -396,6 +396,18 @@ void lust_flush(void) LUST_BODY({ lust_print_flush(); })
    exit() runs them for Rust std). */
 void lust_exit(int32_t code) LUST_BODY({ lust_tls_exit(); lust_print_flush(); exit(code); })
 
+/* A `--sandbox` program reached an OS call it may not make (cgen's
+   `intrinsic`, check/sandbox.rs): say which family on stderr and end the
+   program with exit code 101, before the call runs. Never returns. */
+void lust_sandbox_deny(int32_t family) LUST_BODY({
+    static const char *const names[] = {"the file system", "the network", "the environment", "a process", "an OS extension"};
+    const char *what = family >= 0 && family < 5 ? names[family] : "an OS service";
+    lust_print_flush();
+    fprintf(stderr, "error[L0532]: this program was built with --sandbox and tried to use %s\n", what);
+    fflush(stderr);
+    exit(101);
+})
+
 /* ---------- Vec ---------- */
 
 /* Erased Vec core (ARCH 3.3): capacity rules copy Rust 1.99 RawVec, so

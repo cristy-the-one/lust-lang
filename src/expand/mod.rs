@@ -723,7 +723,7 @@ impl<'a> ExpandCtx<'a> {
             real_path: file_path.to_path_buf(),
             cargo_env: Vec::new(),
             src,
-            cfg: builtin::CfgEnv { test, debug_assertions: true, facts: Vec::new(), panic_unwind: false },
+            cfg: builtin::CfgEnv { test, debug_assertions: true, facts: Vec::new(), panic_unwind: false, sandbox: false },
             module_path: Vec::new(),
             crate_name: None,
             extern_crates: Vec::new(),

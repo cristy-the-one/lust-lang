@@ -52,6 +52,67 @@ check diag-schema $? "see the python assert above"
 "$lust" check "$root/tests/fail/two_mut_borrows.rs" >"$work/diag.txt" 2>&1
 grep -q "mutably borrowed here" "$work/diag.txt"; check diag-human-label $? "human output must show the label"
 
+# --- 1b. Machine-applicable edits for numeric mismatches ---
+# An integer literal where a float goes becomes a float literal (`4` to
+# `4.0`, auto); any other numeric mismatch gets `(value) as T`, auto only
+# when the cast keeps every value. Applying every edit gives a program
+# that lust checks and rustc accepts, and both print the same.
+cat > "$work/num.rs" <<'RSEOF'
+fn area(w: f64, h: f64) -> f64 {
+    w * h
+}
+fn main() {
+    let a: f64 = 4;
+    let b = area(3, 2.5);
+    let c: f64 = 1.5 * 2;
+    let n: i32 = 7;
+    let d: f64 = n;
+    let mut e = 0.0f64;
+    e += 1;
+    let f: f32 = 2.0f64;
+    let k: usize = 3;
+    let h = 2.0 * k;
+    let x = 2.5f64;
+    let m = 2 * x;
+    let neg: f64 = -3;
+    let w: u64 = n;
+    let s: u8 = 300u16;
+    println!("{a} {b} {c} {d} {e} {f} {h} {m} {neg} {w} {s}");
+}
+RSEOF
+"$lust" check --json "$work/num.rs" > "$work/num.json" 2>/dev/null
+python3 - "$work/num.json" "$work/num.rs" "$work/num_fixed.rs" <<'PYEOF'
+import json, sys
+recs = [json.loads(l) for l in open(sys.argv[1])]
+errs = [d for d in recs if d.get("severity") == "error"]
+src = open(sys.argv[2], "rb").read()
+line = lambda d: d["span"]["line"]
+by_line = {line(d): d for d in errs}
+def edits(n):
+    return [(e["replacement"], e["auto"]) for e in by_line[n]["edits"]]
+assert len(errs) == 11 and all(d["edits"] for d in errs), [(line(d), d["message"], d["edits"]) for d in errs]
+assert edits(5) == [(".0", True)], edits(5)              # let a: f64 = 4
+assert edits(6) == [(".0", True)], edits(6)              # area(3, ..)
+assert edits(7) == [(".0", True)], edits(7)              # 1.5 * 2
+assert edits(9) == [("(", True), (") as f64", True)]     # i32 into f64 keeps every value
+assert edits(11) == [(".0", True)], edits(11)            # e += 1
+assert edits(12) == [("(", False), (") as f32", False)]  # f64 into f32 does not
+assert edits(14) == [("(", False), (") as f64", False)]  # usize into f64 does not
+assert edits(16) == [(".0", True)], edits(16)            # 2 * x: the left literal
+assert edits(17) == [(".0", True)], edits(17)            # -3
+assert edits(18) == [("(", False), (") as u64", False)]  # i32 into u64 changes negatives
+assert edits(19) == [("(", False), (") as u8", False)]   # u16 into u8 narrows
+for s0, e0, r in sorted({(e["start"], e["end"], e["replacement"]) for d in errs for e in d["edits"]}, reverse=True):
+    src = src[:s0] + r.encode() + src[e0:]
+open(sys.argv[3], "wb").write(src)
+PYEOF
+check diag-numeric-edits $? "see the python assert above"
+"$lust" run "$work/num_fixed.rs" > "$work/num_fixed.out" 2>&1; check diag-numeric-edits-apply $? "the program with every edit applied must build and run: $(head -3 "$work/num_fixed.out")"
+if command -v rustc >/dev/null 2>&1; then
+  rustc --edition 2024 -A warnings -o "$work/num_fixed.bin" "$work/num_fixed.rs" >/dev/null 2>&1 && "$work/num_fixed.bin" > "$work/num_fixed.rout" 2>&1
+  cmp -s "$work/num_fixed.out" "$work/num_fixed.rout"; check diag-numeric-edits-rustc $? "rustc must accept the fixed program and print the same"
+fi
+
 # --- 2. Bounded output: default cap, truncation record, --max-errors 0 ---
 python3 -c '
 lines = ["fn main() {"]

@@ -85,6 +85,20 @@ fi
 "$lust" build "$root/tests/sandbox/path_exists.rs" -o "$work/exists.plain" >/dev/null 2>&1 && "$work/exists.plain" | grep -qx true \
   && report ok plain-unchanged || report bad plain-unchanged "the plain build should print true"
 
+# A Cargo project the in-process manifest reader does not take (its
+# dependency has a `license` line) runs `cargo metadata`: Cargo keeps the
+# caller's environment (PATH), while `env!` in the program sees none.
+mkdir -p "$work/cp/app/src" "$work/cp/dep/src"
+printf '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2024"\n\n[dependencies]\ndep = { path = "../dep" }\n\n[workspace]\n' > "$work/cp/app/Cargo.toml"
+printf '[package]\nname = "dep"\nversion = "0.1.0"\nedition = "2024"\nlicense = "MIT"\n\n[workspace]\n' > "$work/cp/dep/Cargo.toml"
+printf 'pub fn n() -> u32 { 7 }\n' > "$work/cp/dep/src/lib.rs"
+printf 'fn main() { println!("{} {:?}", dep::n(), option_env!("PATH").is_some()); }\n' > "$work/cp/app/src/main.rs"
+if "$lust" build --sandbox "$work/cp/app/src/main.rs" --manifest-path "$work/cp/app/Cargo.toml" -o "$work/cp/app.bin" >"$work/cp.err" 2>&1 && [ "$("$work/cp/app.bin")" = "7 false" ]; then
+  report ok cargo-metadata-path
+else
+  report bad cargo-metadata-path "$(head -3 "$work/cp.err")"
+fi
+
 # The flag is a dev-build flag: release and the rustc oracle refuse it.
 "$lust" build --sandbox --release "$root/tests/sandbox/allowed.rs" >/dev/null 2>&1; [ $? -ne 0 ] && report ok release-refuses || report bad release-refuses "accepted"
 "$lust" check --sandbox --rustc "$root/tests/sandbox/allowed.rs" >/dev/null 2>&1; [ $? -ne 0 ] && report ok rustc-refuses || report bad rustc-refuses "accepted"

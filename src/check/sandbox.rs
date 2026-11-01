@@ -16,8 +16,8 @@
 //    hides it. These are the errors an author sees and can fix.
 // 2. Expand (expand/builtin.rs). `include!`, `include_str!` and
 //    `include_bytes!` read no file (L0532), and `env!`/`option_env!` see
-//    an empty client environment (protocol.rs), so a build copies no
-//    host file or variable into the program.
+//    no variable, so a build copies no host file or variable into the
+//    program. Cargo itself still runs with the caller's environment.
 // 3. Codegen (cgen.rs `intrinsic`). Every OS intrinsic of those families
 //    that any reachable std or adapter body calls becomes a stop
 //    (`lust_sandbox_deny`) ahead of the call. A path check cannot see

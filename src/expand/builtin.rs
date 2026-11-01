@@ -188,8 +188,8 @@ pub struct CfgEnv {
     /// in the host facts below.
     pub panic_unwind: bool,
     /// A `--sandbox` build of user code: `include!`, `include_str!` and
-    /// `include_bytes!` refuse to read a file (L0532). Shipped crates
-    /// never set it.
+    /// `include_bytes!` refuse to read a file (L0532), and `env!` and
+    /// `option_env!` see no variable. Shipped crates never set it.
     pub sandbox: bool,
 }
 
@@ -682,7 +682,10 @@ pub fn expand_builtin(st: &mut Expander, name: &str, call: &Call, depth: u32) ->
             let Some((var, _)) = literal_string(st, &expanded) else {
                 return Err(bad(format!("{name}! takes one string literal")));
             };
-            let value = st.env_lookup(&var);
+            // A `--sandbox` build sees no variable: the program cannot carry a
+            // host value in. Cargo and the compiler still run with the client's
+            // environment (they need its PATH).
+            let value = if st.ctx.cfg.sandbox { None } else { st.env_lookup(&var) };
             st.read_dep_env(&var, value.as_deref());
             match (name, value) {
                 ("env", Some(v)) => Ok(vec![st.str_tree(&v, span)]),

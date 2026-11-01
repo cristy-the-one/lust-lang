@@ -104,10 +104,7 @@ fn raise_stack_limit() {
 /// a copy of the whole env, which a front image save would write into the image (it writes
 /// every live heap block), secrets and all. A daemon request still carries its client's env.
 fn own_env(req: &mut driver::Request) {
-    // A `--sandbox` request keeps its empty env: `env!` must see no variable.
-    if !req.session.profile.sandbox {
-        req.client.env = None;
-    }
+    req.client.env = None;
 }
 
 /// The root file size from which a one-shot compile keeps transparent

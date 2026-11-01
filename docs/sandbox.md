@@ -24,7 +24,7 @@ Three layers, each enough for what it covers.
 | Layer | Where | What it refuses |
 |---|---|---|
 | Check | `src/check/sandbox.rs` | A user body that names `std::fs`, `std::net`, `std::env`, `std::os`, or `std::process` other than `exit`, `abort`, `ExitCode`, `Termination`, `id`, however a `use` spelled it (the resolver has already turned the path into one std name). A thread spawn in any form (`thread::spawn`, `thread::scope`, `Builder::spawn`, a scope's `spawn`), found by its resolved builtin. Error L0532 at the expression. |
-| Expand | `src/expand/builtin.rs`, `src/protocol.rs` | `include!`, `include_str!`, `include_bytes!` (L0532): a build copies no host file in. `env!` and `option_env!` see an empty environment. |
+| Expand | `src/expand/builtin.rs` | `include!`, `include_str!`, `include_bytes!` (L0532): a build copies no host file in. `env!` and `option_env!` see no variable. `cargo metadata` and the C compiler still run with the caller's environment (they need its `PATH`). |
 | Codegen | `src/cgen.rs` `intrinsic` | Every OS intrinsic of a refused family that a reachable std or adapter body calls gets `lust_sandbox_deny(family)` in front of it. The program prints `error[L0532]: this program was built with --sandbox and tried to use <family>` on stderr and exits with status 101 before the call runs. This covers routes check cannot see, such as `Path::exists` reaching `fs::metadata`. |
 
 The families are in `sandbox::intrinsic_family`. A unit test fails when a

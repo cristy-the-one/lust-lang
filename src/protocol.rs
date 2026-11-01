@@ -75,7 +75,7 @@ pub struct ProfileFlags {
     /// other OS service. Check refuses the std paths to the file system,
     /// the network, the environment, processes, OS extensions and thread
     /// spawning (L0532), `include!`, `include_str!` and `include_bytes!`
-    /// read no file, `env!` sees an empty environment, and codegen turns
+    /// read no file, `env!` sees no variable, and codegen turns
     /// every OS intrinsic a std body reaches into a stop (`lust_sandbox_deny`).
     /// Not a rustc flag: lust's own, for running untrusted generated code.
     pub sandbox: bool,
@@ -817,12 +817,7 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
         session.profile.debug_assertions = on;
     }
     session.profile.sandbox = sandbox;
-    // A sandboxed compile sees no environment: `env!` and `option_env!`
-    // read the client's, so the build cannot copy a host variable in.
-    let mut client = Client::current(&typed);
-    if sandbox {
-        client.env = Some(Vec::new());
-    }
+    let client = Client::current(&typed);
     let req = Request {
         cmd: if cmd == "check" { Cmd::Check } else { Cmd::Build },
         session,

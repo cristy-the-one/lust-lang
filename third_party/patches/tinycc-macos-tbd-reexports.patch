@@ -1,0 +1,75 @@
+--- a/tccmacho.c
++++ b/tccmacho.c
+@@ -2308,6 +2308,64 @@
+ }
+ #endif /* TCC_IS_NATIVE */
+ 
++/* Apple SDK .tbd stubs reexport libsystem_*.dylib and often list no
++   symbols of their own. The real dylibs live in the dyld shared cache,
++   so the sibling .tbd under the SDK's usr/lib is what a link can read.
++   TinyCC already follows LC_REEXPORT_DYLIB for real Mach-O files. */
++static void macho_tbd_reexports(TCCState *s1, const char *data, const char *filename, int lev)
++{
++    const char *dirend = strrchr(filename, '/');
++    int dirlen = dirend ? (int)(dirend - filename) : 0;
++    const char *scan = data;
++
++    while ((scan = strstr(scan, "libraries:"))) {
++        const char *end;
++        scan += 10; /* strlen("libraries:") */
++        end = strchr(scan, ']');
++        if (!end)
++            break;
++        while (scan < end) {
++            const char *q2, *rel;
++            char path[1024];
++            char sib[1024];
++            int fd, n;
++            char quote;
++            char *dot;
++            while (scan < end && *scan != '\'' && *scan != '"')
++                scan++;
++            if (scan >= end)
++                break;
++            quote = *scan++;
++            q2 = strchr(scan, quote);
++            if (!q2 || q2 > end)
++                break;
++            n = (int)(q2 - scan);
++            scan = q2 + 1;
++            if (n <= 0 || n >= (int)sizeof(path))
++                continue;
++            memcpy(path, q2 - n, n);
++            path[n] = 0;
++            rel = path;
++            if (!strncmp(path, "/usr/lib/", 9))
++                rel = path + 9;
++            if (snprintf(sib, sizeof(sib), "%.*s/%s", dirlen, filename, rel) >= (int)sizeof(sib))
++                continue;
++            dot = strrchr(sib, '.');
++            if (!dot)
++                continue;
++            if ((size_t)(dot - sib) + 5 >= sizeof(sib))
++                continue;
++            memcpy(dot, ".tbd", 5);
++            fd = open(sib, O_RDONLY | O_BINARY);
++            if (fd < 0)
++                continue;
++            macho_load_tbd(s1, fd, sib, lev + 1);
++            close(fd);
++        }
++        scan = end + 1;
++    }
++}
++
+ ST_FUNC int macho_load_tbd(TCCState* s1, int fd, const char* filename, int lev)
+ {
+     char *soname, *data, *pos;
+@@ -2323,6 +2381,7 @@
+     ret = 0;
+     if (tcc_add_dllref(s1, soname, lev)->found)
+         goto the_end;
++    macho_tbd_reexports(s1, data, filename, lev);
+     while(pos) {
+         char* sym = NULL;
+         int cont = 1;

@@ -134,13 +134,15 @@ jobs:
             dist/*.zip
             dist/*.sha256
 
-  # macOS is out of scope for now (tcc Mach-O, libbase.so, BSD userland).
-  # The job stays in the file so it can be turned back on by deleting `if: false`.
+  # GitHub-hosted macOS is arm64 (macos-latest). The old macos-13
+  # Intel image is retired, and this workflow has no macOS architecture
+  # matrix, so x86_64 macOS is not a hosted job. See the README.
   macos-arm64:
-    if: false
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install bash 5 and GNU userland
+        run: brew install bash coreutils findutils gnu-sed
       - name: Cache pinned tcc
         id: tcc
         uses: actions/cache@v4
@@ -148,12 +150,18 @@ jobs:
           path: |
             third_party/tcc
             third_party/tinycc
-          key: tcc-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-tcc.sh') }}
+          key: tcc-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-tcc.sh', 'third_party/patches/tinycc-macos-tbd-reexports.patch') }}
       - name: Build pinned tcc
         if: steps.tcc.outputs.cache-hit != 'true'
         run: scripts/build-tcc.sh
       - name: Install rustc 1.99
         run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.99.0
+            # shellcheck disable=SC1091
+            source "$HOME/.cargo/env"
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
           rustup set profile minimal
           rustup toolchain install 1.99.0
           rustup default 1.99.0
@@ -162,10 +170,22 @@ jobs:
         with:
           path: ~/.cargo/registry
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
-      # Known macOS risks, tracked outside this file: tcc Mach-O output,
-      # the hardcoded libbase.so name, and BSD userland differences in
-      # bench scripts. This job exists to find them; expect red at first.
       - name: Run CI gate
         env:
           LUST_TCC_HOME: ${{ github.workspace }}/third_party/tcc
+          LUST_GATE_FILTER: ${{ github.event.inputs.gate_filter }}
         run: bash scripts/ci.sh
+      - name: Publish gate failures
+        if: failure()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: bash scripts/publish-ci-failures.sh
+      - name: Upload gate failure list
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-failures-macos
+          path: ci-failures.txt
+          if-no-files-found: ignore

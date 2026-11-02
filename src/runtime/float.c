@@ -1673,11 +1673,68 @@ float log1pf(float x) {
     if (!ready) { fn = (float (*)(float))lust_ucrt_sym("log1pf"); ready = 1; }
     return fn ? fn(x) : logf(1.0f + x);
 }
-/* Rust's Windows std calls msvcrt's `_hypot` and `_hypotf` for hypot. */
-double __cdecl _hypot(double, double);
-float __cdecl _hypotf(float, float);
-double hypot(double x, double y) { return _hypot(x, y); }
-float hypotf(float x, float y) { return _hypotf(x, y); }
+/* rustc's std on x86_64-pc-windows-msvc imports its float maths from the
+   UCRT (api-ms-win-crt-math-l1-1-0.dll, which forwards to ucrtbase.dll):
+   sin, cos, ..., exp, log, pow and their f32 forms, and `_hypot`/`_hypotf`
+   for hypot. tcc's import library is msvcrt's, whose functions of the same
+   names are older code that differs from the UCRT's in the last bit on up
+   to 2.5% of inputs (sin, cos, tan, asin, acos, atan, atan2, sinh, cosh,
+   tanh, exp, log, log10, pow; tests/pass/float_maths_bits.rs). So these
+   names take ucrtbase's function, and msvcrt's only on a Windows without
+   the UCRT (before 10, without its update). */
+static void *lust_crt_sym(const char *name) {
+    void *p = lust_ucrt_sym(name);
+    if (!p) {
+        HMODULE h = GetModuleHandleA("msvcrt.dll");
+        if (!h) h = LoadLibraryA("msvcrt.dll");
+        p = h ? (void *)GetProcAddress(h, name) : 0;
+    }
+    return p;
+}
+#define LUST_CRT_MATH1(T, name, cname)                                  \
+    T name(T x) {                                                       \
+        static T (*fn)(T);                                              \
+        if (!fn) fn = (T (*)(T))lust_crt_sym(cname);                    \
+        return fn(x);                                                   \
+    }
+#define LUST_CRT_MATH2(T, name, cname)                                  \
+    T name(T x, T y) {                                                  \
+        static T (*fn)(T, T);                                           \
+        if (!fn) fn = (T (*)(T, T))lust_crt_sym(cname);                 \
+        return fn(x, y);                                                \
+    }
+LUST_CRT_MATH1(double, sin, "sin")
+LUST_CRT_MATH1(double, cos, "cos")
+LUST_CRT_MATH1(double, tan, "tan")
+LUST_CRT_MATH1(double, asin, "asin")
+LUST_CRT_MATH1(double, acos, "acos")
+LUST_CRT_MATH1(double, atan, "atan")
+LUST_CRT_MATH1(double, sinh, "sinh")
+LUST_CRT_MATH1(double, cosh, "cosh")
+LUST_CRT_MATH1(double, tanh, "tanh")
+LUST_CRT_MATH1(double, exp, "exp")
+LUST_CRT_MATH1(double, log, "log")
+LUST_CRT_MATH1(double, log10, "log10")
+LUST_CRT_MATH2(double, atan2, "atan2")
+LUST_CRT_MATH2(double, pow, "pow")
+LUST_CRT_MATH2(double, hypot, "_hypot")
+LUST_CRT_MATH1(float, sinf, "sinf")
+LUST_CRT_MATH1(float, cosf, "cosf")
+LUST_CRT_MATH1(float, tanf, "tanf")
+LUST_CRT_MATH1(float, asinf, "asinf")
+LUST_CRT_MATH1(float, acosf, "acosf")
+LUST_CRT_MATH1(float, atanf, "atanf")
+LUST_CRT_MATH1(float, sinhf, "sinhf")
+LUST_CRT_MATH1(float, coshf, "coshf")
+LUST_CRT_MATH1(float, tanhf, "tanhf")
+LUST_CRT_MATH1(float, expf, "expf")
+LUST_CRT_MATH1(float, logf, "logf")
+LUST_CRT_MATH1(float, log10f, "log10f")
+LUST_CRT_MATH2(float, atan2f, "atan2f")
+LUST_CRT_MATH2(float, powf, "powf")
+LUST_CRT_MATH2(float, hypotf, "_hypotf")
+#undef LUST_CRT_MATH1
+#undef LUST_CRT_MATH2
 double copysign(double x, double y) { return _copysign(x, y); }
 float copysignf(float x, float y) { return _copysignf(x, y); }
 float fabsf(float x) {

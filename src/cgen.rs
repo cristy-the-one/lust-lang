@@ -7653,6 +7653,22 @@ fn occt_extern(symbol: &str) -> &'static str {
             | B::FloatIsSignNegative
             | B::FloatToBits
             | B::FloatCopysign
+            | B::FloatSin
+            | B::FloatCos
+            | B::FloatTan
+            | B::FloatAsin
+            | B::FloatAcos
+            | B::FloatAtan
+            | B::FloatSinh
+            | B::FloatCosh
+            | B::FloatTanh
+            | B::FloatExp2
+            | B::FloatExpM1
+            | B::FloatLn1p
+            | B::FloatToRadians
+            | B::FloatToDegrees
+            | B::FloatAtan2
+            | B::FloatHypot
             | B::F32FromBits
             | B::F64FromBits => self.float_method_c(b, &vals, &tys),
             B::CharLenUtf8 => format!("((uint64_t)({0} < 0x80u ? 1 : {0} < 0x800u ? 2 : {0} < 0x10000u ? 3 : 4))", vals[0]),
@@ -10004,6 +10020,24 @@ fn occt_extern(symbol: &str) -> &'static str {
             B::FloatMin => format!("lust_{w}_min({a}, {})", vals[1]),
             B::FloatMax => format!("lust_{w}_max({a}, {})", vals[1]),
             B::FloatCopysign => format!("copysign{suf}({a}, {})", vals[1]),
+            B::FloatSin => format!("sin{suf}({a})"),
+            B::FloatCos => format!("cos{suf}({a})"),
+            B::FloatTan => format!("tan{suf}({a})"),
+            B::FloatAsin => format!("asin{suf}({a})"),
+            B::FloatAcos => format!("acos{suf}({a})"),
+            B::FloatAtan => format!("atan{suf}({a})"),
+            B::FloatSinh => format!("sinh{suf}({a})"),
+            B::FloatCosh => format!("cosh{suf}({a})"),
+            B::FloatTanh => format!("tanh{suf}({a})"),
+            B::FloatExp2 => format!("exp2{suf}({a})"),
+            B::FloatExpM1 => format!("expm1{suf}({a})"),
+            B::FloatLn1p => format!("log1p{suf}({a})"),
+            B::FloatAtan2 => format!("atan2{suf}({a}, {})", vals[1]),
+            B::FloatHypot => format!("hypot{suf}({a}, {})", vals[1]),
+            // std 1.99: f64 multiplies by `PI / 180.0` and `180.0 / PI`;
+            // f32 by `PI / 180.0` and the constant `PIS_IN_180`.
+            B::FloatToRadians => if f == FloatTy::F32 { format!("(({a}) * 0x1.1df46ap-6f)") } else { format!("(({a}) * 0x1.1df46a2529d39p-6)") },
+            B::FloatToDegrees => if f == FloatTy::F32 { format!("(({a}) * 0x1.ca5dc2p+5f)") } else { format!("(({a}) * 0x1.ca5dc1a63c1f8p+5)") },
             B::FloatIsNan => format!("({a} != {a})"),
             B::FloatIsInfinite => {
                 if f == FloatTy::F32 {

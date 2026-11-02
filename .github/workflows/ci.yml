@@ -137,6 +137,9 @@ jobs:
   # GitHub-hosted macOS is arm64 (macos-latest). The old macos-13
   # Intel image is retired, and this workflow has no macOS architecture
   # matrix, so x86_64 macOS is not a hosted job. See the README.
+  # A queued arm64 job that never gets a runner is cancelled after about
+  # 15 minutes ("not acquired by Runner of type hosted"). That is runner
+  # capacity, not a build failure; re-run the job.
   macos-arm64:
     runs-on: macos-latest
     steps:

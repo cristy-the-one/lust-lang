@@ -164,6 +164,11 @@ mod tests {
 
     /// Checks main of one sample file: (queue work count, error codes).
     fn check_main(src: &str) -> (usize, Vec<&'static str>) {
+        let (work, errs) = check_main_diags(src);
+        (work, errs.iter().map(|d| d.code).collect())
+    }
+
+    fn check_main_diags(src: &str) -> (usize, Vec<crate::diag::Diag>) {
         let interner = std::sync::Arc::new(Interner::default());
         let known = std::sync::Arc::new(Known::new(&interner));
         let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
@@ -171,7 +176,42 @@ mod tests {
         let ids = CrateIds { local: LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
         let program = collect::collect(std::sync::Arc::new(ast), interner.clone(), known.clone(), ids).unwrap();
         let (ck, errs) = check::check_fn(&program, program.main.unwrap());
-        (ck.queue_work, errs.iter().map(|d| d.code).collect())
+        (ck.queue_work, errs)
+    }
+
+    #[test]
+    fn missing_from_impl_names_source_type() {
+        let src = r#"
+            struct Json;
+            impl From<String> for Json {
+                fn from(value: String) -> Json { Json }
+            }
+            impl Json {
+                fn set<T: Into<Json>>(&mut self, name: &str, value: T) {}
+            }
+            fn main() {
+                let mut json = Json;
+                let tag = String::from("frog");
+                json.set("name", &tag);
+            }
+        "#;
+        for value in ["&tag", "&format!(\"{}\", tag)"] {
+            let (_, errs) = check_main_diags(&src.replace("&tag", value));
+            assert_eq!(errs.len(), 1, "{value}: {errs:?}");
+            assert_eq!(errs[0].code, "L0612");
+            assert_eq!(errs[0].message, "no impl of `From<&String>` for `Json`");
+        }
+        for value in ["tag", "format!(\"{}\", tag)"] {
+            let (_, errs) = check_main_diags(&src.replace("&tag", value));
+            assert!(errs.is_empty(), "owned String should work: {value}: {errs:?}");
+        }
+    }
+
+    #[test]
+    fn missing_impl_without_arguments_keeps_its_name() {
+        let (_, errs) = check_main_diags("trait Show {} struct S; fn need<T: Show>(x: T) {} fn main() { need(S); }");
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert_eq!(errs[0].message, "no impl of `Show` for `S`");
     }
 
     /// Selecting the same impl again for a queued obligation is not

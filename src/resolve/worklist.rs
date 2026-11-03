@@ -9633,3 +9633,21 @@ fn edit_distance(a: &str, b: &str) -> usize {
     }
     prev[b.len()]
 }
+
+#[cfg(test)]
+mod close_name_tests {
+    use super::{edit_distance, module_name_fix};
+
+    #[test]
+    fn a_misspelled_item_gets_the_closest_names_and_the_list() {
+        assert_eq!(edit_distance("hexa", "hex"), 1);
+        assert_eq!(edit_distance("", "abc"), 3);
+        assert_eq!(module_name_fix("hexa", "lattice", &["along", "hex", "rect"]), "Did you mean `hex`? `lattice` has: along, hex, rect.");
+        assert_eq!(module_name_fix("rectt", "geom2d", &["rect", "regular", "rounded_rect"]), "Did you mean `rect` or `regular`? `geom2d` has: rect, regular, rounded_rect.");
+        assert_eq!(module_name_fix("zzz", "m", &["a"]), "`m` has: a.");
+        assert_eq!(module_name_fix("x", "m", &[]), "Check the spelling, or import the item from the module that defines it.");
+        let many: Vec<String> = (0..30).map(|i| format!("f{i:02}")).collect();
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        assert!(module_name_fix("zzzz", "m", &refs).ends_with(", f23, and 6 more."));
+    }
+}

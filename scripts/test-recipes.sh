@@ -81,5 +81,15 @@ print(f"warm edit loop (bar, 27 edits): check {med(check):.1f} ms, build {med(bu
 print(f"new recipe in a warm slot (6 swaps): build {statistics.median(swap):.1f} ms")
 PYEOF
 [ $? -eq 0 ] && report ok warm-loop || report bad warm-loop "see above"
+
+# A misspelled item of a crate's module names the closest ones the module has, and what it has
+# (an agent fixes it in one round instead of guessing): `ops::hole_dwn` in the bar recipe.
+d=$work/r/bar
+cp "$d/src/main.rs" "$work/bar-main.rs"
+sed -i 's/ops::hole_down/ops::hole_dwn/' "$d/src/main.rs"
+out=$("$lust" check --sandbox --json "$d/src/main.rs" --manifest-path "$d/Cargo.toml" 2>&1)
+cp "$work/bar-main.rs" "$d/src/main.rs"
+if grep -q '"code":"L0101"' <<<"$out" && grep -q 'Did you mean `hole_down`' <<<"$out" && grep -q '`ops` has: ' <<<"$out"; then report ok close-names
+else report bad close-names "want L0101 naming hole_down, got: $(head -c 400 <<<"$out")"; fi
 echo "test-recipes: $pass passed, $fail failed"
 [ $fail -eq 0 ]

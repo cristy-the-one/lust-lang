@@ -6584,8 +6584,22 @@ impl Rewrite<'_> {
                 return None;
             }
             let in_module = names[..plen].iter().map(|s| self.interner.get(*s)).collect::<Vec<_>>().join("::");
+            // The names the module has in that namespace, and the closest to the one written, so a
+            // recipe author (or an agent) fixes the spelling in one round instead of guessing.
+            crate::resolve::mdr::read(m);
+            // Only what the path can reach: public items, and private ones inside the module itself.
+            let inside = self.tables.is_within(module, m);
+            let same_crate = self.tables.modules[module.0 as usize].krate_root == self.tables.modules[m.0 as usize].krate_root;
+            let mut have: Vec<&str> = self.tables.maps[m.0 as usize][ns_index(test_ns)]
+                .iter()
+                .filter(|(_, b)| inside || matches!(b, BindState::One(b) if b.vis == VisKind::Pub || (same_crate && b.vis == VisKind::Crate)))
+                .map(|(s, _)| self.interner.get(*s))
+                .filter(|n| !n.is_empty() && n.chars().all(|c| c == '_' || c.is_alphanumeric()) && !n.starts_with("__"))
+                .collect();
+            have.sort_unstable();
+            have.dedup();
             let seg = self.interner.get(seg);
-            let fix = "Check the spelling, or import the item from the module that defines it.";
+            let fix = module_name_fix(seg, &in_module, &have);
             return Some(if test_ns == Namespace::Value {
                 Diag::new("L0101", span, format!("cannot find value `{seg}` in module `{in_module}`"), fix)
             } else {
@@ -9574,4 +9588,48 @@ fn flatten_items_mods(
             }
         }
     }
+}
+
+/// The fix text for a name a module lacks: the closest names it has (an edit distance of at most a third of the
+/// name, or a shared prefix of three letters), then the names it has, at most 24.
+fn module_name_fix(seg: &str, in_module: &str, have: &[&str]) -> String {
+    let lower = seg.to_lowercase();
+    let limit = (seg.chars().count() / 3).max(1);
+    let mut close: Vec<(usize, &str)> = have
+        .iter()
+        .filter_map(|&n| {
+            let d = edit_distance(&lower, &n.to_lowercase());
+            let prefix = lower.len() >= 3 && n.to_lowercase().starts_with(&lower[..lower.char_indices().nth(3).map_or(lower.len(), |(i, _)| i)]);
+            (d <= limit || prefix).then_some((d, n))
+        })
+        .collect();
+    close.sort_unstable();
+    close.truncate(3);
+    let mut fix = String::new();
+    if !close.is_empty() {
+        let names: Vec<String> = close.iter().map(|(_, n)| format!("`{n}`")).collect();
+        fix.push_str(&format!("Did you mean {}? ", names.join(" or ")));
+    }
+    if have.is_empty() {
+        fix.push_str("Check the spelling, or import the item from the module that defines it.");
+    } else {
+        let shown: Vec<&str> = have.iter().take(24).copied().collect();
+        let more = if have.len() > shown.len() { format!(", and {} more", have.len() - shown.len()) } else { String::new() };
+        fix.push_str(&format!("`{in_module}` has: {}{more}.", shown.join(", ")));
+    }
+    fix
+}
+
+/// Levenshtein distance over chars.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut cur = vec![i + 1; b.len() + 1];
+        for (j, &cb) in b.iter().enumerate() {
+            cur[j + 1] = (prev[j] + usize::from(ca != cb)).min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        prev = cur;
+    }
+    prev[b.len()]
 }

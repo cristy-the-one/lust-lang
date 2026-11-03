@@ -5826,7 +5826,7 @@ impl<'p> Ctx<'p> {
                             // at exponential length: such a name is `_`.
                             let self_ty = self.resolve(self.tys.args(trait_ref.args)[0].as_ty().unwrap_or(ERROR));
                             let tn = if dropck::short_name(self.p, &self.tys, self_ty) == "_" { "_".to_string() } else { self.tn(self_ty) };
-                            let tr_name = self.trait_name(trait_ref.def);
+                            let tr_name = self.trait_ref_name(trait_ref);
                             self.err("L0612", span, format!("no impl of `{tr_name}` for `{tn}`"), "Add the impl, or change the bound.");
                         }
                         Selection::Overflow => {
@@ -5884,7 +5884,7 @@ impl<'p> Ctx<'p> {
                             Selection::Impl { .. } | Selection::ParamEvidence(_) | Selection::Builtin => {}
                             Selection::NoImpl => {
                                 let tn = self.tn(self.tys.args(trait_ref.args)[0].as_ty().unwrap_or(ERROR));
-                                let tr_name = self.trait_name(trait_ref.def);
+                                let tr_name = self.trait_ref_name(trait_ref);
                                 self.err("L0612", span, format!("no impl of `{tr_name}` for `{tn}`"), "Add the impl, or change the bound.");
                             }
                             _ => {
@@ -6240,6 +6240,30 @@ impl<'p> Ctx<'p> {
     /// The display name of a trait def, for obligation errors.
     fn trait_name(&self, def: DefId) -> String {
         self.p.gx.index.trait_record(def).map_or_else(|| "?".to_string(), |r| self.p.display_path(r.name))
+    }
+
+    /// Include the inputs of a failed obligation: `From<&String>` tells
+    /// the caller which conversion is missing. Self is printed separately.
+    fn trait_ref_name(&self, tr: TraitRef) -> String {
+        let name = self.trait_name(tr.def);
+        let args: Vec<String> = self.tys.args(tr.args).iter().skip(1)
+            .map(|arg| match *arg {
+                GenericArg::Ty(t) => {
+                    let t = self.resolve(t);
+                    // Keep the same size guard as the obligation's Self type.
+                    if dropck::short_name(self.p, &self.tys, t) == "_" { "_".to_string() } else { self.tn(t) }
+                }
+                GenericArg::Lifetime(Region::Static) => "'static".to_string(),
+                GenericArg::Lifetime(_) => "'_".to_string(),
+                GenericArg::Const(c) => match self.tys.const_kind(self.resolve_const(c)) {
+                    ConstKind::Int(n) => n.to_string(),
+                    ConstKind::Bool(b) => b.to_string(),
+                    ConstKind::Char(c) => format!("{c:?}"),
+                    ConstKind::Param(_) | ConstKind::Infer(_) => "_".to_string(),
+                },
+            })
+            .collect();
+        if args.is_empty() { name } else { format!("{name}<{}>", args.join(", ")) }
     }
 
     /// Replaces `_` markers in one resolved written type with

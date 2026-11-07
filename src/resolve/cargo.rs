@@ -1395,13 +1395,17 @@ pub fn select_unit(
         .or_else(|| graph.packages.iter().find(|p| p.manifest_path == req.manifest_path))
         .or_else(|| graph.packages.iter().find(|p| graph.workspace_members.contains(&p.id_repr)))
         .ok_or_else(|| format!("no package in the Cargo graph matches {}", req.manifest_path.display()))?;
-    let target = pkg
-        .targets
-        .iter()
-        .find(|t| {
-            t.name == target_name
-                && (t.kind.iter().any(|k| k == target_kind) || target_kind == "lib" && t.kind.iter().any(|k| k == "lib" || k == "rlib"))
-        })
+    // `--lib` selects the package's lib target by kind, not by name: a
+    // package has at most one, and Cargo names it after `[lib] name`, which
+    // defaults to the package name with `-` as `_`. Matching the package
+    // name failed for `foo-bar` packages and picked a bin named after the
+    // package when the lib was renamed (jmcdonald/lust-lang b1c95c0, issue #4).
+    // Other kinds, and a lib whose kinds are neither `lib` nor `rlib`, keep
+    // the name lookup.
+    let lib_by_kind =
+        if target_kind == "lib" { pkg.targets.iter().find(|t| t.kind.iter().any(|k| k == "lib" || k == "rlib")) } else { None };
+    let target = lib_by_kind
+        .or_else(|| pkg.targets.iter().find(|t| t.name == target_name && t.kind.iter().any(|k| k == target_kind)))
         .or_else(|| pkg.targets.iter().find(|t| t.name == target_name))
         .ok_or_else(|| format!("package `{}` has no {target_kind} target named `{target_name}`", pkg.name))?;
     let check_map = if features_follow_metadata(graph) { None } else { unit_features_via_check(req, graph) };
@@ -1733,6 +1737,63 @@ mod tests {
         )
         .unwrap();
         assert!(simple_path_graph(&req).is_none(), "a dev-dependency falls back to cargo metadata");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lib_target_is_selected_by_kind_not_package_name() {
+        // Cargo names the lib target after `[lib] name` (default: the
+        // package name with `-` as `_`), so `--lib` must not look the
+        // target up by the package name. Port of jmcdonald/lust-lang
+        // b1c95c0d5253ee60e286faaeada7c958f1e8b78e (Jeff McDonald, MIT).
+        let dir = std::env::temp_dir().join(format!("lust-cargo-libname-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let interner = crate::intern::Interner::default();
+        let env = CfgEnv::new("", &[], false, crate::protocol::ProfileFlags::DEV);
+        let graph_of = |name: &str, manifest: &str, files: &[(&str, &str)]| {
+            let pkg_dir = dir.join(name);
+            std::fs::create_dir_all(pkg_dir.join("src")).unwrap();
+            std::fs::write(pkg_dir.join("Cargo.toml"), manifest).unwrap();
+            for (file, text) in files {
+                let path = pkg_dir.join(file);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).unwrap();
+                }
+                std::fs::write(path, text).unwrap();
+            }
+            let req = GraphRequest {
+                manifest_path: pkg_dir.join("Cargo.toml"),
+                package: None,
+                features: vec![],
+                default_features: true,
+                all_features: false,
+                target_triple: String::new(),
+                cargo_net: crate::protocol::CargoNet { offline: true, locked: false },
+                env: None,
+            };
+            let graph = load_graph(&req).expect("cargo metadata on a temp package");
+            (graph, req)
+        };
+        // A hyphenated package: the lib target is `hyphen_lib`.
+        let (graph, req) = graph_of(
+            "hyphen-lib",
+            "[package]\nname = \"hyphen-lib\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
+            &[("src/lib.rs", "pub fn add(a: u32, b: u32) -> u32 { a + b }\n")],
+        );
+        let unit = select_unit(&graph, &req, "lib", "hyphen-lib", &env, &interner, false).expect("lib unit of a hyphenated package");
+        assert!(unit.target.kind.iter().any(|k| k == "lib"), "{:?}", unit.target.kind);
+        assert!(unit.target.src_path.ends_with("src/lib.rs"), "{}", unit.target.src_path.display());
+        // A renamed lib beside a bin named after the package: `--lib` is the lib.
+        let (graph, req) = graph_of(
+            "app",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[lib]\nname = \"app_lib\"\n\n[workspace]\n",
+            &[("src/lib.rs", "pub fn answer() -> u32 { 42 }\n"), ("src/main.rs", "fn main() { println!(\"{}\", app_lib::answer()); }\n")],
+        );
+        let lib = select_unit(&graph, &req, "lib", "app", &env, &interner, false).expect("renamed lib unit");
+        assert_eq!(lib.target.name, "app_lib");
+        assert!(lib.target.src_path.ends_with("src/lib.rs"), "{}", lib.target.src_path.display());
+        let bin = select_unit(&graph, &req, "bin", "app", &env, &interner, false).expect("bin unit");
+        assert!(bin.target.src_path.ends_with("src/main.rs"), "{}", bin.target.src_path.display());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -151,9 +151,27 @@ impl ExitStatus {
         if (((self.raw & 0x7f) + 1) as i8 >> 1) > 0 { Some(self.raw & 0x7f) } else { None }
     }
 
-    /// glibc's `WIFSTOPPED` then `WSTOPSIG` (`ExitStatusExt::stopped_signal`).
+    /// Darwin's `WIFCONTINUED`: a stop whose signal is `SIGCONT` (19).
+    /// Everywhere else it is the single status `0xffff`.
+    pub(crate) fn continued_raw(&self) -> bool {
+        if cfg!(target_os = "macos") { self.raw & 0x7f == 0x7f && self.raw >> 8 == 0x13 } else { self.raw == 0xffff }
+    }
+
+    /// `WIFSTOPPED` then `WSTOPSIG` (`ExitStatusExt::stopped_signal`).
+    /// Darwin looks at the low 7 bits and shifts the signed status, so
+    /// `0xff` is a stop by signal 0 and `-1` stays `-1`. A continue is
+    /// not a stop.
     pub(crate) fn stopped_raw(&self) -> Option<i32> {
-        if self.raw & 0xff == 0x7f { Some((self.raw >> 8) & 0xff) } else { None }
+        if self.continued_raw() {
+            return None;
+        }
+        if cfg!(target_os = "macos") {
+            if self.raw & 0x7f == 0x7f { Some(self.raw >> 8) } else { None }
+        } else if self.raw & 0xff == 0x7f {
+            Some((self.raw >> 8) & 0xff)
+        } else {
+            None
+        }
     }
 }
 
@@ -202,7 +220,7 @@ impl fmt::Display for ExitStatus {
             write!(f, "signal: {sig}{}{core}", name(sig))
         } else if let Some(sig) = self.stopped_raw() {
             write!(f, "stopped (not terminated) by signal: {sig}{}", name(sig))
-        } else if self.raw == 0xffff {
+        } else if self.continued_raw() {
             write!(f, "continued (WIFCONTINUED)")
         } else {
             write!(f, "unrecognised wait status: {} {:#x}", self.raw, self.raw)
@@ -979,7 +997,11 @@ impl fmt::Debug for Command {
             if let Some(cfg) = &self.stderr {
                 s.field("stderr", &Some(StdioField(cfg.kind)));
             }
-            s.field("create_pidfd", &false);
+            // `create_pidfd` is a Linux `Command` field. Darwin's Debug
+            // stops at the stdio streams.
+            if cfg!(target_os = "linux") {
+                s.field("create_pidfd", &false);
+            }
             return s.finish();
         }
         if let Some(cwd) = &self.cwd {

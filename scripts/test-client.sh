@@ -117,6 +117,10 @@ loads_base() {
     return
   fi
   local out
+  if [ "$(uname -s)" = Darwin ]; then
+    out=$(otool -L "$bin" 2>/dev/null) && [[ $out == *libbase* ]]
+    return
+  fi
   out=$(ldd "$bin" 2>/dev/null) && [[ $out == *libbase* ]]
 }
 wait_socket() { # wait_socket <dir> : true when the daemon socket appears
@@ -195,6 +199,13 @@ check "race: one daemon socket serves after" wait_socket "$d"
 if loads_base "$d/h"; then ok "race: warm build after the race"; else bad "race: warm build after the race" "no libbase.so"; fi
 stop_daemon "$d"; sleep 0.3
 
+# GNU stat (`stat -c %i`) is what Homebrew's gnubin provides, and the macOS
+# gate puts that ahead of BSD stat. BSD stat wants `stat -f %i`; GNU
+# `stat -f` is a filesystem query and treats `%i` as a path.
+inode_of() {
+  if stat --version >/dev/null 2>&1; then stat -c %i "$1"; else stat -f %i "$1"; fi
+}
+
 # The lock file is the single-daemon guarantee: whoever holds its flock owns the socket.
 # This is the race window frozen: a daemon holds the lock but its pid is not written yet
 # (the file still names the exited client that started it). A client must not replace the
@@ -219,17 +230,37 @@ except OSError:
     break
   done
   before=$(cat "$s.lock")
+elif [ "$(uname -s)" = Darwin ]; then
+  # BSD flock drops the lock when any descriptor of the file closes, so
+  # `flock 9; exec sleep` does not hold it. A Python process keeps one fd.
+  python3 -c 'import fcntl,time,sys
+f=open(sys.argv[1],"a+")
+fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+time.sleep(30)' "$s.lock" &
+  holder=$!
+  for i in $(seq 1 100); do
+    python3 -c 'import fcntl,sys
+f=open(sys.argv[1],"a+")
+try:
+    fcntl.flock(f.fileno(), fcntl.LOCK_EX|fcntl.LOCK_NB)
+    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    sys.exit(0)
+except OSError:
+    sys.exit(1)' "$s.lock" && sleep 0.05 && continue
+    break
+  done
+  ino=$(inode_of "$s.lock")
 else
   ( exec 9>>"$s.lock"; flock 9; exec sleep 30 ) & holder=$!
   for i in $(seq 1 100); do flock -n "$s.lock" true || break; sleep 0.05; done
-  ino=$(stat -c %i "$s.lock")
+  ino=$(inode_of "$s.lock")
 fi
 (cd "$d" && LUST_DAEMON_SOCKET=$s LUST_DAEMON_IDLE=5 "$lust" check hello.rs) >/dev/null 2>&1
 check "lockheld: client answers cold" test $? -eq 0
 if [ "$win" = 1 ]; then
   check "lockheld: a held lock file is never replaced" test "$(cat "$s.lock")" = "$before"
 else
-  check "lockheld: a held lock file is never replaced" test "$(stat -c %i "$s.lock")" = "$ino"
+  check "lockheld: a held lock file is never replaced" test "$(inode_of "$s.lock")" = "$ino"
 fi
 sleep 0.5
 if is_daemon_endpoint "$s"; then bad "lockheld: no second daemon starts" "socket exists"; else ok "lockheld: no second daemon starts"; fi
@@ -383,7 +414,14 @@ check "cache: hit build runs" test "$(runb "$d/h")" = "hello 42"
 run_lust check hello.rs --timings >/dev/null
 out=$(run_lust check hello.rs --timings)
 case "$out" in *"whole-request cache hit"*) ok "cache: second check hits";; *) bad "cache: second check hits" "no hit line";; esac
-sed -i 's/40 + 2/1 + 2/' "$d/hello.rs"
+case $(uname -s) in
+  Darwin)
+    # GNU sed (the CI userland) takes -i. BSD sed needs an empty backup suffix.
+    if sed --version >/dev/null 2>&1; then sed -i 's/40 + 2/1 + 2/' "$d/hello.rs"
+    else sed -i '' 's/40 + 2/1 + 2/' "$d/hello.rs"; fi
+    ;;
+  *) sed -i 's/40 + 2/1 + 2/' "$d/hello.rs" ;;
+esac
 out=$(run_lust build hello.rs -o h --timings)
 case "$out" in *"cache hit"*) bad "cache: edit misses" "reported a hit after an edit";; *) ok "cache: edit misses";; esac
 check "cache: edited build has new output" test "$(runb "$d/h")" = "hello 3"
@@ -411,7 +449,19 @@ done
 # The cap bounds what the last build did not write or use: a build never evicts the unit
 # objects it stored or took (a tsgo release holds about 1 GB of them, more than the default
 # cap) or its own whole-request entry, so those may pass the cap together.
-older=$(find "$d/c" -type f ! -newer "$d/mark" -printf '%s\n' | awk '{ s += $1 } END { print s + 0 }')
+case $(uname -s) in
+  Darwin)
+    older=$(python3 -c 'import os,sys
+root,mark=sys.argv[1],os.path.getmtime(sys.argv[2])
+s=0
+for dp,_,fns in os.walk(root):
+    for f in fns:
+        p=os.path.join(dp,f)
+        if os.path.getmtime(p)<=mark: s+=os.path.getsize(p)
+print(s)' "$d/c" "$d/mark")
+    ;;
+  *) older=$(find "$d/c" -type f ! -newer "$d/mark" -printf '%s\n' | awk '{ s += $1 } END { print s + 0 }') ;;
+esac
 if [ "$older" -le "$cap" ]; then ok "evict: entries older than the last build fit the cap ($older bytes)"; else bad "evict: entries older than the last build fit the cap" "$older bytes over cap $cap"; fi
 if [ -n "${first_entry:-}" ] && [ ! -e "$d/c/$first_entry" ]; then ok "evict: oldest entry deleted first"; else bad "evict: oldest entry deleted first" "$first_entry still present"; fi
 out=$(evict_run build f5.rs -o h5 --timings)

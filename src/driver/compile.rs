@@ -627,7 +627,18 @@ fn install_base(tmp: &Path, dest: &Path) -> Result<(), String> {
         return Ok(());
     }
     match std::fs::rename(tmp, dest) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            // tcc writes LC_ID_DYLIB as the temp path (or a padded
+            // placeholder). dyld loads that name, so after the rename the
+            // dylib's id has to be the final absolute path, then the file
+            // has to be signed again. Linux keeps the ELF soname tcc wrote.
+            #[cfg(target_os = "macos")]
+            if let Err(e) = crate::tcc::seal_macos_install_name(dest) {
+                let _ = std::fs::remove_file(dest);
+                return Err(e);
+            }
+            Ok(())
+        }
         Err(_) if dest.exists() => {
             let _ = std::fs::remove_file(tmp);
             Ok(())
@@ -647,8 +658,10 @@ fn record_base_user(base_dir: &Path, soname: &str, out: &Path) {
     }
 }
 
-/// Shared-library suffix: `.so` on Unix, `.dll` on Windows. tcc's PE linker
-/// records the dll name, and the loader finds it beside the executable.
+/// Shared-library suffix: `.so` on ELF, `.dylib` on macOS, `.dll` on
+/// Windows. tcc's Mach-O linker looks up `lib<name>.dylib`, and dyld
+/// refuses a file whose id still says `.so`. tcc's PE linker records the
+/// dll name, and the loader finds it beside the executable.
 /// Whether a warm (daemon) build links one static executable from the
 /// session's unit objects instead of a base library plus overlays. On
 /// Windows: an executable that reads data from a PE dll needs
@@ -664,7 +677,13 @@ fn static_warm() -> bool {
 }
 
 fn base_suffix() -> &'static str {
-    if cfg!(windows) { "dll" } else { "so" }
+    if cfg!(windows) {
+        "dll"
+    } else if cfg!(target_os = "macos") {
+        "dylib"
+    } else {
+        "so"
+    }
 }
 
 fn base_lib_name(base: &str) -> String {

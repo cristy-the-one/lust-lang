@@ -147,7 +147,7 @@ The daemon exits after 30 idle minutes (`LUST_DAEMON_IDLE`, for example `10m`; `
 
 ## Build and use
 
-Linux x86_64 and Windows x86_64 (MSVC, Windows 10 or 11, PowerShell 7). The daemon listens on a Unix socket on Linux and on `127.0.0.1` on Windows (the socket path is a one-line address file). macOS is in CI and is not part of this support claim.
+Linux x86_64, Windows x86_64 (MSVC, Windows 10 or 11, PowerShell 7), and macOS arm64 (Apple Silicon, macOS 14 or newer). The daemon listens on a Unix socket on Linux and macOS, and on `127.0.0.1` on Windows (the socket path is a one-line address file). macOS x86_64 is not in CI: GitHub no longer provides an Intel macOS runner, and this repo's workflow has no macOS architecture matrix.
 
 ### From the release
 
@@ -236,6 +236,55 @@ The zip contains `bin\lust.exe`, `bin\lust-core.exe`, the pinned `tcc.exe`, and 
 - `lust.exe` and `lust-core.exe` reserve a 256 MiB main-thread stack, the same room the compiler's worker threads get. The Windows default (1 MiB) is too small for the const evaluator.
 - The Windows C runtime loads a few Win32 entry points (`FlsAlloc`, `InitOnceExecuteOnce`, `CommandLineToArgvW`, and the Vista path APIs) with `GetProcAddress`, because the pinned TinyCC import libraries do not list them.
 - `std::net` sockets are not implemented on Windows yet: those calls fail with "not supported". The daemon does not use them.
+
+### macOS
+
+Apple Silicon (arm64), macOS 14 or newer. The commands are a terminal with the Xcode Command Line Tools. They build lust for the host, which on a current Mac is `aarch64-apple-darwin`.
+
+1. Install the Command Line Tools if `clang` is not already available: `xcode-select --install`. TinyCC reads the macOS SDK from that install.
+2. Install [rustup](https://rustup.rs/) and the 1.99 toolchain:
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh
+rustup toolchain install 1.99.0
+rustup default 1.99.0
+```
+
+3. Clone, build TinyCC, build lust, and run a program:
+
+```sh
+git clone https://github.com/cristy-the-one/lust-lang.git
+cd lust-lang
+git checkout next
+scripts/build-tcc.sh
+export LUST_TCC_HOME="$PWD/third_party/tcc"
+cargo build --release
+./target/release/lust --version
+printf 'fn main() { println!("hello {}", 40 + 2); }\n' > hello.rs
+./target/release/lust run hello.rs
+./target/release/lust check hello.rs
+```
+
+`lust run` prints `hello 42` and exits 0. The first command compiles cold and starts a background daemon. The second command is a warm check against that daemon. The daemon's log is `.lust-cache/daemon.log`. Delete `.lust-daemon-*.sock` in the current directory to stop it.
+
+`cargo test` is not the project gate. The gate needs bash 4 or newer and GNU find, sed, and coreutils (macOS ships bash 3.2 and BSD tools):
+
+```sh
+brew install bash coreutils findutils gnu-sed
+bash scripts/ci.sh
+```
+
+`scripts/ci.sh` puts those Homebrew tools on `PATH` and re-runs itself under Homebrew's bash when `/bin/bash` is too old.
+
+#### What changed for macOS
+
+- The dev backend stays TinyCC. On Darwin it writes Mach-O. `scripts/build-tcc.sh` applies one Darwin-only patch so SDK `.tbd` reexports (`libSystem`, `libc`, `libm`) resolve. Linux does not apply that patch.
+- Daemon incremental builds write `libbase-….dylib`. After the file is renamed to its content name, its `LC_ID_DYLIB` is rewritten to that absolute path and the file is signed again (`codesign -f -s -`). The executable records that path. Linux still uses `libbase-….so` and rpath.
+- The daemon watches its Unix socket with kqueue (`EVFILT_VNODE` on the parent directory). Deleting the socket stops it, as inotify does on Linux.
+- A one-shot `lust run` forks only when this process has a single Mach thread (`task_threads`). Otherwise it runs a temporary executable.
+- Float methods (`sin`, `cos`, and the rest) call the system libm, which is what rustc 1.99 uses on macOS. Results are compared to rustc on the same machine.
+- The front-image save (`LUST_FRONT_STATE`) stays Linux-only. Warm incremental checks in the daemon do not use it.
+- CI runs the same `scripts/ci.sh` gate on `macos-latest` (arm64). ASan is not run there. macOS x86_64 is not a hosted job.
 
 ### Use
 

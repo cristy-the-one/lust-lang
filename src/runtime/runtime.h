@@ -14,8 +14,8 @@
    clash with them, and the hand types (unsigned int key, int once with
    0 as its init) match glibc and musl on Linux. On Darwin they are
    wrong (the key is an unsigned long, the once is a 16-byte struct
-   whose valid init is not zero), so a Darwin build, which never uses
-   tcc, takes the real <pthread.h> types instead. */
+   whose valid init is not zero). Darwin, including the tcc dev
+   backend, takes the real <pthread.h> types instead. */
 #ifdef _WIN32
 /* A Fls index and an INIT_ONCE (a pointer word, zero-init). */
 typedef unsigned int lust_pthread_key_t;

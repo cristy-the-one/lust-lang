@@ -92,14 +92,14 @@ def main():
         # daemon's temp dir, so they survive the daemon (section 12).
         bases_dir = os.path.join(work, ".lust-cache", "bases")
 
-        base_ext = "dll" if os.name == "nt" else "so"
+        base_ext = "dll" if os.name == "nt" else "dylib" if sys.platform == "darwin" else "so"
         # Windows links warm builds statically (compile.rs `static_warm`;
         # LUST_STATIC_WARM selects it elsewhere): no base library, so the
         # checks on base files do not apply there.
         static_warm = os.name == "nt" or bool(os.environ.get("LUST_STATIC_WARM"))
 
         def base_of(binpath):
-            m = re.search(rb"libbase-\d+-[0-9a-f]+\.(?:so|dll)", open(binpath, "rb").read())
+            m = re.search(rb"libbase-\d+-[0-9a-f]+\.(?:so|dll|dylib)", open(binpath, "rb").read())
             return m.group(0).decode() if m else None
 
         def run_bin(path):

@@ -1110,12 +1110,22 @@ fn compute(
             // UnsafeCell<MaybeUninit<T>> }`.
             Some(BuiltinTy::Sync(crate::ty::sync::SyncTy::OnceLock)) => {
                 // The value is a `MaybeUninit<T>`: inhabited for any `T`.
+                // Linux `Once` is an `AtomicU32` futex. Darwin's is the
+                // queue `Once`: one atomic pointer (rustc 1.99).
                 let v = Layout { uninhabited: false, ..no_niche(go(tys, shapes, tys.adt_first_ty_arg(t).ok_or(())?, env, frames, memo, active)?) };
-                struct_layout(&[Layout::simple(4, 4, None), v], Repr::default())
+                let (once, once_align) = if cfg!(target_os = "macos") { (8, 8) } else { (4, 4) };
+                struct_layout(&[Layout::simple(once, once_align, None), v], Repr::default())
             }
             Some(BuiltinTy::Sync(k @ (crate::ty::sync::SyncTy::Mutex | crate::ty::sync::SyncTy::RwLock))) => {
                 let v = no_niche(go(tys, shapes, tys.adt_first_ty_arg(t).ok_or(())?, env, frames, memo, active)?);
-                let (state, state_align) = if k == crate::ty::sync::SyncTy::Mutex {
+                // Darwin (rustc 1.99): `sys::Mutex` is a `OnceBox` (a
+                // pointer to a pthread mutex) and `sys::RwLock` is the
+                // queue lock's atomic pointer. Both are 8/8, then the
+                // poison byte. Linux keeps a futex word, or two for
+                // `RwLock`. Windows `Mutex` is a `SmallFutex` (`AtomicU8`).
+                let (state, state_align) = if cfg!(target_os = "macos") {
+                    (8, 8)
+                } else if k == crate::ty::sync::SyncTy::Mutex {
                     if cfg!(windows) { (1, 1) } else { (4, 4) }
                 } else {
                     (8, 4)
@@ -1147,9 +1157,16 @@ fn compute(
                     BuiltinTy::Sync(SyncTy::Sender | SyncTy::SyncSender | SyncTy::Receiver) => {
                         return Ok(Layout::simple(16, 8, Some(Niche { offset: 0, scalar_size: 1, free: 253, start: 3 })));
                     }
-                    BuiltinTy::Sync(SyncTy::Condvar) => return Ok(Layout::simple(4, 4, None)),
-                    // { lock: Mutex<BarrierState>, cvar: Condvar, num_threads }.
-                    BuiltinTy::Sync(SyncTy::Barrier) => return Ok(Layout::simple(40, 8, None)),
+                    // Linux: a futex word (4/4). Darwin: `OnceBox` plus an
+                    // `AtomicUsize` (16/8), and `Option` keeps the tag niche.
+                    BuiltinTy::Sync(SyncTy::Condvar) => {
+                        let (sz, al) = if cfg!(target_os = "macos") { (16, 8) } else { (4, 4) };
+                        return Ok(Layout::simple(sz, al, None));
+                    }
+                    // `{ lock: Mutex<BarrierState>, cvar: Condvar, num_threads }`.
+                    // 40/8 on Linux. On Darwin the pointer-sized lock and the
+                    // 16-byte condvar make it 48/8 (rustc 1.99, arm64).
+                    BuiltinTy::Sync(SyncTy::Barrier) => return Ok(Layout::simple(if cfg!(target_os = "macos") { 48 } else { 40 }, 8, None)),
                     BuiltinTy::Sync(SyncTy::BarrierWaitResult) => return Ok(bool_layout()),
                     BuiltinTy::Iter(IterKind::Range) => {
                         let e = go(tys, shapes, arg(0).ok_or(())?, env, frames, memo, active)?;
@@ -1235,6 +1252,32 @@ mod tests {
     }
     fn sz(l: &Layout) -> (u64, u64) {
         (l.size, l.align)
+    }
+
+    /// Darwin's lock headers, as rustc 1.99 lays them out: a pointer
+    /// plus the poison byte for `Mutex`/`RwLock`, an 8-byte `Once`, and
+    /// `Barrier`'s non-poison lock (24) plus a 16-byte condvar (48).
+    #[test]
+    fn apple_sync_headers_match_rustc() {
+        let poison = Layout::simple(1, 1, None);
+        let state = Layout::simple(8, 8, None);
+        let byte = int_layout(IntTy::U8);
+        let mutex_u8 = struct_layout(&[state.clone(), poison, byte], Repr::default()).unwrap();
+        assert_eq!(sz(&mutex_u8), (16, 8));
+        let wide = Layout::simple(16, 16, None);
+        let mutex_u128 = struct_layout(&[state.clone(), Layout::simple(1, 1, None), wide], Repr::default()).unwrap();
+        assert_eq!(sz(&mutex_u128), (32, 16));
+        let us = int_layout(IntTy::Usize);
+        let barrier_state = struct_layout(&[us.clone(), us], Repr::default()).unwrap();
+        let lock = struct_layout(&[state, barrier_state], Repr::default()).unwrap();
+        assert_eq!(sz(&lock), (24, 8));
+        let condvar = Layout::simple(16, 8, None);
+        let barrier = struct_layout(&[lock, condvar, int_layout(IntTy::Usize)], Repr::default()).unwrap();
+        assert_eq!(sz(&barrier), (48, 8));
+        let once = Layout::simple(8, 8, None);
+        let zst = Layout { uninhabited: false, ..zst_layout(1) };
+        let once_lock = struct_layout(&[once, zst], Repr::default()).unwrap();
+        assert_eq!(sz(&once_lock), (8, 8));
     }
 
     #[test]

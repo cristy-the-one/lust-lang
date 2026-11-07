@@ -3,6 +3,7 @@
 #else
 /* Bodies of the std platform intrinsics declared in sys.h (W-SHIM). */
 #include <errno.h>
+#include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <dirent.h>
@@ -224,6 +225,32 @@ int32_t lust_sys_symlink(const uint8_t *a, uint64_t alen, const uint8_t *b, uint
 int32_t lust_sys_readlink(const uint8_t *p, uint64_t len, lust_Vec *out) {
     char *s = lust_sys_cstr(p, len);
     if (!s) return -1;
+#ifdef __APPLE__
+    /* `File`'s Debug reads `/proc/self/fd/N`. Darwin has no procfs;
+       `F_GETPATH` is the path rustc prints. */
+    if (len >= 14 && memcmp(s, "/proc/self/fd/", 14) == 0) {
+        int fd = 0;
+        int ok = 1;
+        for (char *c = s + 14; *c; c++) {
+            if (*c < '0' || *c > '9') {
+                ok = 0;
+                break;
+            }
+            fd = fd * 10 + (*c - '0');
+        }
+        if (ok && s[14] != '\0') {
+            char buf[1024];
+            if (fcntl(fd, F_GETPATH, buf) == 0) {
+                uint64_t n = strlen(buf);
+                lust_vec_reserve(out, n, 1, 1);
+                memcpy((uint8_t *)out->ptr + out->len, buf, (size_t)n);
+                out->len += n;
+                free(s);
+                return 0;
+            }
+        }
+    }
+#endif
     uint64_t cap = 256;
     for (;;) {
         char *buf = malloc(cap);

@@ -15,6 +15,26 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
 
+# macOS ships bash 3.2 and BSD userland. The gate's case runner needs
+# bash 4 (`declare -A`) plus GNU find, sed, and coreutils. Homebrew's
+# copies go first, and an old bash re-execs this script under the new one.
+if [ "$(uname -s)" = Darwin ]; then
+  if command -v brew >/dev/null 2>&1; then
+    _brew=$(brew --prefix)
+    export PATH="$_brew/opt/coreutils/libexec/gnubin:$_brew/opt/findutils/libexec/gnubin:$_brew/opt/gnu-sed/libexec/gnubin:$_brew/bin:$PATH"
+  fi
+  if [ -z "${LUST_BASH_REEXEC:-}" ] && [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+    _bash=$(command -v bash || true)
+    if [ -n "$_bash" ] && [ "$_bash" != "$BASH" ]; then
+      export LUST_BASH_REEXEC=1
+      exec "$_bash" "$0" "$@"
+    fi
+    echo "ci: macOS needs bash 4 or newer (brew install bash coreutils findutils gnu-sed)" >&2
+    exit 1
+  fi
+  unset _brew _bash
+fi
+
 step() { echo; echo "== ci: $1 =="; }
 
 # Windows Git Bash has no python3 on PATH (only python) and names the

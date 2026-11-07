@@ -245,10 +245,96 @@ fn watch_socket_removal(sock: &Path) -> i32 {
     }
 }
 
-/// Starts an inotify watch for deletion or move-away of `sock` from its
-/// parent directory and returns the watch fd, or -1 when the watch cannot
-/// be set up (the daemon then keeps the other exits). Linux only.
-#[cfg(not(target_os = "linux"))]
+/// One macOS kqueue declaration for the socket watch. Apple's `open` is
+/// variadic (`mode` when `O_CREAT`); rustc 1.99 denies a two-argument
+/// declaration of that runtime symbol. A second `kevent` with a different
+/// timeout pointer is a clashing extern, so both call sites share this one.
+#[cfg(target_os = "macos")]
+mod vnode_watch {
+    #[repr(C)]
+    pub struct Kevent {
+        pub ident: usize,
+        pub filter: i16,
+        pub flags: u16,
+        pub fflags: u32,
+        pub data: isize,
+        pub udata: *mut std::ffi::c_void,
+    }
+
+    #[repr(C)]
+    pub struct Timespec {
+        pub sec: i64,
+        pub nsec: i64,
+    }
+
+    unsafe extern "C" {
+        pub fn open(path: *const i8, flags: i32, ...) -> i32;
+        pub fn kqueue() -> i32;
+        pub fn kevent(
+            kq: i32,
+            changelist: *const Kevent,
+            nchanges: i32,
+            eventlist: *mut Kevent,
+            nevents: i32,
+            timeout: *const Timespec,
+        ) -> i32;
+        pub fn close(fd: i32) -> i32;
+    }
+}
+
+/// Watches the parent directory for a write or rename and returns the
+/// kqueue fd, or -1 when the watch cannot be set up. macOS has no inotify.
+/// The directory fd stays open for the daemon's life: closing it drops
+/// the vnode event. `O_EVTONLY` does not block unmount.
+#[cfg(target_os = "macos")]
+fn watch_socket_removal(sock: &Path) -> i32 {
+    use vnode_watch::{Kevent, close, kevent, kqueue, open};
+    const O_EVTONLY: i32 = 0x8000;
+    const EVFILT_VNODE: i16 = -4;
+    const EV_ADD: u16 = 0x1;
+    const EV_CLEAR: u16 = 0x20;
+    const NOTE_DELETE: u32 = 0x1;
+    const NOTE_WRITE: u32 = 0x2;
+    const NOTE_RENAME: u32 = 0x20;
+    const NOTE_REVOKE: u32 = 0x40;
+    let parent = match sock.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(parent) = std::ffi::CString::new(parent.as_os_str().as_bytes()) else { return -1 };
+    // SAFETY: open and kqueue take no borrowed memory past the call.
+    // kevent registers the directory fd; that fd is left open on purpose.
+    unsafe {
+        let dir = open(parent.as_ptr(), O_EVTONLY);
+        if dir < 0 {
+            return -1;
+        }
+        let kq = kqueue();
+        if kq < 0 {
+            close(dir);
+            return -1;
+        }
+        let change = Kevent {
+            ident: dir as usize,
+            filter: EVFILT_VNODE,
+            flags: EV_ADD | EV_CLEAR,
+            fflags: NOTE_DELETE | NOTE_WRITE | NOTE_RENAME | NOTE_REVOKE,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
+        if kevent(kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) < 0 {
+            close(kq);
+            close(dir);
+            return -1;
+        }
+        let _ = fcntl(kq, F_SETFD, FD_CLOEXEC);
+        kq
+    }
+}
+
+/// No socket-removal watch on this host. The daemon keeps the other exits.
+#[cfg(all(not(target_os = "linux"), not(target_os = "macos"), not(windows)))]
 fn watch_socket_removal(_sock: &Path) -> i32 {
     -1
 }
@@ -294,9 +380,28 @@ fn socket_removed(watch: i32, sock: &Path) -> bool {
     socket_removal_event(&buf[..n as usize], name.as_bytes()) || sock.symlink_metadata().is_err()
 }
 
-/// True when the watched socket was removed since the last call. macOS has
-/// no inotify watch; the file stays until the other exits.
-#[cfg(all(not(target_os = "linux"), not(windows)))]
+/// True when a vnode event has arrived and the socket path is gone.
+/// Unrelated writes in the directory are drained and then ignored.
+#[cfg(target_os = "macos")]
+fn socket_removed(watch: i32, sock: &Path) -> bool {
+    use vnode_watch::{Kevent, Timespec, kevent};
+    if watch < 0 {
+        return false;
+    }
+    let mut ev = Kevent { ident: 0, filter: 0, flags: 0, fflags: 0, data: 0, udata: std::ptr::null_mut() };
+    let timeout = Timespec { sec: 0, nsec: 0 };
+    // SAFETY: `watch` is the kqueue from `watch_socket_removal`. A zero
+    // timeout drains without blocking; the call writes one event.
+    let n = unsafe { kevent(watch, std::ptr::null(), 0, &mut ev, 1, &timeout) };
+    if n <= 0 {
+        return false;
+    }
+    while unsafe { kevent(watch, std::ptr::null(), 0, &mut ev, 1, &timeout) } > 0 {}
+    sock.symlink_metadata().is_err()
+}
+
+/// No socket-removal watch on this host.
+#[cfg(all(not(target_os = "linux"), not(target_os = "macos"), not(windows)))]
 fn socket_removed(_watch: i32, _sock: &Path) -> bool {
     false
 }

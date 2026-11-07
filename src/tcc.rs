@@ -340,7 +340,85 @@ fn link_executable(tcc: &Tcc, objs: &[PathBuf], out: &Path) -> Result<(), String
 /// Links object files into a shared library at `out`.
 pub fn link_shared(objs: &[PathBuf], out: &Path, debug: bool) -> Result<(), String> {
     let tcc = Tcc::new(TCC_OUTPUT_DLL, debug)?;
+    // The final base name includes a hash of these bytes, so the install
+    // name cannot be the final path yet. A 1024-byte placeholder reserves
+    // the LC_ID_DYLIB string slot (headers sit before file offset 4096);
+    // `seal_macos_install_name` writes the absolute path after the rename.
+    #[cfg(target_os = "macos")]
+    {
+        let opt = CString::new(format!("-install_name {}", "X".repeat(1024))).unwrap();
+        // SAFETY: valid state and a NUL-terminated option that outlives the call.
+        if unsafe { tcc_set_options(tcc.s, opt.as_ptr()) } != 0 {
+            return Err(tcc.fail("set the dylib install name"));
+        }
+    }
     link_objects(&tcc, objs, out)
+}
+
+/// Rewrites `LC_ID_DYLIB` in a just-renamed Mach-O dylib to its absolute
+/// path and signs it again. tcc's ad-hoc signature covers the placeholder
+/// name; dyld rejects the file after the load command changes.
+#[cfg(target_os = "macos")]
+pub fn seal_macos_install_name(path: &Path) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+    let abs = std::path::absolute(path).map_err(|e| format!("cannot resolve {}: {e}", path.display()))?;
+    let name = abs.as_os_str().as_bytes();
+    let mut bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    if bytes.len() < 32 || u32::from_le_bytes(bytes[0..4].try_into().unwrap()) != 0xfeed_facf {
+        return Err(format!("{} is not a 64-bit Mach-O dylib", path.display()));
+    }
+    let ncmds = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+    let mut off = 32usize;
+    let mut found = false;
+    for _ in 0..ncmds {
+        if off + 8 > bytes.len() {
+            return Err(format!("{} has a truncated Mach-O load command", path.display()));
+        }
+        let cmd = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+        let cmdsize = u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap()) as usize;
+        if cmdsize < 8 || off + cmdsize > bytes.len() {
+            return Err(format!("{} has a bad Mach-O command size", path.display()));
+        }
+        // LC_ID_DYLIB. The name offset is a u32 at command+8; the string
+        // occupies the rest of the command.
+        if cmd == 0x0d {
+            if cmdsize < 24 {
+                return Err(format!("{} has a short LC_ID_DYLIB", path.display()));
+            }
+            let name_off = u32::from_le_bytes(bytes[off + 8..off + 12].try_into().unwrap()) as usize;
+            if name_off >= cmdsize {
+                return Err(format!("{} has an LC_ID_DYLIB name past the command", path.display()));
+            }
+            let slot = &mut bytes[off + name_off..off + cmdsize];
+            if name.len() + 1 > slot.len() {
+                return Err(format!(
+                    "install name for {} is {} bytes and the Mach-O slot is {}",
+                    path.display(),
+                    name.len(),
+                    slot.len()
+                ));
+            }
+            slot.fill(0);
+            slot[..name.len()].copy_from_slice(name);
+            found = true;
+            break;
+        }
+        off += cmdsize;
+    }
+    if !found {
+        return Err(format!("{} has no LC_ID_DYLIB", path.display()));
+    }
+    std::fs::write(path, &bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    let signed = std::process::Command::new("codesign").args(["-f", "-s", "-"]).arg(path).output();
+    match signed {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => Err(format!(
+            "codesign {} failed: {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+        Err(e) => Err(format!("cannot run codesign: {e}")),
+    }
 }
 
 /// Links an executable from `objs` plus `<dir>/lib<base>.so`, which it loads at run time.
@@ -360,7 +438,13 @@ pub fn link_with_base(objs: &[PathBuf], dir: &Path, base: &str, out: &Path, debu
         unsafe { tcc_set_options(tcc.s, rpath.as_ptr()) };
     }
     let lib_name = CString::new(base).unwrap();
-    let suffix = if cfg!(windows) { "dll" } else { "so" };
+    let suffix = if cfg!(windows) {
+        "dll"
+    } else if cfg!(target_os = "macos") {
+        "dylib"
+    } else {
+        "so"
+    };
     // SAFETY: valid state and NUL-terminated strings that outlive the calls.
     unsafe {
         tcc_add_library_path(tcc.s, cstr(dir).as_ptr());
@@ -630,6 +714,8 @@ fn run_in_child(units: &[(PathBuf, String)], runtime_obj: &Path, argv: &[String]
 /// moment while it exits, so this waits up to 50 ms for the list to settle.
 /// False when the list cannot be read. Other Unix targets have no such list
 /// and return true: there the pins in `run_in_memory`'s contract must hold.
+/// macOS asks `task_threads` and returns false when that call fails, so a
+/// fork falls back to the file run instead of cloning extra threads.
 #[cfg(unix)]
 fn lone_thread() -> bool {
     #[cfg(target_os = "linux")]
@@ -648,7 +734,36 @@ fn lone_thread() -> bool {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            static mach_task_self_: u32;
+            fn task_threads(task: u32, list: *mut *mut u32, count: *mut u32) -> i32;
+            fn vm_deallocate(target: u32, address: usize, size: usize) -> i32;
+        }
+        let start = std::time::Instant::now();
+        loop {
+            let n = unsafe {
+                let task = mach_task_self_;
+                let mut list: *mut u32 = std::ptr::null_mut();
+                let mut count: u32 = 0;
+                if task_threads(task, &mut list, &mut count) != 0 || list.is_null() {
+                    return false;
+                }
+                let n = count;
+                let _ = vm_deallocate(task, list as usize, count as usize * std::mem::size_of::<u32>());
+                n
+            };
+            if n <= 1 {
+                return true;
+            }
+            if start.elapsed() > std::time::Duration::from_millis(500) {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
     true
 }
 

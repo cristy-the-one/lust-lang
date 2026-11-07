@@ -755,6 +755,10 @@ fn parse_command(args: &[String]) -> Option<Invocation> {
         return None;
     }
     let abs = |p: &Path| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+    // Cargo canonicalizes `--manifest-path`, so `../b/Cargo.toml` names the
+    // same file metadata reports. `canonicalize` adds the Windows `\\?\`
+    // prefix; `select_unit` canonicalizes both sides before comparing.
+    let manifest_abs = |p: &Path| p.canonicalize().unwrap_or_else(|_| abs(p));
     // Release and the rustc oracle are build/check-only, with no extra lust flags.
     // Crate-selection flags are lust dev flags today: reject them there rather
     // than build a different crate selection than the user named.
@@ -773,7 +777,7 @@ fn parse_command(args: &[String]) -> Option<Invocation> {
         let typed = file.clone();
         let file = abs(&file);
         if let Some(p) = crate_flags.manifest_path.take() {
-            crate_flags.manifest_path = Some(abs(&p));
+            crate_flags.manifest_path = Some(manifest_abs(&p));
         }
         let profile_name = profile.as_deref().unwrap_or("release");
         let manifest = crate_flags.manifest_path.clone().or_else(|| find_manifest(&file).map(|m| m.path));
@@ -838,7 +842,7 @@ fn parse_command(args: &[String]) -> Option<Invocation> {
     let typed = file.clone();
     let file = abs(&file);
     if let Some(p) = crate_flags.manifest_path.take() {
-        crate_flags.manifest_path = Some(abs(&p));
+        crate_flags.manifest_path = Some(manifest_abs(&p));
     }
     let mut session = session_key_for(&file, crate_flags, net);
     if let Some(abort) = panic_abort {
@@ -1846,9 +1850,11 @@ mod tests {
             "--features",
             "zest",
         ]);
-        assert_eq!(req.session.krate.package_id, format!("widget 1.2.3 (path+file://{})", dir.display()));
+        let canon = dir.join("Cargo.toml").canonicalize().unwrap_or_else(|_| dir.join("Cargo.toml"));
+        let canon_dir = canon.parent().unwrap_or(&dir);
+        assert_eq!(req.session.krate.package_id, format!("widget 1.2.3 (path+file://{})", canon_dir.display()));
         assert_eq!((req.session.krate.target_kind.as_str(), req.session.krate.target_name.as_str()), ("bin", "widget"));
-        assert_eq!(req.session.krate.manifest_path.as_deref(), Some(dir.join("Cargo.toml").as_path()));
+        assert_eq!(req.session.krate.manifest_path.as_deref(), Some(canon.as_path()));
         let lib = compile_req(&["check", main_rs.to_str().unwrap(), "--package", "widget", "--lib"]);
         assert_eq!((lib.session.krate.target_kind.as_str(), lib.session.krate.target_name.as_str()), ("lib", "widget"));
         let _ = std::fs::remove_dir_all(&dir);

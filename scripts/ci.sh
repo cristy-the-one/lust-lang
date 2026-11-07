@@ -33,6 +33,9 @@ if [ "$(uname -s)" = Darwin ]; then
     exit 1
   fi
   unset _brew _bash
+  # The main thread's stack is this limit. The deep-chain cases fit in
+  # Linux's 8 MiB and overflow the same default on arm64.
+  ulimit -s 65532 || ulimit -s 32768 || true
 fi
 
 step() { echo; echo "== ci: $1 =="; }

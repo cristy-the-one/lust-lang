@@ -199,6 +199,13 @@ check "race: one daemon socket serves after" wait_socket "$d"
 if loads_base "$d/h"; then ok "race: warm build after the race"; else bad "race: warm build after the race" "no libbase.so"; fi
 stop_daemon "$d"; sleep 0.3
 
+# GNU stat (`stat -c %i`) is what Homebrew's gnubin provides, and the macOS
+# gate puts that ahead of BSD stat. BSD stat wants `stat -f %i`; GNU
+# `stat -f` is a filesystem query and treats `%i` as a path.
+inode_of() {
+  if stat --version >/dev/null 2>&1; then stat -c %i "$1"; else stat -f %i "$1"; fi
+}
+
 # The lock file is the single-daemon guarantee: whoever holds its flock owns the socket.
 # This is the race window frozen: a daemon holds the lock but its pid is not written yet
 # (the file still names the exited client that started it). A client must not replace the
@@ -242,20 +249,18 @@ except OSError:
     sys.exit(1)' "$s.lock" && sleep 0.05 && continue
     break
   done
-  ino=$(stat -f %i "$s.lock")
+  ino=$(inode_of "$s.lock")
 else
   ( exec 9>>"$s.lock"; flock 9; exec sleep 30 ) & holder=$!
   for i in $(seq 1 100); do flock -n "$s.lock" true || break; sleep 0.05; done
-  ino=$(stat -c %i "$s.lock")
+  ino=$(inode_of "$s.lock")
 fi
 (cd "$d" && LUST_DAEMON_SOCKET=$s LUST_DAEMON_IDLE=5 "$lust" check hello.rs) >/dev/null 2>&1
 check "lockheld: client answers cold" test $? -eq 0
 if [ "$win" = 1 ]; then
   check "lockheld: a held lock file is never replaced" test "$(cat "$s.lock")" = "$before"
-elif [ "$(uname -s)" = Darwin ]; then
-  check "lockheld: a held lock file is never replaced" test "$(stat -f %i "$s.lock")" = "$ino"
 else
-  check "lockheld: a held lock file is never replaced" test "$(stat -c %i "$s.lock")" = "$ino"
+  check "lockheld: a held lock file is never replaced" test "$(inode_of "$s.lock")" = "$ino"
 fi
 sleep 0.5
 if is_daemon_endpoint "$s"; then bad "lockheld: no second daemon starts" "socket exists"; else ok "lockheld: no second daemon starts"; fi

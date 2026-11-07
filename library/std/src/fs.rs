@@ -576,10 +576,14 @@ impl PartialEq for FileType {
     }
 }
 
-/// Std hashes the type bits as a `mode_t` (`u32` on Linux).
+/// Std hashes the type bits as a `mode_t` (`u32` on Linux, `u16` on Darwin).
 impl core::hash::Hash for FileType {
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
-        self.masked().hash(state);
+        if cfg!(target_os = "macos") {
+            (self.masked() as u16).hash(state);
+        } else {
+            self.masked().hash(state);
+        }
     }
 }
 

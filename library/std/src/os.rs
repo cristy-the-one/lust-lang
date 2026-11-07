@@ -397,7 +397,7 @@ pub mod unix {
         }
 
         /// Unix-specific extensions to `fs::Permissions`: the raw mode
-        /// bits, as std keeps them (`mode_t`, no masking).
+        /// bits, as std keeps them (`mode_t`). Darwin's `mode_t` is 16 bits.
         pub trait PermissionsExt {
             fn mode(&self) -> u32;
             fn set_mode(&mut self, mode: u32);
@@ -406,18 +406,24 @@ pub mod unix {
 
         impl PermissionsExt for crate::fs::Permissions {
             fn mode(&self) -> u32 {
-                self.mode as u32
+                unix_mode(self.mode as u32)
             }
             fn set_mode(&mut self, mode: u32) {
-                self.mode = mode as u64;
+                self.mode = unix_mode(mode) as u64;
             }
             fn from_mode(mode: u32) -> crate::fs::Permissions {
                 crate::fs::Permissions {
-                    mode: mode as u64,
+                    mode: unix_mode(mode) as u64,
                     #[cfg(windows)]
                     attrs: 0,
                 }
             }
+        }
+
+        /// Darwin's `mode_t` is 16 bits, so `from_mode(u32::MAX)` is
+        /// `0o177777`. Linux keeps the full `u32`.
+        fn unix_mode(mode: u32) -> u32 {
+            if cfg!(target_os = "macos") { mode & 0xffff } else { mode }
         }
 
         /// Unix-specific extensions to `fs::Metadata`: the raw
@@ -609,7 +615,7 @@ pub mod unix {
                 self.stopped_raw()
             }
             fn continued(&self) -> bool {
-                self.raw() == 0xffff
+                self.continued_raw()
             }
             fn into_raw(self) -> i32 {
                 self.raw()

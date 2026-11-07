@@ -100,21 +100,29 @@ fn main() {
         println!("{} {}", h.starts_with(p), h.ends_with(p));
     }
 
-    // Float min and max: NaN, signed zeros, infinities.
+    // Float min and max: NaN, infinities, and which finite value wins.
+    // `f64::min`/`max` are `minimumNumber`/`maximumNumber` with the nsz
+    // exception: of `+0.0` and `-0.0`, either sign may come back, and
+    // arm64 does not pick the one x86_64 picks. Zeros are printed positive.
+    let show64 = |v: f64| {
+        let v = if v == 0.0 { 0.0 } else { v };
+        format!("{v:?}{}", if v.is_sign_negative() { "-" } else { "" })
+    };
     let vals = [0.0f64, -0.0, 1.5, -2.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY];
     for &x in &vals {
         let row: Vec<String> = vals
             .iter()
             .map(|&y| {
                 let (lo, hi) = (black_box(x).min(y), black_box(x).max(y));
-                format!("{lo:?}{} {hi:?}{}", if lo.is_sign_negative() { "-" } else { "" }, if hi.is_sign_negative() { "-" } else { "" })
+                format!("{} {}", show64(lo), show64(hi))
             })
             .collect();
         println!("{}", row.join(" "));
     }
+    let show32 = |v: f32| if v == 0.0 { 0.0 } else { v };
     let fs = [0.0f32, -0.0, f32::NAN, 2.5];
     for &x in &fs {
-        let row: Vec<String> = fs.iter().map(|&y| format!("{:?} {:?}", black_box(x).min(y), black_box(x).max(y))).collect();
+        let row: Vec<String> = fs.iter().map(|&y| format!("{:?} {:?}", show32(black_box(x).min(y)), show32(black_box(x).max(y)))).collect();
         println!("{}", row.join(" "));
     }
 

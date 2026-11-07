@@ -146,6 +146,7 @@ corpus_crate_one() {
     corpus_report bad "$pkg/$name" "missing expected stdout file ${expected##*/}"
     return
   fi
+  local want=$expected
   if [ -z "$reject" ]; then
     timeout "$run_timeout" "$proj/target/debug/$name" >"$proj/$name.out" 2>"$proj/$name.err"
     local status=$?
@@ -156,8 +157,8 @@ corpus_crate_one() {
     if ! cmp -s "$expected" "$proj/$name.out"; then
       # The pinned file is the x86_64 snapshot (Linux and Windows). libm
       # 0.2.16 lowers sqrt and fma to NEON on aarch64, so the real crate's
-      # bits can differ there without the snapshot being stale. Lust's
-      # adapter is still compared to the pin below.
+      # bits can differ there without the snapshot being stale. Lust is
+      # compared to this host's crate, which is the oracle that ran.
       case "$(uname -m)" in
         x86_64|amd64)
           corpus_report bad "$pkg/$name" "stdout of the real crate differs from ${expected##*/}:"
@@ -165,7 +166,8 @@ corpus_crate_one() {
           return
           ;;
         *)
-          echo "note: $pkg/$name real-crate stdout differs from the pinned file on $(uname -s) $(uname -m); lust is compared to the pin"
+          echo "note: $pkg/$name real-crate stdout differs from the pinned file on $(uname -s) $(uname -m); lust is compared to this host's crate"
+          want=$proj/$name.out
           ;;
       esac
     fi
@@ -204,8 +206,9 @@ corpus_crate_one() {
   fi
   timeout "$run_timeout" "$proj/$name.lust" >"$proj/$name.lust.out" 2>/dev/null
   status=$?
-  if [ $status -ne 0 ] || ! cmp -s "$expected" "$proj/$name.lust.out"; then
+  if [ $status -ne 0 ] || ! cmp -s "$want" "$proj/$name.lust.out"; then
     corpus_lust_note wrong "$pkg/$name" "lust output differs from the real crate (exit $status)"
+    diff "$want" "$proj/$name.lust.out" | head -10
     return
   fi
   if [ "${SANITIZE:-0}" = 1 ]; then

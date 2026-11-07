@@ -33,10 +33,12 @@ def run(cmd, cwd, env, timeout=60):
     return r.returncode, r.stdout, r.stderr
 
 
-# A Unix socket path holds at most 107 bytes (sun_path). A work dir under a long TMPDIR (a local
-# gate slot's /home/theo/lust-scratch/gate-tmp/<pkg>/lane-<x>) plus a scenario's name in its
-# prefix passes that, and the daemon cannot bind: "daemon start failed".
-SUN_PATH_MAX = 107
+# A Unix socket path has to fit in sun_path, NUL included: 108 bytes on
+# Linux (107 of path) and 104 on Darwin (103 of path). A work dir under a
+# long TMPDIR plus the scenario name passes that, and the daemon cannot
+# bind: "daemon start failed". Paths in the gap used to be handed to the
+# kernel anyway, which is the macOS arm64 band of start failures.
+SUN_PATH_MAX = 103 if sys.platform == "darwin" else 107
 
 
 def sock_path(work):

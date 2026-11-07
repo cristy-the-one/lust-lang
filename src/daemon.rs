@@ -245,27 +245,50 @@ fn watch_socket_removal(sock: &Path) -> i32 {
     }
 }
 
+/// One macOS kqueue declaration for the socket watch. Apple's `open` is
+/// variadic (`mode` when `O_CREAT`); rustc 1.99 denies a two-argument
+/// declaration of that runtime symbol. A second `kevent` with a different
+/// timeout pointer is a clashing extern, so both call sites share this one.
+#[cfg(target_os = "macos")]
+mod vnode_watch {
+    #[repr(C)]
+    pub struct Kevent {
+        pub ident: usize,
+        pub filter: i16,
+        pub flags: u16,
+        pub fflags: u32,
+        pub data: isize,
+        pub udata: *mut std::ffi::c_void,
+    }
+
+    #[repr(C)]
+    pub struct Timespec {
+        pub sec: i64,
+        pub nsec: i64,
+    }
+
+    unsafe extern "C" {
+        pub fn open(path: *const i8, flags: i32, ...) -> i32;
+        pub fn kqueue() -> i32;
+        pub fn kevent(
+            kq: i32,
+            changelist: *const Kevent,
+            nchanges: i32,
+            eventlist: *mut Kevent,
+            nevents: i32,
+            timeout: *const Timespec,
+        ) -> i32;
+        pub fn close(fd: i32) -> i32;
+    }
+}
+
 /// Watches the parent directory for a write or rename and returns the
 /// kqueue fd, or -1 when the watch cannot be set up. macOS has no inotify.
 /// The directory fd stays open for the daemon's life: closing it drops
 /// the vnode event. `O_EVTONLY` does not block unmount.
 #[cfg(target_os = "macos")]
 fn watch_socket_removal(sock: &Path) -> i32 {
-    #[repr(C)]
-    struct Kevent {
-        ident: usize,
-        filter: i16,
-        flags: u16,
-        fflags: u32,
-        data: isize,
-        udata: *mut std::ffi::c_void,
-    }
-    unsafe extern "C" {
-        fn open(path: *const i8, flags: i32) -> i32;
-        fn kqueue() -> i32;
-        fn kevent(kq: i32, changelist: *const Kevent, nchanges: i32, eventlist: *mut Kevent, nevents: i32, timeout: *const std::ffi::c_void) -> i32;
-        fn close(fd: i32) -> i32;
-    }
+    use vnode_watch::{Kevent, close, kevent, kqueue, open};
     const O_EVTONLY: i32 = 0x8000;
     const EVFILT_VNODE: i16 = -4;
     const EV_ADD: u16 = 0x1;
@@ -361,23 +384,7 @@ fn socket_removed(watch: i32, sock: &Path) -> bool {
 /// Unrelated writes in the directory are drained and then ignored.
 #[cfg(target_os = "macos")]
 fn socket_removed(watch: i32, sock: &Path) -> bool {
-    #[repr(C)]
-    struct Kevent {
-        ident: usize,
-        filter: i16,
-        flags: u16,
-        fflags: u32,
-        data: isize,
-        udata: *mut std::ffi::c_void,
-    }
-    #[repr(C)]
-    struct Timespec {
-        sec: i64,
-        nsec: i64,
-    }
-    unsafe extern "C" {
-        fn kevent(kq: i32, changelist: *const Kevent, nchanges: i32, eventlist: *mut Kevent, nevents: i32, timeout: *const Timespec) -> i32;
-    }
+    use vnode_watch::{Kevent, Timespec, kevent};
     if watch < 0 {
         return false;
     }

@@ -78,7 +78,8 @@ fn daemon_alloc_env() -> Vec<(&'static str, &'static str)> {
 /// Starts `lust-core daemon` detached (its own session, output to the log file), unless
 /// autostart is off or another client or daemon already claims this socket. The current
 /// command is still answered cold by the caller; the next one finds the daemon warm.
-fn maybe_autostart(sock: &Path, file: &Path, core: &Path) {
+/// `prewarm`: the daemon checks `file` first (as a one-file program), once this process exits.
+fn maybe_autostart(sock: &Path, file: &Path, core: &Path, prewarm: bool) {
     if env_on("LUST_NO_DAEMON") || protocol::source_override().is_some() {
         return;
     }
@@ -92,11 +93,10 @@ fn maybe_autostart(sock: &Path, file: &Path, core: &Path) {
     // The daemon pre-warms a session for this file, so the next command is warm. It
     // waits for this process to exit first (exec keeps the pid, so that is the cold
     // compile), so the pre-warm never competes with the command in front of it.
-    cmd.arg("daemon")
-        .envs(daemon_alloc_env())
-        .env("LUST_DAEMON_PREWARM", file)
-        .env("LUST_DAEMON_PREWARM_AFTER", std::process::id().to_string())
-        .stdin(std::process::Stdio::null());
+    cmd.arg("daemon").envs(daemon_alloc_env()).stdin(std::process::Stdio::null());
+    if prewarm {
+        cmd.env("LUST_DAEMON_PREWARM", file).env("LUST_DAEMON_PREWARM_AFTER", std::process::id().to_string());
+    }
     #[cfg(unix)]
     {
         cmd.env("LUST_DAEMON_LOCK_FD", lock_fd.to_string());
@@ -186,7 +186,18 @@ fn main() {
             }
             // No daemon answered: start one for the next command, answer this one cold.
             log_route("cold", &req.out);
-            maybe_autostart(&sock, &req.file, &core);
+            maybe_autostart(&sock, &req.file, &core, true);
+            let mut cmd = std::process::Command::new(&core);
+            cmd.args(&args);
+            replace_with(&mut cmd, &core);
+        }
+        // `lust test` of a Cargo target sends its build to a daemon
+        // (src/testrun/krate.rs): start one for the next run. No pre-warm:
+        // a check of the root as a one-file program is not the test build.
+        _ if args.first().map(String::as_str) == Some("test") && args.iter().any(|a| a == "--manifest-path" || a.starts_with("--manifest-path=")) => {
+            if let Some(file) = args.get(1) {
+                maybe_autostart(&protocol::socket_path(), Path::new(file), &core, false);
+            }
             let mut cmd = std::process::Command::new(&core);
             cmd.args(&args);
             replace_with(&mut cmd, &core);

@@ -1941,6 +1941,7 @@ mod tests {
                 target_triple: String::new(),
                 cargo_net: crate::protocol::CargoNet { offline: true, locked: false },
                 env: None,
+                cache_dir: None,
             };
             let graph = load_graph(&req).expect("cargo metadata on a temp package");
             (graph, req)

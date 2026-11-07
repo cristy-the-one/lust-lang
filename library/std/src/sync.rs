@@ -85,8 +85,10 @@ impl<T: core::fmt::Debug, F> core::fmt::Debug for LazyLock<T, F> {
 /// `OnceLock<()>`, so a second caller blocks until the first run ends.
 /// A run that panics leaves the lock empty and `poisoned` set: the next
 /// `call_once` runs the closure below again, which panics as std's
-/// poisoned `Once` does. (`call_once_force` and `OnceState` have no lust
-/// form, so a program that names them does not compile.)
+/// poisoned `Once` does. A second caller that arrives while the first
+/// run is still going waits for it, as std's `Once` waits; the lock is
+/// not poisoned for that overlap. (`call_once_force` and `OnceState` have
+/// no lust form, so a program that names them does not compile.)
 pub struct Once {
     done: std::sync::OnceLock<()>,
     poisoned: std::sync::atomic::AtomicBool,
@@ -110,14 +112,33 @@ impl Once {
             if self.poisoned.load(std::sync::atomic::Ordering::Acquire) {
                 panic!("Once instance has previously been poisoned"); //@ gap
             }
-            self.poisoned.store(true, std::sync::atomic::Ordering::Release);
+            // Poisoned only when `f` unwinds: a caller that comes while
+            // `f` runs waits in `get_or_init`, as std's `Once` waits.
+            // (The flag used to stay set for the whole run, so that caller
+            // panicked. Port of adammharris/lust fd4b761.)
+            let mut guard = PoisonOnUnwind { poisoned: &self.poisoned, done: false };
             f();
-            self.poisoned.store(false, std::sync::atomic::Ordering::Release);
+            guard.done = true;
         });
     }
 
     pub fn is_completed(&self) -> bool {
         self.done.get().is_some()
+    }
+}
+
+/// Sets a `Once`'s poison flag when its run ends without finishing (`f`
+/// panicked and this drops in the unwind).
+struct PoisonOnUnwind<'a> {
+    poisoned: &'a std::sync::atomic::AtomicBool,
+    done: bool,
+}
+
+impl Drop for PoisonOnUnwind<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            self.poisoned.store(true, std::sync::atomic::Ordering::Release);
+        }
     }
 }
 

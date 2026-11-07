@@ -192,7 +192,10 @@ adapter_oracles() {
     } >"$proj/Cargo.toml"
     cargo fetch --manifest-path "$proj/Cargo.toml" || return 1
     rm -rf "$proj"
-    LUST="$root/target/release/lust" LUST_STRICT=1 scripts/test-adapters.sh "$name" || st=1
+    if ! LUST="$root/target/release/lust" LUST_STRICT=1 scripts/test-adapters.sh "$name"; then
+      echo "ci: adapter \`$name\` failed"
+      st=1
+    fi
   done
   return "$st"
 }

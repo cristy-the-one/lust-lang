@@ -230,6 +230,9 @@ pub struct DepInfo {
     pub target: Option<String>,
     /// The resolved package id repr, when the resolve graph names it.
     pub pkg: Option<String>,
+    /// An `optional = true` dependency: it joins a unit only when one of
+    /// the unit's features turns it on (`dep_enabled`).
+    pub optional: bool,
 }
 
 /// One Cargo package in the graph.
@@ -255,6 +258,9 @@ pub struct PackageInfo {
     pub targets: Vec<TargetInfo>,
     pub dependencies: Vec<DepInfo>,
     pub features: Vec<String>,
+    /// Each feature with what it turns on (`"dep:x"`, `"x/f"`, `"x?/f"`,
+    /// or another feature), as the manifest's `[features]` lists them.
+    pub feature_table: Vec<(String, Vec<String>)>,
     /// Features the resolve node activated for this package id.
     pub resolved_features: Vec<String>,
 }
@@ -714,6 +720,13 @@ fn parse_metadata(text: &str, key: u64) -> Result<CrateGraph, String> {
             node_deps.insert(id.to_string(), deps);
         }
     }
+    let name_of: std::collections::HashMap<&str, &str> = root
+        .get("packages")
+        .map(|v| v.as_arr())
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|p| Some((p.get("id")?.as_str()?, p.get("name")?.as_str()?)))
+        .collect();
     let mut packages = Vec::new();
     for p in root.get("packages").map(|v| v.as_arr()).unwrap_or(&[]) {
         let id_repr = p.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -731,19 +744,25 @@ fn parse_metadata(text: &str, key: u64) -> Result<CrateGraph, String> {
                 },
                 target: d.get("target").and_then(|v| v.as_str()).map(str::to_string),
                 pkg: None,
+                optional: d.get("optional").is_some_and(|v| v.as_bool()),
             })
             .collect();
         // Fill each dependency's resolved package by matching the resolve
-        // edges of this package (dependency name plus kind plus target;
-        // the resolve node's name is the dependency lib name, with `-`
-        // read as `_` on both sides).
+        // edges of this package (dependency plus kind plus target). The
+        // resolve edge's name is the extern name (a rename, else the
+        // dependency's lib name, which a `[lib] name` may make other than
+        // the package name), so a plain dependency matches the edge by
+        // the package the edge resolves to.
         if let Some(edges) = node_deps.get(&id_repr) {
             for dep in &mut dependencies {
-                let want = dep.name.replace('-', "_");
+                let is_dep = |name: &str, pkg: &str| match &dep.rename {
+                    Some(r) => name.replace('-', "_") == r.replace('-', "_"),
+                    None => name_of.get(pkg).copied() == Some(dep.name.as_str()),
+                };
                 dep.pkg = edges
                     .iter()
-                    .find(|(name, _, kind, target)| name.replace('-', "_") == want && *kind == dep.kind && *target == dep.target)
-                    .or_else(|| edges.iter().find(|(name, _, kind, _)| name.replace('-', "_") == want && *kind == dep.kind))
+                    .find(|(name, pkg, kind, target)| is_dep(name, pkg) && *kind == dep.kind && *target == dep.target)
+                    .or_else(|| edges.iter().find(|(name, pkg, kind, _)| is_dep(name, pkg) && *kind == dep.kind))
                     .map(|(_, pkg, _, _)| pkg.clone());
             }
         }
@@ -786,6 +805,10 @@ fn parse_metadata(text: &str, key: u64) -> Result<CrateGraph, String> {
                     _ => Vec::new(),
                 })
                 .unwrap_or_default(),
+            feature_table: match p.get("features") {
+                Some(Json::Obj(kvs)) => kvs.iter().map(|(k, v)| (k.clone(), v.strings())).collect(),
+                _ => Vec::new(),
+            },
         });
     }
     Ok(CrateGraph { key, watch: Vec::new(), stamp: 0, workspace_root, packages, workspace_members: members })
@@ -931,19 +954,22 @@ pub fn build_dir(manifest: &Path, env: Option<&[(String, String)]>) -> Option<Pa
 /// (graph key plus watch stamp) in this process, and on disk (see `features_disk_path`): its answer does
 /// not depend on the sources. Returns None when the run fails; the caller then falls back
 /// to resolve-node features and the session still works for single-package
-/// graphs.
-fn unit_features_via_check(req: &GraphRequest, graph: &CrateGraph) -> Option<std::collections::HashMap<(String, String), Vec<String>>> {
+/// graphs. A feature request Cargo refuses (`--features x` of a package with
+/// no `x`, which `cargo metadata` takes when another member has it) is an
+/// error, as in Cargo: the fallback's workspace-wide features would build
+/// another unit than the one asked for.
+fn unit_features_via_check(req: &GraphRequest, graph: &CrateGraph) -> Result<Option<std::collections::HashMap<(String, String), Vec<String>>>, String> {
     let key = graph.key;
     static CACHE: OnceLock<Mutex<std::collections::HashMap<u64, std::collections::HashMap<(String, String), Vec<String>>>>> =
         OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     if let Some(v) = cache.lock().unwrap().get(&key) {
-        return Some(v.clone());
+        return Ok(Some(v.clone()));
     }
     let disk = features_disk_path(graph);
     if let Some(map) = disk.as_deref().and_then(read_features_file) {
         cache.lock().unwrap().insert(key, map.clone());
-        return Some(map);
+        return Ok(Some(map));
     }
     let mut cmd = crate::resolve::probe::check_command(&req.manifest_path, &req.target_triple, req.env.as_deref());
     if let Some(pkg) = &req.package {
@@ -959,7 +985,13 @@ fn unit_features_via_check(req: &GraphRequest, graph: &CrateGraph) -> Option<std
         cmd.arg("--all-features");
     }
     cmd.args(req.cargo_net.args());
-    let out = cmd.output().ok()?;
+    let Ok(out) = cmd.output() else { return Ok(None) };
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        if let Some(line) = err.lines().find(|l| l.starts_with("error:") && l.contains("feature")) {
+            return Err(line.trim_start_matches("error:").trim_start().to_string());
+        }
+    }
     let text = String::from_utf8_lossy(&out.stdout);
     let mut map = std::collections::HashMap::new();
     for line in text.lines() {
@@ -973,13 +1005,13 @@ fn unit_features_via_check(req: &GraphRequest, graph: &CrateGraph) -> Option<std
         map.insert((pkg, target), feats);
     }
     if map.is_empty() {
-        return None;
+        return Ok(None);
     }
     if let Some(path) = disk {
         write_features_file(&path, &map);
     }
     cache.lock().unwrap().insert(key, map.clone());
-    Some(map)
+    Ok(Some(map))
 }
 
 /// The disk cache file of `unit_features_via_check`:
@@ -1403,6 +1435,7 @@ fn push_simple_package(dir: &Path, packages: &mut Vec<PackageInfo>, stack: &mut 
             kind: "normal".into(),
             target: None,
             pkg: Some(path_package_id(dep_dir, &child.name, &child.version)),
+            optional: false,
         });
         children.push(dep_dir.clone());
     }
@@ -1424,6 +1457,7 @@ fn push_simple_package(dir: &Path, packages: &mut Vec<PackageInfo>, stack: &mut 
         targets,
         dependencies,
         features: Vec::new(),
+        feature_table: Vec::new(),
         resolved_features: Vec::new(),
     });
     for child in children {
@@ -1464,12 +1498,20 @@ pub fn select_unit(
     interner: &crate::intern::Interner,
     test_crate: bool,
 ) -> Result<UnitInfo, String> {
+    // Cargo's paths are canonical; the request's may hold `..`
+    // (`--manifest-path ../b/Cargo.toml`). Both sides go through
+    // `canonicalize`, including on Windows where that adds the `\\?\`
+    // prefix, so the two forms still compare. A virtual workspace
+    // manifest names no package: it takes a member.
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let want = canon(&req.manifest_path);
+    let is_root = want.parent() == Some(canon(&graph.workspace_root).as_path());
     let pkg = graph
         .packages
         .iter()
         .find(|p| Some(&p.name) == req.package.as_ref())
-        .or_else(|| graph.packages.iter().find(|p| p.manifest_path == req.manifest_path))
-        .or_else(|| graph.packages.iter().find(|p| graph.workspace_members.contains(&p.id_repr)))
+        .or_else(|| graph.packages.iter().find(|p| canon(&p.manifest_path) == want))
+        .or_else(|| graph.packages.iter().find(|p| is_root && graph.workspace_members.contains(&p.id_repr)))
         .ok_or_else(|| format!("no package in the Cargo graph matches {}", req.manifest_path.display()))?;
     // `--lib` selects the package's lib target by kind, not by name: a
     // package has at most one, and Cargo names it after `[lib] name`, which
@@ -1484,7 +1526,7 @@ pub fn select_unit(
         .or_else(|| pkg.targets.iter().find(|t| t.name == target_name && t.kind.iter().any(|k| k == target_kind)))
         .or_else(|| pkg.targets.iter().find(|t| t.name == target_name))
         .ok_or_else(|| format!("package `{}` has no {target_kind} target named `{target_name}`", pkg.name))?;
-    let check_map = if features_follow_metadata(graph) { None } else { unit_features_via_check(req, graph) };
+    let check_map = if features_follow_metadata(graph) { None } else { unit_features_via_check(req, graph)? };
     let features = check_map
         .as_ref()
         .and_then(|m| m.get(&(pkg.id_repr.clone(), target.name.clone())).cloned())
@@ -1493,7 +1535,7 @@ pub fn select_unit(
     // them for this unit, recursively. Dev-dependencies join only the
     // selected test crate itself, never its dependencies.
     let mut stack = vec![pkg.id_repr.clone()];
-    let mut deps = build_deps(graph, pkg, env, interner, test_crate, &check_map, &mut stack);
+    let mut deps = build_deps(graph, pkg, &features, env, interner, test_crate, &check_map, &mut stack);
     // A bin, test, example, or bench target of a package with a lib
     // target depends on that lib implicitly (Cargo adds it as an
     // extern named by the lib crate name; it is not in the manifest
@@ -1541,9 +1583,11 @@ pub fn select_unit(
 /// package already on the stack (a dev-dependency cycle, the only cycle
 /// Cargo allows) is not entered again; its unit still appears at the
 /// level where it was first reached.
+#[allow(clippy::too_many_arguments)]
 fn build_deps(
     graph: &CrateGraph,
     pkg: &PackageInfo,
+    features: &[String],
     env: &CfgEnv,
     interner: &crate::intern::Interner,
     test_crate: bool,
@@ -1553,14 +1597,14 @@ fn build_deps(
     let mut out = Vec::new();
     for dep in &pkg.dependencies {
         let kind_ok = dep.kind == "normal" || (test_crate && dep.kind == "dev");
-        if !kind_ok || !dep_target_matches(env, dep.target.as_deref(), interner) {
+        if !kind_ok || !dep_target_matches(env, dep.target.as_deref(), interner) || !dep_enabled(pkg, dep, features) {
             continue;
         }
         let Some(dep_pkg_id) = &dep.pkg else { continue };
         let Some(dep_pkg) = graph.packages.iter().find(|p| &p.id_repr == dep_pkg_id) else { continue };
         let Some(lib) = dep_pkg.targets.iter().find(|t| t.kind.iter().any(|k| k == "lib" || k == "rlib")) else { continue };
-        let extern_name = dep.rename.clone().unwrap_or_else(|| dep.name.replace('-', "_"));
-        let features = check_map
+        let extern_name = dep.rename.clone().unwrap_or_else(|| lib.name.replace('-', "_"));
+        let dep_features = check_map
             .as_ref()
             .and_then(|m| m.get(&(dep_pkg.id_repr.clone(), lib.name.clone())).cloned())
             .unwrap_or_else(|| dep_pkg.resolved_features.clone());
@@ -1568,7 +1612,7 @@ fn build_deps(
             Vec::new()
         } else {
             stack.push(dep_pkg.id_repr.clone());
-            let s = build_deps(graph, dep_pkg, env, interner, false, check_map, stack);
+            let s = build_deps(graph, dep_pkg, &dep_features, env, interner, false, check_map, stack);
             stack.pop();
             s
         };
@@ -1585,11 +1629,29 @@ fn build_deps(
             cargo_env: package_cargo_env(dep_pkg, lib),
             build_cfgs: Vec::new(),
             build_check_cfgs: Vec::new(),
-            features,
+            features: dep_features,
             deps: sub,
         });
     }
     out
+}
+
+/// True when a dependency joins a unit with these features: always for a
+/// required one; for an optional one, when an enabled feature turns it on:
+/// the implicit feature of its name, `dep:name`, or `name/feature` (not
+/// the weak `name?/feature`, which only follows it).
+fn dep_enabled(pkg: &PackageInfo, dep: &DepInfo, features: &[String]) -> bool {
+    if !dep.optional {
+        return true;
+    }
+    let key = dep.rename.as_deref().unwrap_or(&dep.name);
+    features.iter().any(|f| f == key)
+        || pkg
+            .feature_table
+            .iter()
+            .filter(|(f, _)| features.contains(f))
+            .flat_map(|(_, v)| v)
+            .any(|e| e.strip_prefix("dep:") == Some(key) || e.split_once('/').is_some_and(|(d, _)| d == key))
 }
 
 /// The edition gate for a selected unit (section 1.1): lust source crates
@@ -1879,6 +1941,7 @@ mod tests {
                 target_triple: String::new(),
                 cargo_net: crate::protocol::CargoNet { offline: true, locked: false },
                 env: None,
+                cache_dir: None,
             };
             let graph = load_graph(&req).expect("cargo metadata on a temp package");
             (graph, req)
@@ -1933,6 +1996,133 @@ mod tests {
         let third = load_graph(&req).unwrap();
         assert_eq!(third.packages.iter().find(|p| p.name == "util").unwrap().edition, "2021");
         assert_ne!(second.key, third.key, "the features probe caches by the graph key");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `--manifest-path ../b/Cargo.toml` selects b, not the first workspace
+    /// member (adammharris/lust 3910f27c).
+    #[test]
+    fn unit_of_a_manifest_path_through_dotdot() {
+        let dir = std::env::temp_dir().join(format!("lust-cargo-dotdot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for m in ["a", "b"] {
+            std::fs::create_dir_all(dir.join(m).join("src")).unwrap();
+            std::fs::write(dir.join(m).join("Cargo.toml"), format!("[package]\nname = \"{m}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n")).unwrap();
+            std::fs::write(dir.join(m).join("src/lib.rs"), "").unwrap();
+        }
+        std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"a\", \"b\"]\nresolver = \"3\"\n").unwrap();
+        let interner = crate::intern::Interner::default();
+        let env = CfgEnv::new("", &[], false, crate::protocol::ProfileFlags::DEV);
+        let req = GraphRequest {
+            manifest_path: dir.join("a/../b/Cargo.toml"),
+            default_features: true,
+            cargo_net: crate::protocol::CargoNet { offline: true, locked: false },
+            ..Default::default()
+        };
+        let graph = load_graph(&req).expect("metadata");
+        let unit = select_unit(&graph, &req, "lib", "b", &env, &interner, false).expect("the lib unit");
+        assert_eq!(unit.package.name, "b");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An optional dependency joins a unit only when an enabled feature
+    /// turns it on (adammharris/lust da18b853).
+    #[test]
+    fn optional_dep_follows_the_unit_features() {
+        let dep = |name: &str, optional: bool| DepInfo { name: name.into(), rename: None, kind: "normal".into(), target: None, pkg: None, optional };
+        let table = |rows: &[(&str, &[&str])]| -> Vec<(String, Vec<String>)> {
+            rows.iter().map(|(f, v)| (f.to_string(), v.iter().map(|s| s.to_string()).collect())).collect()
+        };
+        let mut pkg = PackageInfo {
+            id_repr: String::new(),
+            name: "p".into(),
+            version: "0.1.0".into(),
+            edition: "2024".into(),
+            manifest_path: PathBuf::new(),
+            authors: Vec::new(),
+            description: None,
+            homepage: None,
+            license: None,
+            license_file: None,
+            repository: None,
+            readme: None,
+            rust_version: None,
+            source: None,
+            targets: Vec::new(),
+            dependencies: Vec::new(),
+            features: Vec::new(),
+            feature_table: Vec::new(),
+            resolved_features: Vec::new(),
+        };
+        pkg.feature_table = table(&[("x", &[]), ("on", &["dep:y"]), ("sub", &["z/f"]), ("weak", &["w?/f"])]);
+        let on = |feats: &[&str], d: &DepInfo| dep_enabled(&pkg, d, &feats.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert!(on(&[], &dep("req", false)));
+        assert!(!on(&[], &dep("x", true)));
+        assert!(on(&["x"], &dep("x", true)));
+        assert!(on(&["on"], &dep("y", true)));
+        assert!(!on(&["x"], &dep("y", true)));
+        assert!(on(&["sub"], &dep("z", true)));
+        assert!(!on(&["weak"], &dep("w", true)));
+    }
+
+    /// `--features x` of a package without `x` is an error, even when
+    /// another workspace member has it (adammharris/lust aafe8ceb).
+    #[test]
+    fn a_feature_the_package_lacks_is_an_error() {
+        let dir = std::env::temp_dir().join(format!("lust-cargo-nofeat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for m in ["a", "b"] {
+            std::fs::create_dir_all(dir.join(m).join("src")).unwrap();
+            std::fs::write(dir.join(m).join("src/lib.rs"), "").unwrap();
+        }
+        let pkg = |name: &str| format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+        std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"a\", \"b\"]\nresolver = \"3\"\n").unwrap();
+        std::fs::write(dir.join("a/Cargo.toml"), format!("{}\n[features]\nx = []\n", pkg("a"))).unwrap();
+        std::fs::write(dir.join("b/Cargo.toml"), pkg("b")).unwrap();
+        let interner = crate::intern::Interner::default();
+        let env = CfgEnv::new("", &[], false, crate::protocol::ProfileFlags::DEV);
+        let req = GraphRequest {
+            manifest_path: dir.join("b/Cargo.toml"),
+            features: vec!["x".into()],
+            default_features: true,
+            cargo_net: crate::protocol::CargoNet { offline: true, locked: false },
+            ..Default::default()
+        };
+        let err = match load_graph(&req) {
+            Ok(graph) => select_unit(&graph, &req, "lib", "b", &env, &interner, false).err(),
+            Err(e) => Some(e),
+        };
+        assert!(err.as_deref().is_some_and(|e| e.contains("feature")), "{err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A dependency whose `[lib] name` is not its package name is linked
+    /// by the lib name (adammharris/lust 1cce8498).
+    #[test]
+    fn dep_with_a_renamed_lib_uses_the_lib_name() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/crates/dep-lib-renamed");
+        let dir = std::env::temp_dir().join(format!("lust-cargo-renamed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let copy = |rel: &str| {
+            let to = dir.join(rel);
+            std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+            std::fs::copy(src.join(rel), &to).unwrap();
+        };
+        for rel in ["Cargo.toml", "src/main.rs", "kit/Cargo.toml", "kit/src/lib.rs"] {
+            copy(rel);
+        }
+        let interner = crate::intern::Interner::default();
+        let env = CfgEnv::new("", &[], false, crate::protocol::ProfileFlags::DEV);
+        let req = GraphRequest {
+            manifest_path: dir.join("Cargo.toml"),
+            default_features: true,
+            cargo_net: crate::protocol::CargoNet { offline: true, locked: false },
+            ..Default::default()
+        };
+        let graph = load_graph(&req).expect("metadata");
+        let unit = select_unit(&graph, &req, "bin", "dep-lib-renamed", &env, &interner, false).expect("bin");
+        let names: Vec<_> = unit.deps.iter().map(|d| d.extern_name.as_str()).collect();
+        assert_eq!(names, ["kit"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

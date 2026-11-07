@@ -645,6 +645,26 @@ pub fn waits_for_sources(args: &[String]) -> bool {
     std::env::var_os(SOURCES_READY_ENV).is_some_and(|v| !v.is_empty()) && matches!(args.first().map(String::as_str), Some("check" | "build" | "run"))
 }
 
+/// Absolute manifest path Cargo can be given. `..` and symlinks are
+/// resolved. On Windows the `\\?\` prefix from `canonicalize` is removed
+/// so a build script is a path cmd.exe can execute.
+fn cargo_manifest_path(p: &Path, abs: &impl Fn(&Path) -> PathBuf) -> PathBuf {
+    strip_verbatim_prefix(&p.canonicalize().unwrap_or_else(|_| abs(p)))
+}
+
+/// `\\?\C:\...` becomes `C:\...`, and `\\?\UNC\server\share` becomes
+/// `\\server\share`. Other paths are unchanged.
+fn strip_verbatim_prefix(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest);
+    }
+    p.to_path_buf()
+}
+
 /// Parses the command line (without the program name). Paths become absolute.
 pub fn parse_args(args: &[String]) -> Option<Invocation> {
     // The client reads every command line here, and `lust test` is not a
@@ -755,6 +775,12 @@ fn parse_command(args: &[String]) -> Option<Invocation> {
         return None;
     }
     let abs = |p: &Path| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+    // Cargo canonicalizes `--manifest-path`, so `../b/Cargo.toml` names the
+    // same file metadata reports. The stored path drops the Windows `\\?\`
+    // prefix `canonicalize` adds: cargo check copies it into
+    // `CARGO_MANIFEST_DIR`, `OUT_DIR`, `PATH`, and the build-script
+    // executable, and cmd.exe cannot run that verbatim path.
+    let manifest_abs = |p: &Path| cargo_manifest_path(p, &abs);
     // Release and the rustc oracle are build/check-only, with no extra lust flags.
     // Crate-selection flags are lust dev flags today: reject them there rather
     // than build a different crate selection than the user named.
@@ -773,7 +799,7 @@ fn parse_command(args: &[String]) -> Option<Invocation> {
         let typed = file.clone();
         let file = abs(&file);
         if let Some(p) = crate_flags.manifest_path.take() {
-            crate_flags.manifest_path = Some(abs(&p));
+            crate_flags.manifest_path = Some(manifest_abs(&p));
         }
         let profile_name = profile.as_deref().unwrap_or("release");
         let manifest = crate_flags.manifest_path.clone().or_else(|| find_manifest(&file).map(|m| m.path));
@@ -838,7 +864,7 @@ fn parse_command(args: &[String]) -> Option<Invocation> {
     let typed = file.clone();
     let file = abs(&file);
     if let Some(p) = crate_flags.manifest_path.take() {
-        crate_flags.manifest_path = Some(abs(&p));
+        crate_flags.manifest_path = Some(manifest_abs(&p));
     }
     let mut session = session_key_for(&file, crate_flags, net);
     if let Some(abort) = panic_abort {
@@ -1827,6 +1853,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn verbatim_prefix_is_not_a_cargo_path() {
+        assert_eq!(strip_verbatim_prefix(Path::new(r"\\?\C:\proj\Cargo.toml")), PathBuf::from(r"C:\proj\Cargo.toml"));
+        assert_eq!(strip_verbatim_prefix(Path::new(r"\\?\UNC\server\share\Cargo.toml")), PathBuf::from(r"\\server\share\Cargo.toml"));
+        assert_eq!(strip_verbatim_prefix(Path::new("/tmp/Cargo.toml")), PathBuf::from("/tmp/Cargo.toml"));
+    }
+
     /// Manifest and package flags name a real crate: package identity from
     /// the manifest text, `src/main.rs` selecting the package bin.
     #[test]
@@ -1846,9 +1879,11 @@ mod tests {
             "--features",
             "zest",
         ]);
-        assert_eq!(req.session.krate.package_id, format!("widget 1.2.3 (path+file://{})", dir.display()));
+        let canon = strip_verbatim_prefix(&dir.join("Cargo.toml").canonicalize().unwrap_or_else(|_| dir.join("Cargo.toml")));
+        let canon_dir = canon.parent().unwrap_or(&dir);
+        assert_eq!(req.session.krate.package_id, format!("widget 1.2.3 (path+file://{})", canon_dir.display()));
         assert_eq!((req.session.krate.target_kind.as_str(), req.session.krate.target_name.as_str()), ("bin", "widget"));
-        assert_eq!(req.session.krate.manifest_path.as_deref(), Some(dir.join("Cargo.toml").as_path()));
+        assert_eq!(req.session.krate.manifest_path.as_deref(), Some(canon.as_path()));
         let lib = compile_req(&["check", main_rs.to_str().unwrap(), "--package", "widget", "--lib"]);
         assert_eq!((lib.session.krate.target_kind.as_str(), lib.session.krate.target_name.as_str()), ("lib", "widget"));
         let _ = std::fs::remove_dir_all(&dir);

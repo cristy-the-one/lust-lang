@@ -244,6 +244,8 @@ lust check main.rs [--json] [--timings]     # type check and borrow check
 lust run main.rs [-- args]                  # build with tcc and run
 lust build main.rs [-o out]                 # build a dev binary
 lust test main.rs [filter]                  # run #[test] functions
+lust test src/lib.rs --manifest-path Cargo.toml --lib
+lust test tests/api.rs --manifest-path Cargo.toml --test api
 lust check main.rs --rustc                  # ask the real rustc for a second opinion
 lust build main.rs --release                # release build with Cargo (rustc -O for one file)
 lust explain L0602                          # long help for one error code
@@ -256,6 +258,8 @@ A target in a Cargo workspace:
 lust check crates/ts_goport/src/lib.rs --manifest-path crates/ts_goport/Cargo.toml --lib
 lust build crates/ts_goport/src/bin/tsgo.rs --manifest-path crates/ts_goport/Cargo.toml --bin tsgo -o tsgo
 ```
+
+`lust test` of a Cargo target runs the lib's unit tests (`--lib`) or one integration test (`--test <name>`), in one process the way libtest does. The harness is applied to copies of the crate's files in memory. A daemon builds that test binary warm on the next run.
 
 Crate flags work as in Cargo: `--features`, `--no-default-features`, `--all-features`, `--package`, `--target`, `--offline`, `--locked`. A project can drop features from lust dev builds (for example jemalloc) with `dev-exclude-features` in `.lust.toml`. See [docs/dev-features.md](docs/dev-features.md).
 

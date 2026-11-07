@@ -2099,6 +2099,7 @@ fn resolved_setup(
             target_triple: key.target_triple.clone(),
             cargo_net: key.cargo_net,
             env: req.client.env.as_deref().map(cargo::cargo_env_of),
+            cache_dir: Some(super::cache::cache_dir(&key.krate.root)),
         };
         let graph = cargo::load_graph(&greq).map_err(code2)?;
         t.lap("cargo graph");
@@ -2107,7 +2108,7 @@ fn resolved_setup(
         let unit =
             cargo::select_unit(&graph, &greq, &key.krate.target_kind, &key.krate.target_name, &pre_env, &front.interner, key.krate.test)
                 .map_err(code2)?;
-        let root_text = crate::srctext::read(&unit.target.src_path)
+        let root_text = crate::driver::read_source(&unit.target.src_path)
             .map_err(|e| code2(format!("cannot read {}: {e}", unit.target.src_path.display())))?;
         // Edition and lint gates for the selected unit (section 1.1),
         // rendered against the crate root file.
@@ -2300,7 +2301,7 @@ fn resolved_setup(
         None => {
             let mut user = StdPlan::guess_crate(&root_path, &unspliced_root, root_asks);
             for dep in crate::resolve::worklist::dep_roots(&externs) {
-                if let Ok(text) = crate::srctext::read(&dep) {
+                if let Ok(text) = crate::driver::read_source(&dep) {
                     user = user.or(StdPlan::guess_crate(&dep, &text, StdPlan::asks(&text)));
                 }
             }
@@ -2639,7 +2640,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         };
     }
     let path = req.file.to_string_lossy().to_string();
-    let mut src = match crate::srctext::read(&req.file) {
+    let mut src = match crate::driver::read_source(&req.file) {
         Ok(s) => s,
         Err(e) => return Response { stderr: format!("error: cannot read {path}: {e}\n"), code: 2, ..Default::default() },
     };
@@ -6539,7 +6540,7 @@ fn main() { println!(\"{}\", f0() + 5i64.d()); }
             emit_c: None,
             max_errors: 20,
             run_args: None,
-            harness: false, cc: false,
+            harness: false, cc: false, overlay: Default::default(),
             client: Default::default(),
         }
     }

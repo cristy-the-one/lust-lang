@@ -22,6 +22,13 @@
 #   stderr=exact      also compare the program's stderr, with the thread id
 #                     of a panic line masked (panic location fixtures; the
 #                     package sets panic = "abort" so the exits match)
+#   test=<lib|name>   run tests instead: `cargo test --lib` (or `--test <name>`)
+#                     and `lust test <root> --manifest-path .. --lib` (or
+#                     `--test <name>`); the sorted `test <name> ... <status>`
+#                     lines (CR stripped) and whether the exit is zero must
+#                     match. root= defaults to src/lib.rs or tests/<name>.rs.
+#                     After the cold run, the same comparison runs twice
+#                     through a private daemon (the second is the warm build).
 #   lib=1             check the lib target only: `cargo build --lib` (not
 #                     check: metadata skips deny lints like unconditional_panic) and
 #                     `lust check <root> --lib` must both accept (or both
@@ -115,6 +122,7 @@ for dir in "$fixtures"/*/; do
   cargo_pass=""
   stderr_mode=""
   lib=""
+  test_sel=""
   daemon=""
   prog_args=()
   if [ -f "$proj/fixture.txt" ]; then
@@ -130,6 +138,7 @@ for dir in "$fixtures"/*/; do
         cargo) cargo_pass=$v ;;
         stderr) stderr_mode=$v ;;
         lib) lib=$v ;;
+        test) test_sel=$v ;;
         daemon) daemon=$v ;;
         projdir) ;;
         args) # split on spaces by design (see header)
@@ -164,6 +173,51 @@ for dir in "$fixtures"/*/; do
   if [ -n "$lib" ]; then
     cargo_args=(build --manifest-path "$proj/$manifest" --lib)
     lust_args=(check "$proj/$root_file" --manifest-path "$proj/$manifest" --lib)
+  fi
+
+  if [ -n "$test_sel" ]; then
+    # A test fixture: the test targets' per-test results, not one program.
+    if [ "$test_sel" = lib ]; then sel=(--lib); dflt=src/lib.rs; else sel=(--test "$test_sel"); dflt=tests/$test_sel.rs; fi
+    if ! grep -q '^root=' "$proj/fixture.txt" 2>/dev/null; then root_file=$dflt; fi
+    feat=()
+    [ -n "$features" ] && feat=(--features "$features")
+    results() { grep -E '^test .* \.\.\. (ok|FAILED|ignored)' "$1" | sed -E 's/ \([0-9.]+ms\)$//' | tr -d '\r' | sort; }
+    (cd "$proj" && timeout 180 cargo test --manifest-path "$proj/$manifest" "${sel[@]}" "${feat[@]}" --offline --target-dir "$case_dir/cargo-target" -- --test-threads 1) >"$case_dir/cargo.out" 2>"$case_dir/cargo.err"
+    cst=$?
+    (cd "$proj" && lust_cc "$lust" test "$proj/$root_file" --manifest-path "$proj/$manifest" "${sel[@]}" "${feat[@]}" --test-threads 1) >"$case_dir/lust.out" 2>"$case_dir/lust.err"
+    st=$?
+    if is_timeout "$st"; then
+      report bad "$name" "HANG lust test timed out alone at ${retry_timeout}s (first at ${case_timeout}s)"
+    elif [ "$(results "$case_dir/cargo.out")" != "$(results "$case_dir/lust.out")" ] || [ $((cst == 0)) -ne $((st == 0)) ]; then
+      report bad "$name" "results differ (cargo exit $cst, lust exit $st): $(diff <(results "$case_dir/cargo.out") <(results "$case_dir/lust.out") | head -8) $(head -5 "$case_dir/lust.err")"
+    elif ! grep -q '^test ' "$case_dir/cargo.out"; then
+      report bad "$name" "cargo ran no tests: $(tail -5 "$case_dir/cargo.err")"
+    else
+      # The cold run above forces LUST_NO_DAEMON. These two use a private
+      # daemon; the second is the warm build of the same test binary.
+      dbad=""
+      for dpass in cold warm; do
+        (cd "$proj" && lust_cc env -u LUST_NO_DAEMON LUST_DAEMON_SOCKET="$proj/.lust-daemon.sock" LUST_DAEMON_IDLE=30 \
+          "$lust" test "$proj/$root_file" --manifest-path "$proj/$manifest" "${sel[@]}" "${feat[@]}" --test-threads 1) \
+          >"$case_dir/daemon.$dpass.out" 2>"$case_dir/daemon.$dpass.err"
+        dst=$?
+        if is_timeout "$dst"; then
+          dbad="HANG daemon $dpass timed out alone at ${retry_timeout}s"
+          break
+        fi
+        if [ "$(results "$case_dir/cargo.out")" != "$(results "$case_dir/daemon.$dpass.out")" ] || [ $((cst == 0)) -ne $((dst == 0)) ]; then
+          dbad="daemon $dpass results differ (exit $dst): $(diff <(results "$case_dir/cargo.out") <(results "$case_dir/daemon.$dpass.out") | head -8) $(head -5 "$case_dir/daemon.$dpass.err")"
+          break
+        fi
+      done
+      if [ -n "$dbad" ]; then
+        report bad "$name" "$dbad"
+      else
+        slow_note "$name" "lust test"
+        report ok "$name"
+      fi
+    fi
+    continue
   fi
 
   cargo_ok=1

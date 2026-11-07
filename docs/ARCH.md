@@ -84,7 +84,10 @@ requested packages and targets, the requested features and the
 default-feature policy, the target triple, and the Cargo config
 files that apply (`.cargo/config.toml` chain). The driver runs
 `cargo metadata --format-version 1` with those inputs once per
-graph key. `cargo metadata` alone unifies features over the whole
+graph key, and keeps that output in the crate's disk cache
+(`cargo-graph-<key>.txt`, with the watch stamp of the path
+packages) so a later process reuses it until the key or the stamp
+moves (`src/resolve/cargo.rs` `disk_graph`). `cargo metadata` alone unifies features over the whole
 workspace, which can differ from a `-p ts_goport --bin tsgo`
 build. When the workspace has one member and no package in the
 graph has a dev-dependency, a build-dependency, a target-specific
@@ -151,7 +154,9 @@ Terms:
 - Test crates: `lust test` builds the lib or bin crate again with
   `cfg(test)` on and `#[test]` fns as extra roots. Integration
   tests in `tests/` are normal bin-like crates that depend on the
-  lib crate. Ts-rust's baseline runner is such a target with
+  lib crate. `lust test` of a Cargo target (`--lib` or `--test`)
+  runs those tests in one process, the way libtest does, and a
+  daemon builds the test binary warm on the next run. Ts-rust's baseline runner is such a target with
   `test = false` in `crates/ts_goport/Cargo.toml`, so target
   handling must not assume `cargo test` semantics.
 

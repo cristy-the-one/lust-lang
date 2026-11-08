@@ -87,9 +87,12 @@ $sa = New-Object LustWin+Sec
 $sa.nLength = 24
 $sa.inherit = 1
 $invalid = [IntPtr]::new(-1)
-function Open-Inherit([string]$path, [uint32]$access, [uint32]$disp) {
+function Open-Inherit([string]$path, [int64]$access, [uint32]$disp) {
+    # 0x80000000 does not fit in a signed Int32, which is what a bare
+    # PowerShell numeric argument becomes. Keep the low 32 bits.
+    $uaccess = [uint32]($access -band 4294967295)
     $local = $script:sa
-    $h = [LustWin]::CreateFile($path, $access, 7, [ref]$local, $disp, 0, [IntPtr]::Zero)
+    $h = [LustWin]::CreateFile($path, $uaccess, 7, [ref]$local, $disp, 0, [IntPtr]::Zero)
     if ($h -eq $script:invalid -or $h -eq [IntPtr]::Zero) {
         throw "CreateFile $path failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
     }

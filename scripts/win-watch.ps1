@@ -63,6 +63,10 @@ public class LustWin {
   public static extern bool SetConsoleCtrlHandler(IntPtr h, bool add);
   [DllImport("kernel32.dll", SetLastError = true)]
   public static extern bool GenerateConsoleCtrlEvent(uint ev, uint group);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  public static extern IntPtr GetStdHandle(int n);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  public static extern bool SetHandleInformation(IntPtr h, uint mask, uint flags);
 }
 "@
 
@@ -108,6 +112,16 @@ $si.show = 0
 $si.stdin = $stdin
 $si.stdout = $stdout
 $si.stderr = $stderr
+# bInheritHandles is true so the three files above reach the watcher.
+# This process's own stdin, stdout, and stderr must not go with them:
+# the shell is reading our stdout for the pid, and a watcher that
+# inherits that pipe holds it open for as long as it runs.
+foreach ($n in -10, -11, -12) {
+    $h = [LustWin]::GetStdHandle($n)
+    if ($h -ne [IntPtr]::Zero -and $h -ne $invalid) {
+        [void][LustWin]::SetHandleInformation($h, 1, 0)
+    }
+}
 $pi = New-Object LustWin+PI
 $cmd = New-Object System.Text.StringBuilder 1024
 [void]$cmd.Append('"')

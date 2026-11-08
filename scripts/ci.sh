@@ -136,7 +136,13 @@ run_step() {
     {
       printf 'STEP %s exit %s\n' "$name" "$st"
       echo "--- $name: lines that look like failures (first 40)"
-      grep -a -E -i 'fail|error|mismatch|differ|bad request|panicked|not found|cannot|timed? ?out|expected' "$out" | grep -a -v -E '^(ok|PASS) ' | head -n 40
+      # A quiet timeout matches nothing. With pipefail that grep is a
+      # failed command, and set -e would skip every later step.
+      grep -a -E -i 'fail|error|mismatch|differ|bad request|panicked|not found|cannot|timed? ?out|expected' "$out" | grep -a -v -E '^(ok|PASS) ' | head -n 40 || true
+      if [ -s "$root/ci-watch-progress.txt" ]; then
+        echo "--- $name: watch progress"
+        cat "$root/ci-watch-progress.txt"
+      fi
       echo "--- $name: last 25 lines"
       tail -n 25 "$out"
       echo

@@ -13,8 +13,11 @@ source "$root/scripts/gnu-tools.sh"
 
 pass=0
 fail=0
-ok() { pass=$((pass + 1)); echo "ok   $1"; }
-bad() { fail=$((fail + 1)); echo "FAIL $1: $2"; }
+# ci.sh tees this script. A kill drops whatever is still in the stdio
+# buffer, so each result is also appended to a file the shell closes.
+: >"$root/ci-watch-progress.txt"
+ok() { pass=$((pass + 1)); printf 'ok   %s\n' "$1" | tee -a "$root/ci-watch-progress.txt"; }
+bad() { fail=$((fail + 1)); printf 'FAIL %s: %s\n' "$1" "$2" | tee -a "$root/ci-watch-progress.txt"; }
 
 lust=$root/target/release/lust
 if [ -f "$lust.exe" ]; then lust=$lust.exe; fi
@@ -110,7 +113,17 @@ case "$(uname -s)" in
     # A background job shares this console, so a Ctrl-C aimed at it also
     # hits the script. Start lust in its own console and signal that.
     win_job=1
-    wpid=$(powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -m "$root/scripts/win-watch.ps1")" -Action start -Exe "$(cygpath -m "$lust")" -WorkDir "$(cygpath -m "$work")" -ErrFile "$(cygpath -m "$work/err")" -OutFile "$(cygpath -m "$work/out")" 2>"$work/launch.err" | tr -d '\r ')
+    # The pid is a file, not a pipe. CreateProcess inherits every
+    # inheritable handle; a pipe here stays open in the watcher, and this
+    # shell then blocks in the read until that process exits.
+    printf 'test-watch: launching\n' >>"$root/ci-watch-progress.txt"
+    if ! timeout 60 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -m "$root/scripts/win-watch.ps1")" -Action start -Exe "$(cygpath -m "$lust")" -WorkDir "$(cygpath -m "$work")" -ErrFile "$(cygpath -m "$work/err")" -OutFile "$(cygpath -m "$work/out")" >"$work/pid" 2>"$work/launch.err"; then
+      printf 'test-watch: launch failed\n' >>"$root/ci-watch-progress.txt"
+      wpid=
+    else
+      wpid=$(tr -d '\r\n ' <"$work/pid" 2>/dev/null || true)
+      printf 'test-watch: pid=%s\n' "$wpid" >>"$root/ci-watch-progress.txt"
+    fi
     ;;
   *)
     "$lust" watch check hello.rs >"$work/out" 2>"$work/err" &
@@ -118,6 +131,7 @@ case "$(uname -s)" in
     ;;
 esac
 job_alive() {
+  [ -n "${wpid:-}" ] || return 1
   if [ "$win_job" -eq 1 ]; then
     pid_alive "$wpid"
   else
@@ -157,7 +171,9 @@ fi
 # for as long as the process lives.
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*)
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -m "$root/scripts/win-watch.ps1")" -Action ctrl -Target "$wpid" >"$work/ctrl.err" 2>&1 || true
+    if [ -n "${wpid:-}" ]; then
+      powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -m "$root/scripts/win-watch.ps1")" -Action ctrl -Target "$wpid" >"$work/ctrl.err" 2>&1 || true
+    fi
     ;;
   *) kill -INT "$wpid" 2>/dev/null || true ;;
 esac

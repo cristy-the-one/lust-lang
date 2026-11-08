@@ -16,3 +16,7 @@ __pycache__/
 /boat-out/
 # scripts/release.sh output
 /dist/
+# ci.sh step logs. Written on the runner; not part of the tree.
+/ci-failures.txt
+/ci-step.log
+/ci-watch-progress.txt

@@ -228,7 +228,11 @@ fn same_bytes_are_not_another_check() {
 fn edits_during_a_check_schedule_one_follow_up_and_mark_stale() {
     let dir = scratch("during");
     std::fs::write(dir.join("main.rs"), "one\n").unwrap();
-    let env = stub_env(&dir, 350, 40);
+    // The check holds the file for a second. The saves are a few milliseconds
+    // apart, inside that hold: a 20ms pause on a busy runner stretches past
+    // the hold, the follow-up starts on an intermediate save, and that
+    // result is stale. The assertions are the final bytes and one follow-up.
+    let env = stub_env(&dir, 1_000, 40);
     let mut session = Session::spawn(&dir, &["check", "main.rs", "--features", "a,b", "--target", "x86_64-unknown-linux-gnu", "-C", "panic=abort"], &env);
     let log = dir.join("stub.log");
     let start = Instant::now();
@@ -238,7 +242,7 @@ fn edits_during_a_check_schedule_one_follow_up_and_mark_stale() {
     assert!(std::fs::read_to_string(&log).unwrap_or_default().contains("start\t"), "check started\n{}", session.output());
     for i in 0..5 {
         std::fs::write(dir.join("main.rs"), format!("two-{i}\n")).unwrap();
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(5));
     }
     assert!(session.wait_until("watch-status:", 2, Duration::from_secs(5)), "{}", session.output());
     std::thread::sleep(Duration::from_millis(250));

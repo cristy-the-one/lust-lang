@@ -189,7 +189,7 @@ if job_alive; then
   else
     kill_hard "$wpid" || true
   fi
-  bad "watch stops on interrupt" "still running $(tail -5 "$work/ctrl.err" 2>/dev/null)"
+  bad "watch stops on interrupt" "still running pid=${wpid:-} ctrl=$(tail -5 "$work/ctrl.err" 2>/dev/null) err=$(tail -8 "$work/err" 2>/dev/null)"
 elif ! grep -q 'lust watch: stopped' "$work/err"; then
   bad "watch stops on interrupt" "exited without stopping: $(tail -20 "$work/err")"
 else

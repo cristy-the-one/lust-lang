@@ -78,7 +78,11 @@ if ($Action -eq 'ctrl') {
     }
     # This helper is attached to the watcher's console. Ignore the event here.
     [LustWin]::SetConsoleCtrlHandler([IntPtr]::Zero, $true) | Out-Null
-    if (-not [LustWin]::GenerateConsoleCtrlEvent(0, 0)) {
+    # CTRL_BREAK_EVENT, aimed at the process group. CTRL_C_EVENT is not
+    # delivered to a group, and a process started with CREATE_NEW_CONSOLE
+    # never saw the Ctrl-C this helper used to broadcast to group 0.
+    # The watcher's handler treats break the same as Ctrl-C.
+    if (-not [LustWin]::GenerateConsoleCtrlEvent(1, $Target)) {
         Write-Error "GenerateConsoleCtrlEvent failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
         exit 3
     }
@@ -127,7 +131,10 @@ $cmd = New-Object System.Text.StringBuilder 1024
 [void]$cmd.Append('"')
 [void]$cmd.Append($Exe)
 [void]$cmd.Append('" watch check hello.rs')
-$ok = [LustWin]::CreateProcess($Exe, $cmd, [IntPtr]::Zero, [IntPtr]::Zero, $true, 0x10, [IntPtr]::Zero, $WorkDir, [ref]$si, [ref]$pi)
+# CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP. The new console keeps
+# this off the test's Ctrl-C. The new group is what CTRL_BREAK_EVENT can
+# address; without it the interrupt never arrives.
+$ok = [LustWin]::CreateProcess($Exe, $cmd, [IntPtr]::Zero, [IntPtr]::Zero, $true, 0x210, [IntPtr]::Zero, $WorkDir, [ref]$si, [ref]$pi)
 $winerr = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
 [LustWin]::CloseHandle($stdin) | Out-Null
 [LustWin]::CloseHandle($stdout) | Out-Null

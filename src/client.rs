@@ -4,6 +4,7 @@
 // It has no custom allocator and few dependencies, so it starts in about a millisecond.
 //
 //   lust check <file.rs> [--json] [--timings]     lust check <file.rs> --rustc (oracle)
+//   lust watch check <file.rs> [check flags]     re-check on save (execs `lust-watch`)
 //   lust build <file.rs> [-o <out>] [-g] [--emit-c <prefix>] [--timings]
 //   lust build <file.rs> --release | --profile <name> [-o <out>]  (Cargo or rustc)
 //   lust build <file.rs> --release --target <triple>...            (lust + zig cc, per target)
@@ -145,6 +146,19 @@ fn main() {
     // (tools/lust-port), found next to this executable like `lust-core`.
     if args.first().map(String::as_str) == Some("port") {
         let tool = std::env::current_exe().map(|p| protocol::sibling_tool(&p, "lust-port")).unwrap_or_else(|_| tool_name("lust-port"));
+        let mut cmd = std::process::Command::new(&tool);
+        cmd.args(&args[1..]);
+        replace_with(&mut cmd, &tool);
+    }
+    // `lust watch` is a separate binary. notify is not a dependency of this
+    // client or of lust-core, so check/build/run do not load or start it.
+    if args.first().map(String::as_str) == Some("watch") {
+        let tool = std::env::current_exe().map(|p| protocol::sibling_tool(&p, "lust-watch")).unwrap_or_else(|_| tool_name("lust-watch"));
+        if !tool.is_file() {
+            eprintln!("error: lust watch needs the lust-watch binary next to this program ({})", tool.display());
+            eprintln!("error: build it with: cargo build --release --manifest-path tools/lust-watch/Cargo.toml");
+            std::process::exit(2);
+        }
         let mut cmd = std::process::Command::new(&tool);
         cmd.args(&args[1..]);
         replace_with(&mut cmd, &tool);

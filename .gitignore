@@ -1,4 +1,5 @@
 /target
+/tools/lust-watch/target
 /third_party/tinycc
 /third_party/tcc
 # lust's own local state. The cache is trusted local data: never commit it.

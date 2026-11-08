@@ -290,6 +290,7 @@ bash scripts/ci.sh
 
 ```sh
 lust check main.rs [--json] [--timings]     # type check and borrow check
+lust watch check main.rs [check flags]      # re-check when a source is saved
 lust run main.rs [-- args]                  # build with tcc and run
 lust build main.rs [-o out]                 # build a dev binary
 lust test main.rs [filter]                  # run #[test] functions
@@ -300,6 +301,8 @@ lust build main.rs --release                # release build with Cargo (rustc -O
 lust explain L0602                          # long help for one error code
 lust capabilities --json                    # what the subset supports and rejects
 ```
+
+`lust watch check` repeats that check when a source file, `Cargo.toml`, or `Cargo.lock` is saved. It keeps the working directory and the check flags (target, features, profile, `--sandbox`) and sends each check through the same client, so an already warm daemon session stays warm. `target/`, `.lust-cache`, and `$CARGO_TARGET_DIR` are not watched. Edits that land together become one check. An edit that lands while a check is running schedules one more check, and the diagnostics from the check that was in flight are marked `stale` until a later check matches the saved tree (`current`). Ctrl-C stops the watcher, the check it is running, and a daemon that this watch started. `watch` does not run tests or build. The watcher is a separate program (`lust-watch`); `check`, `build`, and `run` do not load it.
 
 A target in a Cargo workspace:
 

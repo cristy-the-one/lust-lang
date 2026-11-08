@@ -4,10 +4,15 @@ name: CI
 # valid (actionlint) and runs the same scripts/ci.sh gate as a dev box.
 # A feature-branch commit is tested by pull_request only. push on every
 # branch was starting a second full run of the same SHA.
+# Both events include next and main. The macOS job below has no `if:`,
+# so it runs on those events. An `if: false` on that job skipped it for
+# every pull request that did not edit this file: those runs use the
+# workflow from the base branch.
 on:
   push:
-    branches: [next]
+    branches: [next, main]
   pull_request:
+    branches: [next, main]
   workflow_dispatch:
     inputs:
       gate_filter:
@@ -140,6 +145,9 @@ jobs:
   # A queued arm64 job that never gets a runner is cancelled after about
   # 15 minutes ("not acquired by Runner of type hosted"). That is runner
   # capacity, not a build failure; re-run the job.
+  # This job is part of every push and pull_request to next and main.
+  # Do not add `if: false`: that condition skipped the job on every PR
+  # whose branch did not change this file.
   macos-arm64:
     runs-on: macos-latest
     steps:

@@ -72,7 +72,50 @@ if ! command -v timeout >/dev/null; then
   exit 2
 fi
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+# shellcheck source=scripts/os-sh.sh
+source "$root/scripts/os-sh.sh"
+# Sockets of daemons this run started. `test=` and `daemon=1` launch one
+# with its working directory inside the fixture (`cd "$proj"`). Nothing
+# else stops it. On Windows a process's cwd cannot be removed, so the
+# exit cleanup printed "Device or resource busy" for test-integration
+# and test-libtest-model and left lust-core alive into the next step.
+daemon_socks=()
+stop_daemon_sock() {
+  local sock=$1 pid i
+  [ -n "$sock" ] || return 0
+  pid=$(tr -d '[:space:]' <"$sock.lock" 2>/dev/null || true)
+  # Removing the address file is the daemon's stop request on every host.
+  rm -f "$sock" 2>/dev/null || true
+  [ -n "$pid" ] || return 0
+  i=0
+  while [ "$i" -lt 50 ]; do
+    pid_alive "$pid" || return 0
+    sleep 0.1
+    i=$((i + 1))
+  done
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) taskkill //F //T //PID "$pid" >/dev/null 2>&1 || true ;;
+    *) kill_hard "$pid" ;;
+  esac
+  i=0
+  while [ "$i" -lt 20 ]; do
+    pid_alive "$pid" || return 0
+    sleep 0.1
+    i=$((i + 1))
+  done
+}
+stop_fixture_daemons() {
+  local s
+  for s in "${daemon_socks[@]+"${daemon_socks[@]}"}"; do
+    stop_daemon_sock "$s"
+  done
+  daemon_socks=()
+}
+cleanup() {
+  stop_fixture_daemons
+  rm -rf "$work" || true
+}
+trap cleanup EXIT
 # Cold, cache-free lust builds: daemon routing has its own gate in smoke.py.
 export LUST_NO_DAEMON=1
 export LUST_DAEMON_SOCKET="$work/no-daemon.sock"
@@ -101,6 +144,9 @@ report() {
 host_triple=$(rustc -vV | sed -n 's/^host: //p')
 
 for dir in "$fixtures"/*/; do
+  # A daemon from the previous fixture is gone before this one starts,
+  # including when that fixture returned through `continue`.
+  stop_fixture_daemons
   name=$(basename "$dir")
   [[ -n "$filter" && "$name" != *"$filter"* ]] && continue
   seen=$((seen + 1))
@@ -195,6 +241,9 @@ for dir in "$fixtures"/*/; do
     else
       # The cold run above forces LUST_NO_DAEMON. These two use a private
       # daemon; the second is the warm build of the same test binary.
+      # The socket is recorded so cleanup stops the process even when a
+      # pass returns early.
+      daemon_socks+=("$proj/.lust-daemon.sock")
       dbad=""
       for dpass in cold warm; do
         (cd "$proj" && lust_cc env -u LUST_NO_DAEMON LUST_DAEMON_SOCKET="$proj/.lust-daemon.sock" LUST_DAEMON_IDLE=30 \
@@ -210,6 +259,7 @@ for dir in "$fixtures"/*/; do
           break
         fi
       done
+      stop_fixture_daemons
       if [ -n "$dbad" ]; then
         report bad "$name" "$dbad"
       else
@@ -309,8 +359,10 @@ for dir in "$fixtures"/*/; do
 
   if [ "$daemon" = 1 ]; then
     # The same build twice through a private daemon (the client starts it
-    # on this socket, inside the project dir; it exits once idle): its
-    # cold build, then its warm one, must give the same program.
+    # on this socket, inside the project dir). Idle exit is not how this
+    # script reclaims the directory: the process is stopped below, before
+    # the next fixture and before `rm`.
+    daemon_socks+=("$proj/.lust-daemon.sock")
     dbad=""
     for dpass in cold warm; do
       env -u LUST_NO_DAEMON LUST_DAEMON_SOCKET="$proj/.lust-daemon.sock" LUST_DAEMON_IDLE=20 \
@@ -325,6 +377,7 @@ for dir in "$fixtures"/*/; do
         break
       fi
     done
+    stop_fixture_daemons
     if [ -n "$dbad" ]; then
       report bad "$name" "$dbad"
       continue

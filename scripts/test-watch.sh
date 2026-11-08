@@ -31,8 +31,8 @@ fi
 rel=$root/tools/lust-watch/target/release
 mkdir -p "$root/target/release"
 if [ -f "$rel/lust-watch.exe" ]; then
+  # Git bash treats `name` and `name.exe` as the same file.
   cp "$rel/lust-watch.exe" "$root/target/release/lust-watch.exe"
-  cp "$rel/lust-watch.exe" "$root/target/release/lust-watch"
 else
   cp "$rel/lust-watch" "$root/target/release/lust-watch"
 fi
@@ -60,6 +60,9 @@ fi
 work=$(mktemp -d)
 cleanup() {
   cd "$root" || true
+  if [ "${win_job:-0}" -eq 1 ] && [ -n "${wpid:-}" ]; then
+    taskkill //F //T //PID "$wpid" >/dev/null 2>&1 || true
+  fi
   local pid
   pid=$(cat "$work"/.lust-daemon-*.sock.lock 2>/dev/null || true)
   if [ -n "${pid:-}" ]; then
@@ -81,7 +84,6 @@ cd "$work"
 aside=$root/target/release/lust-watch.aside
 if [ -f "$root/target/release/lust-watch.exe" ]; then
   mv "$root/target/release/lust-watch.exe" "$aside.exe"
-  mv "$root/target/release/lust-watch" "$aside" 2>/dev/null || true
 else
   mv "$root/target/release/lust-watch" "$aside"
 fi
@@ -94,7 +96,6 @@ else
 fi
 if [ -f "$aside.exe" ]; then
   mv "$aside.exe" "$root/target/release/lust-watch.exe"
-  cp "$root/target/release/lust-watch.exe" "$root/target/release/lust-watch"
 else
   mv "$aside" "$root/target/release/lust-watch"
 fi
@@ -102,19 +103,38 @@ fi
 # One real watch through the client: error, then a fix, then Ctrl-C.
 # The Rust tests cover coalescing. This checks the exec from `lust`.
 printf 'fn main() { let x: i32 = "no"; }\n' >"$work/hello.rs"
-LUST_WATCH_DEBOUNCE_MS=30 LUST_DAEMON_IDLE=60 "$lust" watch check hello.rs >"$work/out" 2>"$work/err" &
-wpid=$!
+export LUST_WATCH_DEBOUNCE_MS=30 LUST_DAEMON_IDLE=60
+win_job=0
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    # A background job shares this console, so a Ctrl-C aimed at it also
+    # hits the script. Start lust in its own console and signal that.
+    win_job=1
+    wpid=$(powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -m "$root/scripts/win-watch.ps1")" -Action start -Exe "$(cygpath -m "$lust")" -WorkDir "$(cygpath -m "$work")" -ErrFile "$(cygpath -m "$work/err")" -OutFile "$(cygpath -m "$work/out")" 2>"$work/launch.err" | tr -d '\r ')
+    ;;
+  *)
+    "$lust" watch check hello.rs >"$work/out" 2>"$work/err" &
+    wpid=$!
+    ;;
+esac
+job_alive() {
+  if [ "$win_job" -eq 1 ]; then
+    pid_alive "$wpid"
+  else
+    kill -0 "$wpid" 2>/dev/null
+  fi
+}
 i=0
 while [ "$i" -lt 50 ]; do
   if grep -q 'watch-status:' "$work/err" 2>/dev/null; then break; fi
-  if ! pid_alive "$wpid" && ! kill -0 "$wpid" 2>/dev/null; then break; fi
+  if ! job_alive; then break; fi
   sleep 0.1
   i=$((i + 1))
 done
 if grep -q 'L0110' "$work/err" && grep -q 'watch-status: current code=1' "$work/err"; then
   ok "client watch reports the type error as current"
 else
-  bad "client watch reports the type error as current" "$(tail -20 "$work/err")"
+  bad "client watch reports the type error as current" "$(tail -20 "$work/err"; echo; tail -20 "$work/launch.err" 2>/dev/null)"
 fi
 printf 'fn main() {}\n' >"$work/hello.rs"
 i=0
@@ -131,30 +151,43 @@ if grep -q 'watch-status: current code=0' "$work/err"; then
 else
   bad "client watch clears the error" "$(tail -20 "$work/err")"
 fi
-# Ctrl-C. On Windows Git bash, kill -INT is not the console handler; the
-# Rust tests send CTRL_BREAK. Here, SIGTERM is the same handler on Unix,
-# and on Windows we remove the socket after the process is stopped below.
+# Ctrl-C. On Unix, SIGINT is the watcher's handler. On Windows the client
+# is in its own console: attach to it and send CTRL_C_EVENT. taskkill
+# without /F does not deliver that event, and a bare `wait` then blocks
+# for as long as the process lives.
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*)
-    winpid=$wpid
-    if [ -r "/proc/$wpid/winpid" ]; then winpid=$(cat "/proc/$wpid/winpid"); fi
-    taskkill //T //PID "$winpid" >/dev/null 2>&1 || true
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -m "$root/scripts/win-watch.ps1")" -Action ctrl -Target "$wpid" >"$work/ctrl.err" 2>&1 || true
     ;;
   *) kill -INT "$wpid" 2>/dev/null || true ;;
 esac
 i=0
-while pid_alive "$wpid" || kill -0 "$wpid" 2>/dev/null; do
+while job_alive; do
   i=$((i + 1))
-  if [ "$i" -gt 30 ]; then break; fi
+  if [ "$i" -gt 40 ]; then break; fi
   sleep 0.1
 done
-if pid_alive "$wpid" || kill -0 "$wpid" 2>/dev/null; then
-  kill_hard "$wpid" || true
-  bad "watch stops on interrupt" "still running"
+if job_alive; then
+  if [ "$win_job" -eq 1 ]; then
+    taskkill //F //T //PID "$wpid" >/dev/null 2>&1 || true
+  else
+    kill_hard "$wpid" || true
+  fi
+  bad "watch stops on interrupt" "still running $(tail -5 "$work/ctrl.err" 2>/dev/null)"
+elif ! grep -q 'lust watch: stopped' "$work/err"; then
+  bad "watch stops on interrupt" "exited without stopping: $(tail -20 "$work/err")"
 else
   ok "watch stops on interrupt"
 fi
-wait "$wpid" 2>/dev/null || true
+# Reap a Unix job. Bounded: a survivor must not hold the rest of the step.
+if [ "$win_job" -eq 0 ]; then
+  i=0
+  while kill -0 "$wpid" 2>/dev/null; do
+    i=$((i + 1))
+    if [ "$i" -gt 20 ]; then break; fi
+    sleep 0.1
+  done
+fi
 
 cd "$root"
 echo "test-watch: cargo test"

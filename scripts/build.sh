@@ -16,8 +16,9 @@ cp target/gate/lust target/gate/lust-core target/release/
 # Its release binary sits next to the client; `lust watch` execs it.
 cargo build --release --manifest-path tools/lust-watch/Cargo.toml --bin lust-watch
 if [ -f tools/lust-watch/target/release/lust-watch.exe ]; then
+  # Git bash treats `name` and `name.exe` as the same file, so a second
+  # copy onto the bare name fails. The client looks for the `.exe` first.
   cp tools/lust-watch/target/release/lust-watch.exe target/release/lust-watch.exe
-  cp tools/lust-watch/target/release/lust-watch.exe target/release/lust-watch
 else
   cp tools/lust-watch/target/release/lust-watch target/release/lust-watch
 fi

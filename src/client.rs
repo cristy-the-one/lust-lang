@@ -161,6 +161,12 @@ fn main() {
         }
         let mut cmd = std::process::Command::new(&tool);
         cmd.args(&args[1..]);
+        // Windows has no exec: this process waits on lust-watch. Swallow
+        // Ctrl-C here so the default handler does not kill the waiter and
+        // leave the watcher (and its daemon) running. lust-watch receives
+        // the same event and shuts down; this wait then returns.
+        #[cfg(windows)]
+        ignore_ctrl_c();
         replace_with(&mut cmd, &tool);
     }
     let core = std::env::current_exe().map(|p| protocol::sibling_tool(&p, "lust-core")).unwrap_or_else(|_| tool_name("lust-core"));
@@ -251,6 +257,18 @@ fn tool_name(name: &str) -> PathBuf {
     {
         PathBuf::from(name)
     }
+}
+
+/// Ctrl-C and Ctrl-Break are handled by the process this one is waiting on.
+#[cfg(windows)]
+fn ignore_ctrl_c() {
+    unsafe extern "system" {
+        fn SetConsoleCtrlHandler(handler: Option<unsafe extern "system" fn(u32) -> i32>, add: i32) -> i32;
+    }
+    unsafe extern "system" fn swallow(ctrl: u32) -> i32 {
+        if ctrl <= 1 { 1 } else { 0 }
+    }
+    unsafe { SetConsoleCtrlHandler(Some(swallow), 1); }
 }
 
 /// Replaces this process with `cmd` on Unix (`exec` keeps the pid, which the

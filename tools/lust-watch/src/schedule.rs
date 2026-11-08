@@ -1,9 +1,14 @@
-//! One check at a time, with a debounce in front of each check.
+//! One check at a time. The deadline is the quiet time of the newest save,
+//! not the moment a kernel event showed up.
 //!
-//! Relevant events while idle collapse into a single deadline. Events while a
-//! check is running do not start another check: they set one pending bit, and
-//! the finish of that check arms exactly one follow-up (which itself debounces
-//! with any edits that arrive after the check).
+//! macOS FSEvents (latency 0, `kFSEventStreamEventIdSinceNow`) still delivers
+//! a save late, and can deliver the same save again in a later batch, including
+//! a notification for the tree that existed when the stream started. A second
+//! batch is not a second check: the caller drops the deadline when the saved
+//! bytes match the check already run, and moves this one deadline when a newer
+//! save is still inside the quiet period. A save that arrives while a check is
+//! running sets one pending bit. The finish does not arm a follow-up by itself;
+//! the caller arms exactly one, from the tree's mtime.
 
 use std::time::{Duration, Instant};
 
@@ -33,17 +38,42 @@ impl Scheduler {
         self.running
     }
 
+    pub fn debounce(&self) -> Duration {
+        self.debounce
+    }
+
     pub fn is_pending(&self) -> bool {
         self.pending
     }
 
-    /// A relevant path changed and the save is visible.
-    pub fn on_relevant(&mut self, now: Instant) {
-        self.last_event = Some(now);
+    /// The saved tree differs from the last settled check. `quiet_at` is when
+    /// the newest save is old enough to check (the save's mtime plus the
+    /// debounce, which may already be `now` when the kernel delivered the
+    /// event late). A later save replaces that one deadline. While a check
+    /// runs, this only records that one follow-up is owed.
+    pub fn on_save(&mut self, now: Instant, quiet_at: Instant) {
         if self.running {
             self.pending = true;
-        } else {
-            self.deadline = Some(now + self.debounce);
+            return;
+        }
+        self.last_event = Some(now);
+        self.deadline = Some(quiet_at);
+    }
+
+    /// The saved bytes match the check already finished. A late kernel event
+    /// for that same tree must not start another check.
+    pub fn on_unchanged(&mut self) {
+        if !self.running {
+            self.deadline = None;
+            self.last_event = None;
+        }
+    }
+
+    /// The quiet time moved (a save landed after the deadline was chosen)
+    /// but the edit this check answers stays the one already recorded.
+    pub fn postpone(&mut self, quiet_at: Instant) {
+        if !self.running && self.deadline.is_some() {
+            self.deadline = Some(quiet_at);
         }
     }
 
@@ -83,15 +113,15 @@ impl Scheduler {
     }
 
     /// The running check has finished. Returns whether a relevant change
-    /// landed during it (the diagnostics are stale). When that happened,
-    /// exactly one follow-up is armed.
-    pub fn on_finished(&mut self, now: Instant) -> bool {
+    /// landed during it. The deadline is cleared either way: a follow-up is
+    /// one `on_save` from the caller, using the tree's mtime, so a kernel
+    /// batch that shows up later cannot add a second quiet window on top.
+    pub fn on_finished(&mut self) -> bool {
         let stale = self.pending;
         self.running = false;
         self.pending = false;
-        if stale {
-            self.deadline = Some(now + self.debounce);
-        }
+        self.deadline = None;
+        self.last_event = None;
         stale
     }
 }
@@ -109,10 +139,12 @@ mod tests {
         let base = Instant::now();
         let mut s = Scheduler::new(Duration::from_millis(100));
         for i in 0..8 {
-            s.on_relevant(at(base, i * 10));
-            assert!(s.poll(at(base, i * 10 + 5)).is_none());
+            // Each save replaces the one quiet deadline. The first edit's
+            // deadline (100) must not start a check once a later save exists.
+            let saved_at = i * 10;
+            s.on_save(at(base, saved_at), at(base, saved_at + 100));
+            assert!(s.poll(at(base, saved_at + 5)).is_none());
         }
-        // The deadline is the last edit plus the debounce, not the first.
         assert!(s.poll(at(base, 169)).is_none());
         assert!(s.poll(at(base, 170)).is_some());
         assert!(s.running());
@@ -123,21 +155,26 @@ mod tests {
     fn edits_during_a_check_schedule_exactly_one_follow_up() {
         let base = Instant::now();
         let mut s = Scheduler::new(Duration::from_millis(50));
-        s.on_relevant(base);
+        s.on_save(base, at(base, 50));
         assert!(s.poll(at(base, 50)).is_some());
-        s.on_relevant(at(base, 60));
-        s.on_relevant(at(base, 70));
-        s.on_relevant(at(base, 80));
-        assert!(s.poll(at(base, 90)).is_none());
-        assert!(s.on_finished(at(base, 100)));
+        s.on_save(at(base, 60), at(base, 110));
+        s.on_save(at(base, 70), at(base, 120));
+        s.on_save(at(base, 80), at(base, 130));
+        assert!(s.poll(at(base, 200)).is_none());
+        assert!(s.on_finished());
         assert!(!s.running());
-        // Not a second or a third check: one deadline.
+        // Finish does not invent a deadline. The caller arms one follow-up.
+        assert!(s.poll(at(base, 500)).is_none());
+        s.on_save(at(base, 100), at(base, 150));
         assert!(s.poll(at(base, 149)).is_none());
         assert!(s.poll(at(base, 150)).is_some());
-        // An edit during the follow-up waits for that check to finish.
-        s.on_relevant(at(base, 160));
+        // An edit during the follow-up waits for that check to finish,
+        // and again becomes exactly one arm.
+        s.on_save(at(base, 160), at(base, 210));
         assert!(s.poll(at(base, 400)).is_none());
-        assert!(s.on_finished(at(base, 410)));
+        assert!(s.on_finished());
+        assert!(s.poll(at(base, 500)).is_none());
+        s.on_save(at(base, 410), at(base, 460));
         assert!(s.poll(at(base, 459)).is_none());
         assert!(s.poll(at(base, 460)).is_some());
     }
@@ -147,12 +184,13 @@ mod tests {
         let base = Instant::now();
         let mut s = Scheduler::new(Duration::from_millis(50));
         s.begin();
-        s.on_relevant(at(base, 10));
-        assert!(s.on_finished(at(base, 20)));
-        s.on_relevant(at(base, 40));
+        s.on_save(at(base, 10), at(base, 60));
+        assert!(s.on_finished());
+        s.on_save(at(base, 20), at(base, 70));
+        s.on_save(at(base, 40), at(base, 90));
         assert!(s.poll(at(base, 70)).is_none());
         assert!(s.poll(at(base, 90)).is_some());
-        assert!(!s.on_finished(at(base, 100)));
+        assert!(!s.on_finished());
         assert!(s.poll(at(base, 200)).is_none());
     }
 
@@ -161,7 +199,35 @@ mod tests {
         let base = Instant::now();
         let mut s = Scheduler::new(Duration::from_millis(50));
         s.begin();
-        assert!(!s.on_finished(base));
+        assert!(!s.on_finished());
         assert!(s.poll(at(base, 1000)).is_none());
+    }
+
+    #[test]
+    fn unchanged_tree_cancels_a_late_event() {
+        let base = Instant::now();
+        let mut s = Scheduler::new(Duration::from_millis(120));
+        // A scan event, or a second FSEvents batch for the bytes just checked.
+        s.on_save(base, at(base, 120));
+        s.on_unchanged();
+        assert!(s.poll(at(base, 120)).is_none());
+        assert!(s.poll(at(base, 500)).is_none());
+    }
+
+    #[test]
+    fn postpone_keeps_a_burst_that_the_kernel_split() {
+        let base = Instant::now();
+        let mut s = Scheduler::new(Duration::from_millis(100));
+        s.on_save(base, at(base, 100));
+        // At the first quiet time the newest save is newer than the one
+        // that armed the deadline (the kernel had not delivered it yet).
+        // The same check waits; it does not start and then start again.
+        s.postpone(at(base, 180));
+        assert!(s.poll(at(base, 100)).is_none());
+        assert!(s.poll(at(base, 179)).is_none());
+        assert!(s.poll(at(base, 180)).is_some());
+        s.on_save(at(base, 190), at(base, 290));
+        assert!(s.is_pending());
+        assert!(s.poll(at(base, 400)).is_none());
     }
 }

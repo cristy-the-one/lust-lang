@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
-use lust_watch::{fingerprint, is_real_dir, is_relevant, is_skipped_dir, parse_watch, usage, watch_plan, Plan, Scheduler};
+use lust_watch::{is_real_dir, is_relevant, is_skipped_dir, parse_watch, survey, usage, watch_plan, Plan, Scheduler};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -65,6 +65,9 @@ fn main() {
     eprintln!("lust watch: {} (debounce {debounce_ms} ms)", cmd.file.display());
     let mut sched = Scheduler::new(debounce);
     sched.begin();
+    // Fingerprint of the last check whose bytes matched the tree. A later
+    // kernel event for those same bytes is not another check.
+    let mut settled: Option<u64> = None;
     let mut inflight = match start_check(&client, &cmd.args, &plan) {
         Ok(run) => Some(run),
         Err(e) => {
@@ -76,34 +79,42 @@ fn main() {
         if STOP.load(Ordering::SeqCst) {
             break;
         }
-        let mut saw = false;
         while let Ok(event) = rx.try_recv() {
-            saw = true;
-            on_event(&event, &mut watcher, &mut watched, &plan, &mut sched);
-        }
-        if saw {
-            continue;
+            on_event(&event, &mut watcher, &mut watched, &plan, &mut sched, &inflight, settled, debounce);
         }
         let now = Instant::now();
-        if let Some(trigger) = sched.poll(now) {
-            match start_check(&client, &cmd.args, &plan) {
-                Ok(run) => inflight = Some(Check { trigger: Some(trigger), ..run }),
-                Err(e) => {
-                    eprintln!("error: cannot run {}: {e}", client.display());
-                    sched.on_finished(now);
+        // The quiet time is up. Re-read mtimes first: saves the kernel has
+        // not delivered yet still move this one deadline instead of starting
+        // a check that would need a second one.
+        if sched.time_until(now).is_some_and(|d| d.is_zero()) {
+            let saved = survey(&plan.roots, &plan.exclude, plan.output.as_deref());
+            if settled.is_some_and(|fp| fp == saved.fingerprint) {
+                sched.on_unchanged();
+            } else {
+                let quiet = quiet_at(now, saved.newest, debounce);
+                if quiet > now {
+                    sched.postpone(quiet);
+                } else if let Some(trigger) = sched.poll(now) {
+                    match start_check(&client, &cmd.args, &plan) {
+                        Ok(run) => inflight = Some(Check { trigger: Some(trigger), ..run }),
+                        Err(e) => {
+                            eprintln!("error: cannot run {}: {e}", client.display());
+                            sched.on_finished();
+                        }
+                    }
+                    continue;
                 }
             }
-            continue;
         }
         let done = inflight.as_mut().and_then(|run| run.child.try_wait().ok().flatten());
         if let Some(status) = done {
             let run = inflight.take().expect("the check that just finished");
-            finish_check(run, status, &plan, &mut sched);
+            finish_check(run, status, &plan, &mut sched, &mut settled, debounce);
             continue;
         }
         let slice = sched.time_until(Instant::now()).unwrap_or(Duration::from_millis(50)).min(Duration::from_millis(50));
         match rx.recv_timeout(slice) {
-            Ok(event) => on_event(&event, &mut watcher, &mut watched, &plan, &mut sched),
+            Ok(event) => on_event(&event, &mut watcher, &mut watched, &plan, &mut sched, &inflight, settled, debounce),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
@@ -126,7 +137,7 @@ struct Check {
 }
 
 fn start_check(client: &Path, args: &[String], plan: &Plan) -> std::io::Result<Check> {
-    let fingerprint = fingerprint(&plan.roots, &plan.exclude, plan.output.as_deref());
+    let fingerprint = survey(&plan.roots, &plan.exclude, plan.output.as_deref()).fingerprint;
     let mut cmd = Command::new(client);
     cmd.arg("check").args(args);
     cmd.stdin(Stdio::null());
@@ -148,39 +159,96 @@ fn start_check(client: &Path, args: &[String], plan: &Plan) -> std::io::Result<C
     Ok(Check { child, fingerprint, trigger: None })
 }
 
-fn finish_check(run: Check, status: ExitStatus, plan: &Plan, sched: &mut Scheduler) {
-    // `try_wait` already reaped the child. A fingerprint change means a save
-    // landed after the snapshot even if its event is still in the channel;
-    // that event is applied on the next loop turn and resets this one follow-up.
-    let now = Instant::now();
-    let fp_now = fingerprint(&plan.roots, &plan.exclude, plan.output.as_deref());
-    if fp_now != run.fingerprint {
-        sched.note_dirty();
-    }
-    let stale = sched.is_pending();
+fn finish_check(run: Check, status: ExitStatus, plan: &Plan, sched: &mut Scheduler, settled: &mut Option<u64>, debounce: Duration) {
+    // `try_wait` already reaped the child. Stale means the bytes on disk
+    // are not the bytes this check snapshotted. A notification that does
+    // not change those bytes (the FSEvents scan, or a second batch of a
+    // save we already checked) leaves the result current and arms nothing.
+    let saved = survey(&plan.roots, &plan.exclude, plan.output.as_deref());
+    let stale = saved.fingerprint != run.fingerprint;
     let code = status.code().unwrap_or(1);
     let latency = run.trigger.map(|t| t.elapsed().as_millis().to_string()).unwrap_or_else(|| "-".to_string());
     let fresh = if stale { "stale" } else { "current" };
     eprintln!("watch-status: {fresh} code={code} latency-ms={latency}");
     let _ = std::io::Write::flush(&mut std::io::stderr());
-    sched.on_finished(now);
+    if !stale {
+        *settled = Some(run.fingerprint);
+    }
+    sched.on_finished();
+    if stale {
+        // Exactly one follow-up. Its quiet time is the newest mtime, so
+        // events that are still queued cannot schedule a second one.
+        arm_if_changed(plan, sched, *settled, debounce);
+    }
 }
 
-fn on_event(event: &Event, watcher: &mut RecommendedWatcher, watched: &mut std::collections::HashSet<PathBuf>, plan: &Plan, sched: &mut Scheduler) {
+fn on_event(
+    event: &Event,
+    watcher: &mut RecommendedWatcher,
+    watched: &mut std::collections::HashSet<PathBuf>,
+    plan: &Plan,
+    sched: &mut Scheduler,
+    inflight: &Option<Check>,
+    settled: Option<u64>,
+    debounce: Duration,
+) {
     if matches!(event.kind, EventKind::Access(_)) {
         return;
     }
+    let mut look = false;
     for path in &event.paths {
         if is_skipped_dir(path, &plan.exclude) {
             continue;
         }
         if is_real_dir(path) {
             add_tree(watcher, watched, path, plan);
+            look = true;
             continue;
         }
         if is_relevant(path, &plan.exclude, plan.output.as_deref()) {
-            sched.on_relevant(Instant::now());
+            look = true;
         }
+    }
+    if !look {
+        return;
+    }
+    let saved = survey(&plan.roots, &plan.exclude, plan.output.as_deref());
+    if sched.running() {
+        // Same bytes as the check that is already running: the event is
+        // the scan or a duplicate, not an edit.
+        if inflight.as_ref().is_some_and(|run| saved.fingerprint != run.fingerprint) {
+            sched.note_dirty();
+        }
+        return;
+    }
+    if settled.is_some_and(|fp| fp == saved.fingerprint) {
+        sched.on_unchanged();
+        return;
+    }
+    let now = Instant::now();
+    sched.on_save(now, quiet_at(now, saved.newest, debounce));
+}
+
+fn arm_if_changed(plan: &Plan, sched: &mut Scheduler, settled: Option<u64>, debounce: Duration) {
+    let saved = survey(&plan.roots, &plan.exclude, plan.output.as_deref());
+    if settled.is_some_and(|fp| fp == saved.fingerprint) {
+        sched.on_unchanged();
+        return;
+    }
+    let now = Instant::now();
+    sched.on_save(now, quiet_at(now, saved.newest, debounce));
+}
+
+/// When the newest save has already been quiet for `debounce`, the deadline
+/// is `now` (a late kernel batch does not add another wait, and does not
+/// split the burst). Otherwise it is the moment that save becomes quiet.
+fn quiet_at(now: Instant, newest: Option<SystemTime>, debounce: Duration) -> Instant {
+    let Some(newest) = newest else {
+        return now + debounce;
+    };
+    match newest.elapsed() {
+        Ok(age) => now + debounce.saturating_sub(age),
+        Err(_) => now + debounce,
     }
 }
 

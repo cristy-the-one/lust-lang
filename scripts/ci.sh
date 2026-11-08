@@ -211,7 +211,14 @@ run_step "ts-rust kernels and compat fixtures" kernel_suite
 if [ -e scripts/test-client.sh ]; then
   run_step "client tests" scripts/test-client.sh
 fi
-run_step "lust watch check" scripts/test-watch.sh
+# shellcheck source=scripts/gnu-tools.sh
+source "$root/scripts/gnu-tools.sh"
+# Each watch test already bounds its own wait. This bound ends the step
+# when a watcher or a check never returns, and the rest of the gate still
+# runs. Difftest, the sanitized difftest, fuzz, and the benchmark smoke
+# are the rest of the wall clock; a full next run sits past an hour
+# without this step.
+run_step "lust watch check" timeout "${WATCH_STEP_TIMEOUT:-1200}" scripts/test-watch.sh
 run_step "crate fixture tests" crate_suite
 # gnu-tools gives a `timeout` that wraps a command. Windows `timeout.exe`
 # does not. The sandbox script bounds each lust call; this bound is the

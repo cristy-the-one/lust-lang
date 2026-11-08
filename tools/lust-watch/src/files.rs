@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Component, Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::time::SystemTime;
 
 const SKIP_DIRS: &[&str] = &["target", ".lust-cache", ".git"];
 
@@ -154,25 +154,43 @@ pub fn is_relevant(path: &Path, exclude: &[PathBuf], output: Option<&Path>) -> b
     path.extension().is_some_and(|e| e == "rs")
 }
 
-/// A fingerprint of the relevant files under `roots`. Skipped directories
-/// are not read. Used to tell a check that raced a save from one that
-/// matches the tree still on disk.
+/// Identity of the saved sources, plus the newest save time.
+///
+/// The fingerprint is the file bytes. A kernel notification for a file that
+/// was not edited (FSEvents delivers those for the tree that was already
+/// there, and again in a later batch) hashes the same and is not a new check.
+/// `newest` is the newest mtime, which is the clock the quiet period uses, so
+/// a burst stays one check when those notifications arrive after the debounce.
+#[derive(Clone, Copy, Debug)]
+pub struct Survey {
+    pub fingerprint: u64,
+    pub newest: Option<SystemTime>,
+}
+
 pub fn fingerprint(roots: &[PathBuf], exclude: &[PathBuf], output: Option<&Path>) -> u64 {
+    survey(roots, exclude, output).fingerprint
+}
+
+pub fn survey(roots: &[PathBuf], exclude: &[PathBuf], output: Option<&Path>) -> Survey {
     let mut files = BTreeSet::new();
     for root in roots {
         collect(root, exclude, output, &mut files);
     }
     let mut h = 0xcbf29ce484222325u64;
+    let mut newest: Option<SystemTime> = None;
     for path in files {
         h = mix(h, hash_bytes(path.as_os_str().as_encoded_bytes()));
         if let Ok(meta) = std::fs::symlink_metadata(&path) {
-            h = mix(h, meta.len());
-            let nanos = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_nanos()).unwrap_or(0);
-            h = mix(h, nanos as u64);
-            h = mix(h, (nanos >> 64) as u64);
+            if let Ok(modified) = meta.modified() {
+                newest = Some(newest.map_or(modified, |have| have.max(modified)));
+            }
+            match std::fs::read(&path) {
+                Ok(bytes) => h = mix(h, hash_bytes(&bytes)),
+                Err(_) => h = mix(h, 0xdead),
+            }
         }
     }
-    h
+    Survey { fingerprint: h, newest }
 }
 
 fn collect(dir: &Path, exclude: &[PathBuf], output: Option<&Path>, files: &mut BTreeSet<PathBuf>) {
@@ -274,6 +292,13 @@ mod tests {
         assert_eq!(h1, fingerprint(&[root.clone()], &[], None));
         std::fs::write(&main, "fn main() { let _ = 1; }\n").unwrap();
         assert_ne!(h1, fingerprint(&[root.clone()], &[], None));
+        // A second delivery of the same bytes is the same check. mtime may move.
+        let again = fingerprint(&[root.clone()], &[], None);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&main, "fn main() { let _ = 1; }\n").unwrap();
+        assert_eq!(again, fingerprint(&[root.clone()], &[], None));
+        let saved = survey(&[root.clone()], &[], None);
+        assert!(saved.newest.is_some());
         let _ = std::fs::remove_dir_all(&root);
     }
 

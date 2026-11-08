@@ -8,6 +8,6 @@ mod files;
 mod parse;
 mod schedule;
 
-pub use files::{fingerprint, is_real_dir, is_relevant, is_skipped_dir, project_root, watch_plan, Plan};
+pub use files::{fingerprint, is_real_dir, is_relevant, is_skipped_dir, project_root, survey, watch_plan, Plan, Survey};
 pub use parse::{parse_watch, usage, CheckCmd};
 pub use schedule::Scheduler;

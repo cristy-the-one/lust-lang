@@ -8,6 +8,8 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
 # shellcheck source=scripts/os-sh.sh
 source "$root/scripts/os-sh.sh"
+# shellcheck source=scripts/gnu-tools.sh
+source "$root/scripts/gnu-tools.sh"
 
 pass=0
 fail=0
@@ -156,10 +158,19 @@ wait "$wpid" 2>/dev/null || true
 
 cd "$root"
 echo "test-watch: cargo test"
-if LUST="$lust" LUST_WATCH_REQUIRE_COMPILER=1 cargo test --manifest-path "$root/tools/lust-watch/Cargo.toml" -- --test-threads=1 --nocapture; then
+# Debug rebuild plus the tests. A stuck lust-watch used to hold the step
+# until the job was killed; 124 is that bound, and the timing line below
+# still runs.
+test_timeout=${WATCH_TEST_TIMEOUT:-600}
+if timeout "$test_timeout" env LUST="$lust" LUST_WATCH_REQUIRE_COMPILER=1 cargo test --manifest-path "$root/tools/lust-watch/Cargo.toml" -- --test-threads=1 --nocapture; then
   ok "lust-watch tests"
 else
-  bad "lust-watch tests" "cargo test failed"
+  st=$?
+  if [ "$st" -eq 124 ]; then
+    bad "lust-watch tests" "timed out after ${test_timeout}s"
+  else
+    bad "lust-watch tests" "cargo test failed"
+  fi
 fi
 
 # Startup and a one-file check, so a later run can compare. The watcher is

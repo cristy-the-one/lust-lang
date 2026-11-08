@@ -130,7 +130,13 @@ impl Drop for Session {
             self.signal_stop();
             if !self.wait_exit(Duration::from_secs(3)) {
                 let _ = self.child.kill();
-                let _ = self.child.wait();
+                let killed = Instant::now();
+                while killed.elapsed() < Duration::from_secs(2) {
+                    if self.child.try_wait().ok().flatten().is_some() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
             }
         }
         let _ = std::fs::remove_dir_all(&self.dir);
@@ -195,6 +201,27 @@ fn rapid_edits_coalesce_to_one_check() {
     assert!(log.contains(name), "check keeps the working directory\n{log}");
     session.signal_stop();
     assert!(session.wait_exit(Duration::from_secs(3)), "clean stop\n{}", session.output());
+}
+
+#[test]
+fn same_bytes_are_not_another_check() {
+    // A kernel can report the file again without the bytes changing
+    // (FSEvents does this for the tree that was already on disk, and again
+    // in a later batch). Those reports must not start a check.
+    let dir = scratch("same");
+    let src = "fn main() {}\n";
+    std::fs::write(dir.join("main.rs"), src).unwrap();
+    let env = stub_env(&dir, 0, 80);
+    let mut session = Session::spawn(&dir, &["check", "main.rs"], &env);
+    assert!(session.wait_until("watch-status:", 1, Duration::from_secs(5)), "{}", session.output());
+    std::thread::sleep(Duration::from_millis(40));
+    for _ in 0..6 {
+        std::fs::write(dir.join("main.rs"), src).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(session.line_count("watch-status:"), 1, "same bytes are not a new check\n{}", session.output());
+    assert_eq!(stub_starts(&dir), 1, "{}", std::fs::read_to_string(dir.join("stub.log")).unwrap_or_default());
 }
 
 #[test]

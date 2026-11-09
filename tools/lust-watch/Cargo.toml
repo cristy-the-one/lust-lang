@@ -1,0 +1,28 @@
+[package]
+name = "lust-watch"
+version = "0.1.0"
+edition = "2024"
+description = "Opt-in lust watch check. Not linked into lust or lust-core."
+license = "MIT"
+
+# Detached from the root crate on purpose: the root must not become a workspace,
+# and notify must not be a dependency of lust or lust-core.
+[workspace]
+
+[lib]
+name = "lust_watch"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lust-watch"
+path = "src/main.rs"
+
+[[bin]]
+name = "watch-stub"
+path = "src/stub.rs"
+
+[dependencies]
+notify = "=8.2.0"
+
+[profile.release]
+debug = false

@@ -25,31 +25,53 @@ if [ "$(type -t timeout 2>/dev/null || true)" != function ]; then
       ;;
   esac
   if [ "$_gt_keep" -eq 0 ]; then
+    # SIGTERM does not stop a native Windows process, and it does not
+    # interrupt Git bash while that bash is blocked in `wait` or in a
+    # read of a pipe the child still holds. Kill by pid, then by tree.
+    _gt_kill_tree() {
+      local pid=$1 win
+      case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*)
+          win=$(cat "/proc/$pid/winpid" 2>/dev/null || true)
+          [ -n "$win" ] || win=$pid
+          taskkill //F //T //PID "$win" >/dev/null 2>&1 || true
+          ;;
+        *)
+          kill "$pid" 2>/dev/null || true
+          sleep 1
+          kill -9 "$pid" 2>/dev/null || true
+          ;;
+      esac
+    }
     # A small stand-in for GNU timeout. Exit 124 when this function kills
     # the command; the command's own status otherwise (an abort is not a
-    # timeout). Errexit is restored to whatever the caller had: forcing
-    # `set -e` on the way out aborts scripts that record a non-zero status.
+    # timeout). The wait is polled: a signal sent from another process
+    # never has to interrupt it. Errexit is restored to whatever the
+    # caller had: forcing `set -e` on the way out aborts scripts that
+    # record a non-zero status.
     timeout() {
       local secs=$1
       shift
-      local flag pid watcher st errexit=0
+      local flag pid st start now errexit=0
       case $- in *e*) errexit=1 ;; esac
       flag=$(mktemp)
       "$@" &
       pid=$!
-      (
-        sleep "$secs"
-        if kill -0 "$pid" 2>/dev/null; then
-          echo 1 >"$flag"
-          kill "$pid" 2>/dev/null || true
-        fi
-      ) &
-      watcher=$!
+      start=$(date +%s)
       set +e
+      while kill -0 "$pid" 2>/dev/null; do
+        now=$(date +%s)
+        if [ $((now - start)) -ge "$secs" ]; then
+          echo 1 >"$flag"
+          _gt_kill_tree "$pid"
+          break
+        fi
+        sleep 1
+      done
+      # The process was killed above, or it has already exited. This wait
+      # reaps it. It is not the thing that enforces the bound.
       wait "$pid"
       st=$?
-      kill "$watcher" 2>/dev/null
-      wait "$watcher" 2>/dev/null
       if [ "$errexit" -eq 1 ]; then set -e; fi
       if [ -s "$flag" ]; then
         rm -f "$flag"

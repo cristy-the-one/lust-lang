@@ -4,6 +4,7 @@
 // It has no custom allocator and few dependencies, so it starts in about a millisecond.
 //
 //   lust check <file.rs> [--json] [--timings]     lust check <file.rs> --rustc (oracle)
+//   lust watch check <file.rs> [check flags]     re-check on save (execs `lust-watch`)
 //   lust build <file.rs> [-o <out>] [-g] [--emit-c <prefix>] [--timings]
 //   lust build <file.rs> --release | --profile <name> [-o <out>]  (Cargo or rustc)
 //   lust build <file.rs> --release --target <triple>...            (lust + zig cc, per target)
@@ -149,6 +150,25 @@ fn main() {
         cmd.args(&args[1..]);
         replace_with(&mut cmd, &tool);
     }
+    // `lust watch` is a separate binary. notify is not a dependency of this
+    // client or of lust-core, so check/build/run do not load or start it.
+    if args.first().map(String::as_str) == Some("watch") {
+        let tool = std::env::current_exe().map(|p| protocol::sibling_tool(&p, "lust-watch")).unwrap_or_else(|_| tool_name("lust-watch"));
+        if !tool.is_file() {
+            eprintln!("error: lust watch needs the lust-watch binary next to this program ({})", tool.display());
+            eprintln!("error: build it with: cargo build --release --manifest-path tools/lust-watch/Cargo.toml");
+            std::process::exit(2);
+        }
+        let mut cmd = std::process::Command::new(&tool);
+        cmd.args(&args[1..]);
+        // Windows has no exec: this process waits on lust-watch. Swallow
+        // Ctrl-C here so the default handler does not kill the waiter and
+        // leave the watcher (and its daemon) running. lust-watch receives
+        // the same event and shuts down; this wait then returns.
+        #[cfg(windows)]
+        ignore_ctrl_c();
+        replace_with(&mut cmd, &tool);
+    }
     let core = std::env::current_exe().map(|p| protocol::sibling_tool(&p, "lust-core")).unwrap_or_else(|_| tool_name("lust-core"));
     // A build that waits for its sources (`LUST_SOURCES_READY`, resolve/prefetch.rs) reads no
     // workspace file before they are there, and parsing its request reads the manifest: the
@@ -237,6 +257,18 @@ fn tool_name(name: &str) -> PathBuf {
     {
         PathBuf::from(name)
     }
+}
+
+/// Ctrl-C and Ctrl-Break are handled by the process this one is waiting on.
+#[cfg(windows)]
+fn ignore_ctrl_c() {
+    unsafe extern "system" {
+        fn SetConsoleCtrlHandler(handler: Option<unsafe extern "system" fn(u32) -> i32>, add: i32) -> i32;
+    }
+    unsafe extern "system" fn swallow(ctrl: u32) -> i32 {
+        if ctrl <= 1 { 1 } else { 0 }
+    }
+    unsafe { SetConsoleCtrlHandler(Some(swallow), 1); }
 }
 
 /// Replaces this process with `cmd` on Unix (`exec` keeps the pid, which the

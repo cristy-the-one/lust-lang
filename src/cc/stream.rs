@@ -96,7 +96,10 @@ impl Stream {
         let num = |v: &str, d: usize| std::env::var(v).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
         let jobs = num("LUST_CC_STREAM_JOBS", crate::pool::threads().max(1));
         let early = num("LUST_CC_STREAM_EARLY", (jobs / 4).max(1));
-        let flags = super::cflags(debug).split_whitespace().map(str::to_string).collect();
+        let mut flags: Vec<String> = super::cflags(debug).split_whitespace().map(str::to_string).collect();
+        if let Some(f) = super::zig_darwin_lto_arg(&spec) {
+            flags.push(f.into());
+        }
         let owner = std::process::id();
         Some(Stream(Arc::new(Inner {
             spec,

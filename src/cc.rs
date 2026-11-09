@@ -215,6 +215,12 @@ fn strict_fp() -> bool {
     STRICT_FP.load(Ordering::Relaxed) > 0
 }
 
+/// zig cc on Darwin refuses `-flto` unless this is on the command
+/// (`error: LTO requires using LLD`). None for every other compiler and target.
+fn zig_darwin_lto_arg(spec: &CcSpec) -> Option<&'static str> {
+    (strict_fp() && spec.cmd.first().is_some_and(|c| is_zig(c)) && spec.triple.contains("darwin")).then_some("-fuse-ld=lld")
+}
+
 /// Flags that keep IEEE results next to a tcc build of the same C: no
 /// contraction to a fused multiply-add, no reassociation, no reciprocal
 /// rewrite, and libm calls left as calls (`-fmath-errno`). `-flto` is what
@@ -323,6 +329,11 @@ fn ldflags(spec: &CcSpec, debug: bool) -> Vec<String> {
     // tcc links that library itself, and a mingw/clang link does not.
     if strict_fp() {
         v.extend(strict_fp_flags().split_whitespace().map(str::to_string));
+        // zig cc on macOS rejects -flto unless the linker is lld
+        // ("LTO requires using LLD"). The unit compile checks it too.
+        if let Some(f) = zig_darwin_lto_arg(spec) {
+            v.push(f.into());
+        }
         if spec.triple.contains("windows") {
             v.push("-lws2_32".into());
         }
@@ -841,7 +852,10 @@ pub fn build_with(
         s.go();
     }
     std::fs::create_dir_all(work).map_err(|e| format!("cannot create {}: {e}", work.display()))?;
-    let flags: Vec<String> = cflags(debug).split_whitespace().map(str::to_string).collect();
+    let mut flags: Vec<String> = cflags(debug).split_whitespace().map(str::to_string).collect();
+    if let Some(f) = zig_darwin_lto_arg(spec) {
+        flags.push(f.into());
+    }
     let cxx_flags: Vec<String> = cxxflags(debug).split_whitespace().map(str::to_string).collect();
     let is_cxx = |name: &str| name.ends_with(".cc");
     let rt_max: usize = std::env::var("LUST_LL_RTINL").ok().and_then(|v| v.parse().ok()).unwrap_or(0);

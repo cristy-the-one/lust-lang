@@ -234,6 +234,9 @@ run_step "crate fixture tests" crate_suite
 source "$root/scripts/gnu-tools.sh"
 run_step "sandbox tests" timeout "${SANDBOX_STEP_TIMEOUT:-1200}" scripts/test-sandbox.sh
 run_step "optimised sandbox build" timeout "${OPT_STEP_TIMEOUT:-900}" scripts/test-opt.sh
+if [ "${LUST_OPT_CORPUS:-0}" = 1 ]; then
+  run_step "optimised plugin corpus" timeout "${OPT_CORPUS_TIMEOUT:-1800}" scripts/test-opt-corpus.sh
+fi
 run_step "recipe tests" scripts/test-recipes.sh
 run_step "daemon edit scenarios (warm vs cold vs rustc)" python3 scripts/test-daemon-scenarios.py
 if [ -e scripts/test-slots.py ]; then

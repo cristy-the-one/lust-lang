@@ -6120,7 +6120,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         return Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() };
     }
     if req.opt_bg {
-        super::optbg::swap_or_spawn(req, &map, &mut resp.stderr);
+        super::optbg::swap_or_spawn(req, &map, &mut resp.stderr, caches.persistent);
     }
     // Reference-counted cleanup: record this build as a user of the current base (in memory
     // and in the base dir manifest, for after this daemon exits), then delete old bases past

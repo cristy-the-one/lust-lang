@@ -220,8 +220,22 @@ fn strict_fp() -> bool {
 /// rewrite, and libm calls left as calls (`-fmath-errno`). `-flto` is what
 /// lets the optimiser inline across lust's units. Passed again at link time
 /// (`ldflags`): an LTO link re-optimises and must not drop these.
-pub fn strict_fp_flags() -> &'static str {
-    "-flto -fno-fast-math -ffp-contract=off -fno-unsafe-math-optimizations -fno-associative-math -fno-reciprocal-math -fno-finite-math-only -fmath-errno"
+///
+/// `-fno-builtin-<math>` stops gcc and clang from constant-folding `sin`,
+/// `cos`, `pow` and the rest with their own correctly-rounded maths. tcc
+/// calls libm at run time, and those folds differ in the last bit. On
+/// Windows the runtime defines the same names and forwards them to ucrt
+/// (`float.c`); a builtin would skip that and link zig's or mingw's libm
+/// instead. Not a blanket `-fno-builtin`: on the 80-hex bench that was
+/// within about a millisecond of this list, and `memcpy` stays available.
+pub fn strict_fp_flags() -> String {
+    let mut s = String::from("-flto -fno-fast-math -ffp-contract=off -fno-unsafe-math-optimizations -fno-associative-math -fno-reciprocal-math -fno-finite-math-only -fmath-errno");
+    for name in [
+        "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "sinh", "cosh", "tanh", "exp", "exp2", "expm1", "log", "log2", "log10", "log1p", "pow", "hypot", "sqrt", "floor", "ceil", "round", "trunc", "fma", "fabs", "copysign", "fmod",
+    ] {
+        s.push_str(&format!(" -fno-builtin-{name} -fno-builtin-{name}f"));
+    }
+    s
 }
 
 /// The C flags of every unit, one string so the cache key and the command

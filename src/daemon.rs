@@ -502,6 +502,9 @@ fn shutdown(sock: &Path, base: &Path, sessions: &HashMap<SessionKey, Entry>, why
     for dir in &base_dirs {
         driver::sweep_bases(dir, std::process::id());
     }
+    // Background `--opt` compiles are children of this process. Kill them
+    // before exit; on Linux the parent-death signal covers a crash too.
+    driver::kill_background();
     let _ = std::fs::remove_dir_all(base);
     let _ = std::fs::remove_file(sock);
     eprintln!("lust daemon: {why}, exiting");

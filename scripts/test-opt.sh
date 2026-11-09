@@ -61,6 +61,55 @@ if [ "$has_cc" -eq 0 ]; then
   esac
 fi
 
+# libm: constant and runtime sin/cos/atan2/sqrt/powi/powf. --opt must not
+# constant-fold these with the compiler's own maths; tcc calls libm.
+cat >"$work/libm.rs" <<'EOF'
+fn main() {
+    let s = (1.0_f64).sin();
+    let c = (0.5_f64).cos();
+    let a = (0.3_f64).atan2(0.4);
+    let q = (2.0_f64).sqrt();
+    let p = (1.5_f64).powi(7);
+    let f = (1.5_f64).powf(2.5);
+    println!("{:x} {:x} {:x} {:x} {:x} {:x}", s.to_bits(), c.to_bits(), a.to_bits(), q.to_bits(), p.to_bits(), f.to_bits());
+    let mut x = 0.13_f64;
+    let mut acc = 0u64;
+    let mut i = 0;
+    while i < 16 {
+        acc = acc ^ (x.sin().to_bits());
+        acc = acc ^ (x.cos().to_bits());
+        acc = acc ^ (x.atan2(0.25).to_bits());
+        acc = acc ^ (x.sqrt().to_bits());
+        acc = acc ^ (x.powi(5).to_bits());
+        acc = acc ^ (x.powf(1.5).to_bits());
+        x = x + 0.07;
+        i = i + 1;
+    }
+    println!("{acc:x}");
+}
+EOF
+if ! timeout 300 "$lust" build --sandbox "$work/libm.rs" -o "$work/libm-tcc" >"$work/libm-tcc.log" 2>&1; then
+  report bad "libm-tcc" "$(tail -c 400 "$work/libm-tcc.log")"
+else
+  report ok "libm-tcc"
+fi
+if ! timeout 300 "$lust" build --sandbox --opt "$work/libm.rs" -o "$work/libm-opt" >"$work/libm-opt.log" 2>&1; then
+  report bad "libm-opt" "$(tail -c 500 "$work/libm-opt.log")"
+else
+  report ok "libm-opt"
+fi
+if [ -x "$work/libm-tcc" ] && [ -x "$work/libm-opt" ]; then
+  "$work/libm-tcc" >"$work/libm-tcc.out" 2>"$work/libm-tcc.err"
+  st_tcc=$?
+  "$work/libm-opt" >"$work/libm-opt.out" 2>"$work/libm-opt.err"
+  st_opt=$?
+  if [ "$st_tcc" -eq 0 ] && [ "$st_opt" -eq 0 ] && cmp -s "$work/libm-tcc.out" "$work/libm-opt.out"; then
+    report ok "libm-bytes"
+  else
+    report bad "libm-bytes" "tcc($st_tcc)=$(cat "$work/libm-tcc.out") opt($st_opt)=$(cat "$work/libm-opt.out") err=$(cat "$work/libm-tcc.err" "$work/libm-opt.err")"
+  fi
+fi
+
 # Numeric program: tcc and --opt print the same bits. The polynomial is the
 # shape of a libm-free kernel (products and adds, no contraction wanted).
 cat >"$work/num.rs" <<'EOF'
@@ -146,9 +195,10 @@ if [ -x "$work/sand-tcc" ] && [ -x "$work/sand-opt" ]; then
   fi
 fi
 
-# Background: the first run links tcc and starts --opt; once it publishes,
-# the next run says it installed the cached binary. Both runs print the
-# same bits.
+# Background: the daemon links tcc and starts --opt; once it publishes, the
+# next run installs the cached binary. The cache is LUST_CACHE_DIR, not the
+# project. The daemon is killed at the end, and that kills the background
+# compile if it is still going.
 cat >"$work/bg.rs" <<'EOF'
 fn main() {
     let mut acc = 1.0_f64;
@@ -160,7 +210,21 @@ fn main() {
     println!("{:x}", acc.to_bits());
 }
 EOF
-if timeout 180 "$lust" build --sandbox --opt=bg "$work/bg.rs" -o "$work/bg" >"$work/bg1.log" 2>&1; then
+# The rest of this script turns the daemon off. This part wants one, in
+# the work directory, so the background compile is the daemon's child.
+bg_env() {
+  env -u LUST_NO_DAEMON LUST_DAEMON_SOCKET="$work/bg.sock" LUST_CACHE_DIR="$work/cache" "$@"
+}
+cleanup_bg() {
+  if [ -d /proc ]; then
+    for d in /proc/[0-9]*; do
+      [ -r "$d/environ" ] || continue
+      tr '\0' '\n' <"$d/environ" 2>/dev/null | grep -qx "LUST_DAEMON_SOCKET=$work/bg.sock" && kill "$(basename "$d")" 2>/dev/null || true
+    done
+  fi
+}
+trap 'cleanup_bg; rm -rf "$work"' EXIT
+if bg_env timeout 180 "$lust" build --sandbox --opt=bg "$work/bg.rs" -o "$work/bg" >"$work/bg1.log" 2>&1; then
   if grep -q "opt: optimised build started in the background" "$work/bg1.log"; then
     report ok "bg-start"
   else
@@ -175,7 +239,7 @@ fi
 # The marker sits next to the cached binary. Poll the log and a second build.
 ready=0
 for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
-  if timeout 180 "$lust" build --sandbox --opt=bg "$work/bg.rs" -o "$work/bg" >"$work/bg2.log" 2>&1; then
+  if bg_env timeout 180 "$lust" build --sandbox --opt=bg "$work/bg.rs" -o "$work/bg" >"$work/bg2.log" 2>&1; then
     if grep -q "opt: cached optimised build" "$work/bg2.log"; then
       ready=1
       break
@@ -195,7 +259,7 @@ if [ "$ready" -eq 1 ]; then
   fi
 else
   log=""
-  if [ -f "$work/.lust-cache/opt-bg.log" ]; then log=$(tail -c 400 "$work/.lust-cache/opt-bg.log"); fi
+  if [ -f "$work/cache/opt/opt-bg.log" ]; then log=$(tail -c 400 "$work/cache/opt/opt-bg.log"); fi
   report bad "bg-cached" "never published. last=$(tail -c 200 "$work/bg2.log") bglog=$log"
 fi
 

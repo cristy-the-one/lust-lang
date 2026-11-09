@@ -1209,7 +1209,15 @@ pub fn build_with(
         // A build with a C++ unit links with the C++ driver (its runtime and personality).
         let link = if units.iter().any(|u| is_cxx(&u.name)) { &spec.cxx } else { &spec.cmd };
         let mut cmd = cc_command(&link[0]);
-        cmd.args(&link[1..]).args(ldflags(spec, debug)).args(pgo.as_ref().map(pgo::Mode::link_flags).unwrap_or_default()).args(&objs).arg("-o").arg(out);
+        cmd.args(&link[1..]).args(ldflags(spec, debug)).args(pgo.as_ref().map(pgo::Mode::link_flags).unwrap_or_default()).args(&objs);
+        // `-lm` in `ldflags` is before the objects. gcc links with
+        // `--as-needed`, so that scan finds nothing to pull in, and `-flto`
+        // only emits `hypot` (and the other `-fno-builtin-*` libm calls)
+        // afterwards. Search libm again once the objects are on the line.
+        if strict_fp() && !spec.triple.contains("windows") {
+            cmd.arg("-lm");
+        }
+        cmd.arg("-o").arg(out);
         match cmd.output() {
             Ok(o) if o.status.success() => Ok(format!(
                 "{} units ({} from cache, clang {:.2}s, {}link {:.2}s{}), linked {}",

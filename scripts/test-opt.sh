@@ -69,9 +69,10 @@ fn main() {
     let c = (0.5_f64).cos();
     let a = (0.3_f64).atan2(0.4);
     let q = (2.0_f64).sqrt();
+    let h = (3.0_f64).hypot(4.0);
     let p = (1.5_f64).powi(7);
     let f = (1.5_f64).powf(2.5);
-    println!("{:x} {:x} {:x} {:x} {:x} {:x}", s.to_bits(), c.to_bits(), a.to_bits(), q.to_bits(), p.to_bits(), f.to_bits());
+    println!("{:x} {:x} {:x} {:x} {:x} {:x} {:x}", s.to_bits(), c.to_bits(), a.to_bits(), q.to_bits(), h.to_bits(), p.to_bits(), f.to_bits());
     let mut x = 0.13_f64;
     let mut acc = 0u64;
     let mut i = 0;
@@ -80,6 +81,7 @@ fn main() {
         acc = acc ^ (x.cos().to_bits());
         acc = acc ^ (x.atan2(0.25).to_bits());
         acc = acc ^ (x.sqrt().to_bits());
+        acc = acc ^ (x.hypot(0.5).to_bits());
         acc = acc ^ (x.powi(5).to_bits());
         acc = acc ^ (x.powf(1.5).to_bits());
         x = x + 0.07;
@@ -219,7 +221,8 @@ cleanup_bg() {
   if [ -d /proc ]; then
     for d in /proc/[0-9]*; do
       [ -r "$d/environ" ] || continue
-      tr '\0' '\n' <"$d/environ" 2>/dev/null | grep -qx "LUST_DAEMON_SOCKET=$work/bg.sock" && kill "$(basename "$d")" 2>/dev/null || true
+      text=$(cat "$d/environ" 2>/dev/null | tr '\0' '\n') || continue
+      printf '%s\n' "$text" | grep -qx "LUST_DAEMON_SOCKET=$work/bg.sock" && kill "$(basename "$d")" 2>/dev/null || true
     done
   fi
 }

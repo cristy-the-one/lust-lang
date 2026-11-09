@@ -63,7 +63,10 @@ set -e
 if [ -d /proc ]; then
   for d in /proc/[0-9]*; do
     [ -r "$d/environ" ] || continue
-    tr '\0' '\n' <"$d/environ" 2>/dev/null | grep -qx "LUST_DAEMON_SOCKET=$work/corpus.sock" && kill "$(basename "$d")" 2>/dev/null || true
+    # cat, not a shell redirect: a refused /proc open is cat's error, and
+    # the redirect on the redirect itself is what bash prints.
+    text=$(cat "$d/environ" 2>/dev/null | tr '\0' '\n') || continue
+    printf '%s\n' "$text" | grep -qx "LUST_DAEMON_SOCKET=$work/corpus.sock" && kill "$(basename "$d")" 2>/dev/null || true
   done
 fi
 exit "$st"

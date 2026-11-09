@@ -171,7 +171,7 @@ fn env_key(vars: impl Iterator<Item = (String, String)>) -> String {
 fn request_key(id: (u64, u64), req: &Request, src: &[u8]) -> String {
     let target = format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS);
     let cmd: &[u8] = if req.cmd == Cmd::Check { b"check" } else { b"build" };
-    let flags = [req.json as u8, req.debug as u8];
+    let flags = [req.json as u8, req.debug as u8, req.opt_bg as u8];
     let session = req.session.describe();
     // The graph key and the build script output hash (section 1.1):
     // editing Cargo.toml, Cargo.lock, a cargo config, or a build script
@@ -536,7 +536,7 @@ mod tests {
             emit_c: None,
             max_errors: 20,
             run_args: None,
-            harness: false, cc: false, overlay: Default::default(),
+            harness: false, cc: false, opt_bg: false, overlay: Default::default(),
             client: Default::default(),
         }
     }

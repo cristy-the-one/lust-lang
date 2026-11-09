@@ -7,7 +7,7 @@ candidate in a search loop. The host talks to the program over stdin and
 stdout; the program cannot reach the host's files, network, environment
 or processes on its own.
 
-It is lust's own flag, not rustc's. `--release` and `--rustc` refuse it.
+It is lust's own flag, not rustc's. `--release` and `--rustc` refuse it. `--opt` and `--opt=bg` accept it: the optimised build is the same sandboxed C, compiled with an optimising C compiler. See [opt.md](opt.md).
 
 ## What a sandboxed program keeps
 

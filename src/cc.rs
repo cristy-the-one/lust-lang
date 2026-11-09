@@ -21,6 +21,7 @@
 // function of those alone.
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 mod memo;
 pub(crate) mod pgo;
@@ -189,6 +190,40 @@ pub fn spec_for(triple: &str) -> Result<CcSpec, String> {
     ))
 }
 
+/// How many `--opt` compiles on this process are inside `cc::build` right now.
+/// Their C flags add `-flto` and the strict floating-point set. A count, not a
+/// bool: a guard compile on another thread must not clear it.
+static STRICT_FP: AtomicU32 = AtomicU32::new(0);
+
+/// Holds one `--opt` compile's strict floating-point flags (see `strict_fp_flags`).
+pub struct StrictFp;
+
+impl StrictFp {
+    pub fn enter() -> Self {
+        STRICT_FP.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for StrictFp {
+    fn drop(&mut self) {
+        STRICT_FP.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn strict_fp() -> bool {
+    STRICT_FP.load(Ordering::Relaxed) > 0
+}
+
+/// Flags that keep IEEE results next to a tcc build of the same C: no
+/// contraction to a fused multiply-add, no reassociation, no reciprocal
+/// rewrite, and libm calls left as calls (`-fmath-errno`). `-flto` is what
+/// lets the optimiser inline across lust's units. Passed again at link time
+/// (`ldflags`): an LTO link re-optimises and must not drop these.
+pub fn strict_fp_flags() -> &'static str {
+    "-flto -fno-fast-math -ffp-contract=off -fno-unsafe-math-optimizations -fno-associative-math -fno-reciprocal-math -fno-finite-math-only -fmath-errno"
+}
+
 /// The C flags of every unit, one string so the cache key and the command
 /// line can never disagree.
 pub fn cflags(debug: bool) -> String {
@@ -204,7 +239,28 @@ pub fn cflags(debug: bool) -> String {
     // -g0: zig cc emits DWARF by default, which the release link strips
     // (`ldflags`); on a fn of 400 KB of C it was 7/8 of the compile.
     let base = "-O2 -std=gnu11 -w -fsigned-char -fno-strict-aliasing -fwrapv -fexceptions -fno-asynchronous-unwind-tables -fomit-frame-pointer";
+    let base = if strict_fp() { format!("{base} {}", strict_fp_flags()) } else { base.to_string() };
     if debug { format!("{base} -g") } else { format!("{base} -g0") }
+}
+
+/// `cc --version` (or zig's) for the compiler `spec_for` would run on `triple`,
+/// or the `spec_for` error when this host has none. The `--opt=bg` cache key
+/// holds it, so a toolchain change does not reuse a binary.
+pub fn compiler_stamp(triple: &str) -> String {
+    match spec_for(triple) {
+        Ok(spec) => {
+            let line = Command::new(&spec.cmd[0])
+                .args(&spec.cmd[1..])
+                .arg("--version")
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .and_then(|s| s.lines().next().map(str::to_string))
+                .unwrap_or_default();
+            format!("{} | {line}", spec.cmd.join(" "))
+        }
+        Err(e) => e,
+    }
 }
 
 /// mimalloc as one C unit that replaces malloc and free (`MI_MALLOC_OVERRIDE`): the
@@ -247,6 +303,15 @@ fn ldflags(spec: &CcSpec, debug: bool) -> Vec<String> {
     }
     if spec.cmd.first().is_some_and(|c| is_zig(c)) {
         v.push("-lunwind".into());
+    }
+    // `--opt`: the link re-runs the optimiser under LTO, so it needs the same
+    // floating-point rules as the compile. Windows sockets live in ws2_32;
+    // tcc links that library itself, and a mingw/clang link does not.
+    if strict_fp() {
+        v.extend(strict_fp_flags().split_whitespace().map(str::to_string));
+        if spec.triple.contains("windows") {
+            v.push("-lws2_32".into());
+        }
     }
     // Windows has no libm and no libpthread. The CRT already exports the
     // math functions the float methods call; the rest are in float.c.

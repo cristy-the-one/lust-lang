@@ -3108,7 +3108,7 @@ pub fn run() -> i64 {
             emit_c: None,
             max_errors: 0,
             run_args: None,
-            harness: false, cc: false, overlay: Default::default(),
+            harness: false, cc: false, opt_bg: false, overlay: Default::default(),
             client: Default::default(),
         };
         let resp = compile(&req, session);

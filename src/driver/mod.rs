@@ -24,6 +24,7 @@ pub(crate) mod sig_nodes;
 mod span_shift;
 mod session;
 pub(crate) mod release_c;
+mod optbg;
 pub mod read_cover;
 
 pub use crate::protocol::{Cmd, Request, Response, SessionKey};

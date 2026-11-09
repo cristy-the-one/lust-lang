@@ -233,6 +233,7 @@ run_step "crate fixture tests" crate_suite
 # shellcheck source=scripts/gnu-tools.sh
 source "$root/scripts/gnu-tools.sh"
 run_step "sandbox tests" timeout "${SANDBOX_STEP_TIMEOUT:-1200}" scripts/test-sandbox.sh
+run_step "optimised sandbox build" timeout "${OPT_STEP_TIMEOUT:-900}" scripts/test-opt.sh
 run_step "recipe tests" scripts/test-recipes.sh
 run_step "daemon edit scenarios (warm vs cold vs rustc)" python3 scripts/test-daemon-scenarios.py
 if [ -e scripts/test-slots.py ]; then

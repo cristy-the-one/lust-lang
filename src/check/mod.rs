@@ -21660,18 +21660,23 @@ impl<'p> Ctx<'p> {
     }
 
     /// The one field pattern of `Some(..)`, `Ok(..)` or `Err(..)`, of type
-    /// `inner`. A lone `..` stands for the field without naming it
-    /// (`Ok(..)` is `Ok(_)`): it gets the field's type and binds nothing,
-    /// and the later passes read a `..` there as they read `_`.
-    fn payload_pattern(&mut self, elems: &[PatId], inner: Ty, mode: BindMode, in_match: bool) {
-        if let [only] = elems
-            && matches!(self.p.ast.pat(*only), Pat::Rest)
-        {
-            let pi = (only.0 - self.out.pat_base) as usize;
+    /// `inner` (`Ast::one_field_pat`). A lone `..` stands for the field
+    /// without naming it (`Ok(..)` is `Ok(_)`): it gets the field's type
+    /// and binds nothing, and the later passes read a `..` there as they
+    /// read `_`. Beside a pattern (`Some(x, ..)`, `Some(.., x)`) a `..`
+    /// stands for no field. Any other list does not fit the one field
+    /// (rustc E0023).
+    fn payload_pattern(&mut self, elems: &[PatId], inner: Ty, mode: BindMode, in_match: bool, span: Span) {
+        let Some(sub) = self.p.ast.one_field_pat(elems) else {
+            self.err("L0110", span, "this variant has 1 field(s)", "Match the field, use `_`, or write `..`.");
+            return;
+        };
+        if matches!(self.p.ast.pat(sub), Pat::Rest) {
+            let pi = (sub.0 - self.out.pat_base) as usize;
             self.out.pat_ty[pi] = inner;
             return;
         }
-        self.pattern_mode(elems[0], inner, mode, in_match);
+        self.pattern_mode(sub, inner, mode, in_match);
     }
 
     fn pattern_mode(&mut self, pat: PatId, t: Ty, mode: BindMode, in_match: bool) {
@@ -21747,7 +21752,7 @@ impl<'p> Ctx<'p> {
             }
             self.out.pat_res[pi] = PatRes::Opt(is_some);
             if let (true, Pat::TupleStruct { elems, .. }) = (is_some, p.ast.pat(pat)) {
-                self.payload_pattern(elems, inner, mode, in_match);
+                self.payload_pattern(elems, inner, mode, in_match, span);
             }
             return;
         }
@@ -21771,7 +21776,7 @@ impl<'p> Ctx<'p> {
             }
             self.out.pat_res[pi] = PatRes::Res(is_ok);
             if let Pat::TupleStruct { elems, .. } = p.ast.pat(pat) {
-                self.payload_pattern(elems, if is_ok { a } else { b }, mode, in_match);
+                self.payload_pattern(elems, if is_ok { a } else { b }, mode, in_match, span);
             }
             return;
         }
@@ -22464,7 +22469,7 @@ impl<'p> Ctx<'p> {
             Pat::Binding { name, mutable: false, by_ref: false } if *name == k.None => Some(false),
             Pat::Path(segs) if self.std_parent_path(segs, k.Option, k.None) => Some(false),
             Pat::TupleStruct { path, elems }
-                if elems.len() == 1 && ((path.len() == 1 && path[0].name == k.Some) || self.std_parent_path(path, k.Option, k.Some)) =>
+                if self.p.ast.one_field_pat(elems).is_some() && ((path.len() == 1 && path[0].name == k.Some) || self.std_parent_path(path, k.Option, k.Some)) =>
             {
                 Some(true)
             }
@@ -22477,7 +22482,7 @@ impl<'p> Ctx<'p> {
     fn result_pattern(&self, pat: PatId) -> Option<bool> {
         let k = &*self.p.known;
         match self.p.ast.pat(pat) {
-            Pat::TupleStruct { path, elems } if elems.len() == 1 => {
+            Pat::TupleStruct { path, elems } if self.p.ast.one_field_pat(elems).is_some() => {
                 let last = path.last().map(|s| s.name)?;
                 if (path.len() == 1 && last == k.Ok) || self.std_parent_path(path, k.Result, k.Ok) {
                     Some(true)

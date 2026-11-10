@@ -1,5 +1,6 @@
 // `Some(..)`, `Ok(..)` and `Err(..)`: a lone `..` stands for the one field
-// without naming it, as `_` does. In `match`, `if let`, `while let`,
+// without naming it, as `_` does; beside a pattern (`Some(x, ..)`,
+// `Ok(.., v)`) it stands for no field. In `match`, `if let`, `while let`,
 // `let .. else`, `matches!`, nested, with a guard, and where the value
 // behind it has a destructor that must still run once.
 struct Loud(&'static str);
@@ -58,7 +59,23 @@ fn must(r: Result<Loud, Loud>) -> &'static str {
     "taken"
 }
 
+// A `..` beside a pattern stands for no field: the pattern is the field's.
+fn beside(o: Option<u32>, r: Result<Loud, Loud>) -> u32 {
+    let n = match o {
+        Some(x, ..) => x,
+        None => 0,
+    };
+    let m = if let Some(.., y) = o { y } else { 0 };
+    match r {
+        Ok(.., v) => println!("ok {}", v.0),
+        Err(e, ..) => println!("err {}", e.0),
+    }
+    n + m
+}
+
 fn main() {
+    println!("{}", beside(Some(4), Ok(Loud("beside ok"))));
+    println!("{}", beside(None, Err(Loud("beside err"))));
     println!("{} {}", kind(&Ok(1)), kind(&Err("x".to_string())));
     println!("{} {}", has(Some(vec![1, 2])), has(None));
     println!("{} {} {}", nested(Some(Ok(1))), nested(Some(Err("e".into()))), nested(None));

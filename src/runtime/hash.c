@@ -82,8 +82,10 @@ static int lh_alloc_buckets(lust_hash_table *t, uint64_t buckets) {
     if (ctrl_offset > UINT64_MAX - buckets - LH_WIDTH) return lust_hash_capacity_overflow(), 0;
     uint64_t total = ctrl_offset + buckets + LH_WIDTH;
     if (total > (uint64_t)INT64_MAX - (ctrl_align - 1)) return lust_hash_capacity_overflow(), 0;
+    LUST_MEM_ASK(total);
     void *raw = malloc((size_t)(total + ctrl_align));
     if (!raw) lust_oom_size(total); /* hashbrown's table layout */
+    LUST_MEM_NOTE(total);
     uintptr_t base = lh_align_up((uint64_t)(uintptr_t)raw, ctrl_align);
     t->alloc_base = raw;
     t->data = (uint8_t *)base;
@@ -969,8 +971,10 @@ static void li_entries_alloc(lust_index_table *t, uint64_t new_cap) {
             return;
         }
         uint64_t bytes = new_cap * t->entry_size;
+        LUST_MEM_ASK(bytes);
         raw = malloc((size_t)(bytes + t->entry_align));
         if (!raw) lust_oom_size(bytes); /* indexmap's entries Vec */
+        LUST_MEM_NOTE(bytes);
         base = (uint8_t *)lh_align_up((uint64_t)(uintptr_t)raw, t->entry_align);
         if (t->len) memcpy(base, t->entries, (size_t)(t->len * t->entry_size));
     }

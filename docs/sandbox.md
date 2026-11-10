@@ -43,15 +43,43 @@ the program's stdout is lust's.
 |---|---|---|
 | 101 | `thread 'main' (<tid>) panicked at <file>:<line>:<col>:` then the message | A panic. The line is rustc's, byte for byte (rule zero), so a host parses one format for both builds. `<file>` is the path as the build command named it. |
 | 101 | `error[L0532]: this program was built with --sandbox and tried to use <family>` | The codegen stop (above). Nothing ran past it. |
+| 101 | `error[L0532]: this program was built with --max-memory <bytes> and tried to use more memory` | The memory limit (below). What the program printed before it is flushed first. |
 | any other | whatever the program wrote | `std::process::exit(n)`, or a signal (killed by the host on a time limit). |
 
 Check and build errors come before any run, as JSON with `--json`, each
 with its `edits`.
 
+## The memory limit
+
+`lust build --sandbox --max-memory <size>` (and `lust run`) builds the
+limit into the program. `<size>` is a byte count, or one with a binary
+suffix: `64K`, `512M`, `1G`. The program stops, as the table above shows,
+when its process has held more memory than that. The flag needs
+`--sandbox`, and a limit is its own daemon session, like `--sandbox`.
+
+What is measured is the operating system's peak for the process: the peak
+resident set on Linux and macOS, the peak commit charge on Windows. That
+is the number a host reads when it polls the process, so a host cap and
+this one agree. The runtime reads it after an allocation, once for every
+64th of the limit the program asks for, so the stop comes within about
+that much of the limit. A single request above the whole limit stops
+before it is made.
+
+Limits of the limit:
+
+- The check runs when the program allocates. On Linux and macOS, memory a
+  program reserved and did not touch is not held yet; if it touches those
+  pages later and allocates nothing more, the stop does not come. A host
+  that must bound that case keeps its own cap as the backstop.
+- Memory the program asked for in turn and gave back does not count:
+  only what the process held at once.
+- The stack is not part of this limit. A stack overflow is its own stop
+  (`fatal runtime error: stack overflow`, then an abort).
+
 ## What it does not do
 
-- It does not limit time or memory. The host kills a program that runs
-  too long; a memory cap is planned (`--max-memory`).
+- It does not limit time. The host kills a program that runs too long.
+  Memory has a limit when the build asks for one (`--max-memory`, above).
 - It does not change what an allowed program prints. A sandboxed program
   that only uses allowed services behaves as the rustc build of the same
   source (`scripts/test-sandbox.sh` checks one).

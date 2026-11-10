@@ -10939,6 +10939,8 @@ pub struct UnwindInit {
     pub tables: bool,
     pub ids: [u64; 4],
     pub hook_runner: Option<u32>,
+    /// `--max-memory` (0: none): main sets the runtime's limit first.
+    pub max_memory: u64,
 }
 
 /// The `main_unit` argument for `p` (`slot_of` maps a fn to its slot).
@@ -10956,7 +10958,7 @@ pub fn unwind_init(p: &Program, slot_of: impl Fn(LocalDefId) -> u32) -> Option<U
         .map(|i| slot_of(LocalDefId(i as u32)));
     let (a, b) = crate::check::any::type_id_words(p, &p.tys, REF_STR);
     let (c, d) = crate::check::any::type_id_words(p, &p.tys, STRING);
-    Some(UnwindInit { unwind: p.unwind, tables: p.unwind_tables, ids: [a, b, c, d], hook_runner: runner })
+    Some(UnwindInit { unwind: p.unwind, tables: p.unwind_tables, ids: [a, b, c, d], hook_runner: runner, max_memory: p.max_memory })
 }
 
 /// The location unit: the per-slot line and file tables and
@@ -11002,8 +11004,12 @@ pub fn main_unit(main_slot: u32, overlays: &[usize], init: Option<UnwindInit>) -
     let tables = init.as_ref().is_some_and(|i| i.unwind && i.tables);
     let runner_slot = init.as_ref().and_then(|i| i.hook_runner);
     let (init, runner) = match init {
-        Some(UnwindInit { unwind, tables, ids: [a, b, c, d], hook_runner }) => (
-            format!("\n  lust_unw_init({}, {a}ull, {b}ull, {c}ull, {d}ull);", if unwind && tables { 2 } else { unwind as u8 }),
+        Some(UnwindInit { unwind, tables, ids: [a, b, c, d], hook_runner, max_memory }) => (
+            format!(
+                "{}\n  lust_unw_init({}, {a}ull, {b}ull, {c}ull, {d}ull);",
+                if max_memory != 0 { format!("\n  lust_mem_limit_set({max_memory}ull);") } else { String::new() },
+                if unwind && tables { 2 } else { unwind as u8 }
+            ),
             hook_runner.map_or(String::new(), |s| {
                 // Release C names the runner directly (only its address is taken here).
                 if names::release() { format!("\n  lust_hook_set_runner((lust_fnptr){});", names::body(s)) } else { format!("\n  lust_hook_set_runner(lust_fns[{s}]);") }

@@ -2305,6 +2305,15 @@ impl Evaluator {
                 Flow::Val(v) => v,
                 other => return Ok(other),
             },
+            // A closure has a rewrite of its own (src/rewrite.rs): a named fn.
+            Expr::Closure { .. } => {
+                return Err(Diag::new(
+                    C_OUTSIDE,
+                    span,
+                    crate::rewrite::CLOSURE_CONST,
+                    "Write the closure as a named fn next to the item, and name that fn here.",
+                ));
+            }
             _ => return Err(outside(span, "this expression")),
         };
         Ok(Flow::Val(v))

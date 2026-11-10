@@ -1291,6 +1291,10 @@ pub(super) fn common_ends(a: &[u8], b: &[u8]) -> (usize, usize) {
 }
 
 fn errors(diags: &mut [Diag], map: &SourceMap, src: &str, req: &Request) -> Response {
+    // The rewrites for rejects that need the source text (src/rewrite.rs).
+    // First, and from the diagnostic alone: edits are part of what the
+    // dedup below and the daemon guard compare.
+    crate::rewrite::attach(diags, map, src);
     // Exact duplicates first: a delta path and a full collect can
     // push the same diagnostic a different number of times, and
     // the daemon guard compares this answer byte for byte with a
@@ -3790,6 +3794,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     program.overflow_checks = session_key.profile.overflow_checks;
     program.debug_assertions = session_key.profile.debug_assertions;
     program.sandbox = session_key.profile.sandbox;
+    program.max_memory = session_key.profile.max_memory;
     // Unwind tables need a C compiler with -fexceptions and a C++ driver, never tcc: a
     // release driver build uses them, one-shot or from a persistent session such as a
     // front image (LUST_UNWIND_TABLES=0 turns them off); --emit-c in a one-shot process

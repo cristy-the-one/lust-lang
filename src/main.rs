@@ -22,6 +22,7 @@ mod diag;
 mod driver;
 mod expand;
 mod explain;
+mod fix;
 mod image;
 mod srctext;
 mod sys_host;
@@ -36,6 +37,7 @@ mod pool;
 mod protocol;
 #[allow(dead_code)] // Wired into the driver by the worklist increment.
 mod resolve;
+mod rewrite;
 mod scan;
 mod stdload;
 mod stdloc;
@@ -410,6 +412,7 @@ fn run() {
         Some("explain") => std::process::exit(explain::run(&args[1..])),
         Some("capabilities") => std::process::exit(capabilities::run(&args[1..])),
         Some("expand") => std::process::exit(expand::run_expand(&args[1..])),
+        Some("fix") => std::process::exit(fix::run(&args[1..])),
         _ => {}
     }
     // A CI job may check its sources out while lust restores its front image

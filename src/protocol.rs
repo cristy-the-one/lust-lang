@@ -83,11 +83,16 @@ pub struct ProfileFlags {
     /// tcc. Its own daemon session, so its objects never mix with a tcc build.
     /// The dev profile (overflow checks, debug assertions, panic) stays.
     pub opt: bool,
+    /// `--max-memory <bytes>`, with `--sandbox`: the program stops when its
+    /// process has held more memory than this (runtime/core.c
+    /// `lust_mem_note_slow`). 0 is no limit. The limit is built into the
+    /// program, so it is part of the session and cache keys.
+    pub max_memory: u64,
 }
 
 impl ProfileFlags {
     /// The dev flags with `-C panic=abort`.
-    pub const DEV: ProfileFlags = ProfileFlags { panic_abort: true, overflow_checks: true, debug_assertions: true, sandbox: false, opt: false };
+    pub const DEV: ProfileFlags = ProfileFlags { panic_abort: true, overflow_checks: true, debug_assertions: true, sandbox: false, opt: false, max_memory: 0 };
     /// rustc's and Cargo's dev defaults (panics unwind): a single-file compile
     /// and a Cargo dev profile that does not set `panic`.
     pub const DEV_UNWIND: ProfileFlags = ProfileFlags { panic_abort: false, ..ProfileFlags::DEV };
@@ -162,7 +167,7 @@ impl SessionKey {
         let b = |x: bool| if x { "1" } else { "0" };
         let manifest = self.krate.manifest_path.as_ref().map_or_else(|| "-".to_string(), |p| p.to_string_lossy().into_owned());
         format!(
-            "pkg={} manifest={} {}:{} root={} test={} features=[{}] default_features={} all_features={} target={} panic_abort={} overflow_checks={} debug_assertions={} sandbox={} opt={} offline={} locked={}",
+            "pkg={} manifest={} {}:{} root={} test={} features=[{}] default_features={} all_features={} target={} panic_abort={} overflow_checks={} debug_assertions={} sandbox={} opt={} max_memory={} offline={} locked={}",
             self.krate.package_id,
             manifest,
             self.krate.target_kind,
@@ -178,6 +183,7 @@ impl SessionKey {
             b(self.profile.debug_assertions),
             b(self.profile.sandbox),
             b(self.profile.opt),
+            self.profile.max_memory,
             b(self.cargo_net.offline),
             b(self.cargo_net.locked),
         )
@@ -421,7 +427,7 @@ pub enum Invocation {
     },
 }
 
-pub const USAGE: &str = "usage: lust <check|build|run> <file.rs> [--json] [--max-errors N] [--timings] [-o out] [-g] [--emit-c prefix] [--mark-unread <fn path>]... [-- args]\n       lust <check|build|run> <file.rs> [--manifest-path <Cargo.toml>] [--package <name>] [--bin <name> | --lib] [--features <a,b>] [--no-default-features] [--all-features] [--target <triple>] [-C panic=unwind|abort] [-C overflow-checks=on|off] [-C debug-assertions=on|off] [--offline] [--locked] [--frozen] [--sandbox] [--opt | --opt=bg]\n       lust build <file.rs> --release | --profile <name> [-o out] [--offline] [--locked] [--frozen]\n       lust build <file.rs> --release | --profile <name> --target <triple> [--target <triple>...] [crate flags] [-o out-or-dir] (lust release driver: zig cc)\n       lust check <file.rs> --rustc\n       lust test <file.rs> [filter] [--json] [--timeout SECONDS] [--max-errors N]\n       lust test <root.rs> --manifest-path <Cargo.toml> --lib | --test <name> [crate flags] [filter] [--json] [--timeout SECONDS]\n       lust query <def|type> <file.rs> <line>:<col> [--in <file.rs>] [crate flags] [--json]\n       lust explain <L####>\n       lust expand <file.rs>\n       lust capabilities [--json | --summary]\n       lust daemon\n       lust --version";
+pub const USAGE: &str = "usage: lust <check|build|run> <file.rs> [--json] [--max-errors N] [--timings] [-o out] [-g] [--emit-c prefix] [--mark-unread <fn path>]... [-- args]\n       lust <check|build|run> <file.rs> [--manifest-path <Cargo.toml>] [--package <name>] [--bin <name> | --lib] [--features <a,b>] [--no-default-features] [--all-features] [--target <triple>] [-C panic=unwind|abort] [-C overflow-checks=on|off] [-C debug-assertions=on|off] [--offline] [--locked] [--frozen] [--sandbox [--max-memory <bytes|N[K|M|G]>]] [--opt | --opt=bg]\n       lust build <file.rs> --release | --profile <name> [-o out] [--offline] [--locked] [--frozen]\n       lust build <file.rs> --release | --profile <name> --target <triple> [--target <triple>...] [crate flags] [-o out-or-dir] (lust release driver: zig cc)\n       lust check <file.rs> --rustc\n       lust test <file.rs> [filter] [--json] [--timeout SECONDS] [--max-errors N]\n       lust test <root.rs> --manifest-path <Cargo.toml> --lib | --test <name> [crate flags] [filter] [--json] [--timeout SECONDS]\n       lust query <def|type> <file.rs> <line>:<col> [--in <file.rs>] [crate flags] [--json]\n       lust fix <file.rs> [--all] [--dry-run] [crate flags]\n       lust explain <L####>\n       lust expand <file.rs>\n       lust capabilities [--json | --summary]\n       lust daemon\n       lust --version";
 
 /// Crate-selection flags from the command line, before defaults are filled in.
 #[derive(Clone, Default)]
@@ -761,6 +767,18 @@ fn parse_command(args: &[String]) -> Option<Invocation> {
     let mut sandbox = false;
     // 0 off, 1 `--opt` (blocking), 2 `--opt=bg` (fast build now, optimised later).
     let mut opt_mode: u8 = 0;
+    let mut max_memory = 0u64;
+    // A byte count, or one with a binary suffix: 512M, 1G, 64K.
+    fn byte_size(v: &str) -> Option<u64> {
+        let (digits, shift) = match v.as_bytes().last()? {
+            b'K' | b'k' => (&v[..v.len() - 1], 10),
+            b'M' | b'm' => (&v[..v.len() - 1], 20),
+            b'G' | b'g' => (&v[..v.len() - 1], 30),
+            _ => (v, 0),
+        };
+        let n: u64 = digits.parse().ok()?;
+        n.checked_mul(1 << shift).filter(|&n| n > 0)
+    }
     // A rustc boolean option value.
     fn rustc_bool(v: &str) -> Option<bool> {
         match v {
@@ -809,6 +827,8 @@ fn parse_command(args: &[String]) -> Option<Invocation> {
             "--sandbox" => sandbox = true,
             "--opt" | "--opt=now" => opt_mode = 1,
             "--opt=bg" | "--opt=background" => opt_mode = 2,
+            "--max-memory" => max_memory = byte_size(it.next()?)?,
+            _ if a.starts_with("--max-memory=") => max_memory = byte_size(&a["--max-memory=".len()..])?,
             "--frozen" => net = CargoNet { offline: true, locked: true },
             "-C" => match it.next()?.as_str() {
                 "panic=unwind" => panic_abort = Some(false),
@@ -839,6 +859,10 @@ fn parse_command(args: &[String]) -> Option<Invocation> {
         return None;
     }
     if file.as_os_str().is_empty() {
+        return None;
+    }
+    // The memory limit is part of the sandbox, and of a build lust runs.
+    if max_memory != 0 && (!sandbox || cmd == "check" || cmd == "query") {
         return None;
     }
     let abs = |p: &Path| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
@@ -971,6 +995,7 @@ fn parse_command(args: &[String]) -> Option<Invocation> {
     // and only changes the C compiler. It is its own session (`profile.opt`).
     let opt_now = opt_mode == 1;
     session.profile.opt = opt_now;
+    session.profile.max_memory = max_memory;
     let client = Client::current(&typed);
     let req = Request {
         cmd: if cmd == "check" { Cmd::Check } else { Cmd::Build },
@@ -1208,7 +1233,7 @@ pub fn encode(r: &Request) -> Vec<u8> {
     let s = &r.session;
     let env_count = r.client.env.as_ref().map_or_else(|| "-".to_string(), |e| e.len().to_string());
     let mut out = format!(
-        "{cmd} {} {} {} {} {} {} {} {} {} {} {} {env_count} {} {} {} {} {} {} {} {}\n",
+        "{cmd} {} {} {} {} {} {} {} {} {} {} {} {env_count} {} {} {} {} {} {} {} {} {}\n",
         b(r.json),
         b(r.timings),
         b(r.debug),
@@ -1227,6 +1252,7 @@ pub fn encode(r: &Request) -> Vec<u8> {
         r.overlay.len(),
         b(s.profile.opt),
         b(r.opt_bg),
+        s.profile.max_memory,
         build_id()
     )
     .into_bytes();
@@ -1280,7 +1306,7 @@ pub fn read_request(r: &mut impl BufRead) -> Result<Request, ReadError> {
         return Err(ReadError::Bad);
     }
     let f: Vec<&str> = head.split_whitespace().collect();
-    if f.len() != 21 || f[20] != build_id() {
+    if f.len() != 22 || f[21] != build_id() {
         // The first word is always a command, so a short header of a known
         // command is a client from before this field.
         return Err(if matches!(f.first(), Some(&"check" | &"build")) { ReadError::OtherBuild } else { ReadError::Bad });
@@ -1370,6 +1396,7 @@ fn read_fields(r: &mut impl BufRead, f: &[&str]) -> Option<Request> {
                 debug_assertions: f[10] == "1",
                 sandbox: f[15] == "1",
                 opt: f[18] == "1",
+                max_memory: f[20].parse().ok()?,
             },
             cargo_net: CargoNet { offline: f[13] == "1", locked: f[14] == "1" },
         },
@@ -1676,6 +1703,7 @@ pub fn cargo_profile(manifest: Option<&Path>, name: &str) -> Result<CargoProfile
             debug_assertions: lookup("debug-assertions").map_or(!release, |v| v == "true"),
             sandbox: false,
             opt: false,
+            max_memory: 0,
         },
         opt_level: lookup("opt-level").unwrap_or_else(|| if release { "3" } else { "0" }.into()),
     })
@@ -2219,7 +2247,7 @@ mod tests {
         let m = dir.join("Cargo.toml");
         std::fs::write(&m, "[package]\nname = \"p\"\n\n[profile.goport]\ninherits = \"release\"\nlto = \"fat\"\n\n[profile.chk]\ninherits = \"goport\"\noverflow-checks = true\n\n[profile.a]\ninherits = \"b\"\n[profile.b]\ninherits = \"a\"\n").unwrap();
         let rel = cargo_profile(Some(&m), "release").unwrap();
-        assert_eq!(rel.flags, ProfileFlags { panic_abort: false, overflow_checks: false, debug_assertions: false, sandbox: false, opt: false });
+        assert_eq!(rel.flags, ProfileFlags { panic_abort: false, overflow_checks: false, debug_assertions: false, sandbox: false, opt: false, max_memory: 0 });
         assert_eq!(rel.opt_level, "3");
         assert_eq!(cargo_profile(Some(&m), "goport").unwrap(), rel, "goport inherits release");
         let chk = cargo_profile(Some(&m), "chk").unwrap();

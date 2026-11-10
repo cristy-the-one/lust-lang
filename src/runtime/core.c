@@ -56,6 +56,79 @@ void lust_oom_size(uint64_t n) LUST_BODY({
     abort();
 })
 
+/* `--sandbox --max-memory N` (docs/sandbox.md): the program stops when the
+   process has held more than N bytes. main sets the limit before anything
+   runs (cgen `main_unit`); with no limit a note is one test of a global.
+
+   The measure is the operating system's own peak for the process, not a
+   count of the bytes the runtime handed out: frees with no size, blocks
+   the C library allocates for itself and allocator overhead all make a
+   count drift, and the peak is what a host that polls the process reads
+   (peak resident set on Linux and macOS, peak commit charge on Windows).
+   It is read after an allocation, once per `step` bytes requested (a 64th
+   of the limit), so the program stops within about that much of the limit.
+   One request above the limit stops at once, before it is made.
+
+   Memory the program has reserved and not yet touched is not held on
+   Linux and macOS; pages it touches later count at its next allocation. */
+#ifdef LUST_IMPL
+#ifndef _WIN32
+#include <sys/resource.h>
+#endif
+static uint64_t lust_mem_limit_v; /* 0: no limit */
+static uint64_t lust_mem_step_v;
+static uint64_t lust_mem_since_v;
+static uint64_t lust_mem_peak(void) {
+#ifdef _WIN32
+    /* PROCESS_MEMORY_COUNTERS, by name from kernel32 (Windows 7 and later):
+       tcc's import list for it may not have the symbol. */
+    typedef struct { DWORD cb, faults; SIZE_T peak_ws, ws, qpp, qp, qpnp, qnp, pagefile, peak_pagefile; } lust_pmc;
+    typedef BOOL (WINAPI *lust_pmi_fn)(HANDLE, lust_pmc *, DWORD);
+    lust_pmi_fn f = (lust_pmi_fn)GetProcAddress(GetModuleHandleA("kernel32.dll"), "K32GetProcessMemoryInfo");
+    lust_pmc c;
+    c.cb = sizeof c;
+    return f && f(GetCurrentProcess(), &c, sizeof c) ? (uint64_t)c.peak_pagefile : 0;
+#else
+    struct rusage u;
+    if (getrusage(RUSAGE_SELF, &u)) return 0;
+#ifdef __APPLE__
+    return (uint64_t)u.ru_maxrss; /* bytes */
+#else
+    return (uint64_t)u.ru_maxrss * 1024; /* kilobytes */
+#endif
+#endif
+}
+void lust_print_flush(void);
+static void lust_mem_stop(void) {
+    lust_print_flush();
+    fprintf(stderr, "error[L0532]: this program was built with --max-memory %llu and tried to use more memory\n", (unsigned long long)lust_mem_limit_v);
+    fflush(stderr);
+    exit(101);
+}
+/* After an allocation of `size` bytes, under a limit. */
+static void lust_mem_note_slow(uint64_t size) {
+    uint64_t since, zero = 0;
+    __atomic_load(&lust_mem_since_v, &since, 0);
+    since += size;
+    if (since < lust_mem_step_v) {
+        /* Two threads can lose an update here: the next check comes a
+           little later, and never not at all. */
+        __atomic_store(&lust_mem_since_v, &since, 0);
+        return;
+    }
+    __atomic_store(&lust_mem_since_v, &zero, 0);
+    if (lust_mem_peak() > lust_mem_limit_v) lust_mem_stop();
+}
+/* Before an allocation of `size` bytes: one above the whole limit never
+   starts (on Linux and macOS it would not count until touched). */
+#define LUST_MEM_ASK(size) do { if (lust_mem_limit_v && (uint64_t)(size) > lust_mem_limit_v) lust_mem_stop(); } while (0)
+#define LUST_MEM_NOTE(size) do { if (lust_mem_limit_v) lust_mem_note_slow((uint64_t)(size)); } while (0)
+#endif
+void lust_mem_limit_set(uint64_t n) LUST_BODY({
+    lust_mem_limit_v = n;
+    lust_mem_step_v = n / 64 < 65536 ? 65536 : n / 64;
+})
+
 /* LUST_ALIGNED_EMU (Linux dev only): emulate Windows' _aligned_malloc
    pairing on Linux. An over-aligned block is then a pointer inside a
    larger malloc block, so a plain free() of it aborts at once (glibc:
@@ -89,6 +162,7 @@ static void lust_emu_aligned_free(void *p) {
    an _aligned_malloc block, and free() of that pointer fail-fasts. */
 void *lust_alloc(uint64_t size, uint64_t align) LUST_BODY({
     if (!size) return (void *)(uintptr_t)(align ? align : 1);
+    LUST_MEM_ASK(size);
     void *p = 0;
 #ifdef _WIN32
     p = align <= 16 ? malloc(size) : _aligned_malloc((size_t)size, (size_t)align);
@@ -99,6 +173,7 @@ void *lust_alloc(uint64_t size, uint64_t align) LUST_BODY({
     else if (posix_memalign(&p, align, size) != 0) p = 0;
 #endif
     if (!p) lust_oom_size(size);
+    LUST_MEM_NOTE(size);
     return p;
 })
 
@@ -121,6 +196,7 @@ void *lust_overaligned_alloc(uint64_t size, uint64_t align) LUST_BODY({
     else if (posix_memalign(&p, align, size) != 0) p = 0;
 #endif
     if (!p) lust_oom_size(size);
+    LUST_MEM_NOTE(size);
     return p;
 })
 #ifdef _WIN32
@@ -136,8 +212,10 @@ void lust_overaligned_free(void *pp) LUST_BODY({
 void *lust_alloc_zeroed(uint64_t size, uint64_t align) LUST_BODY({
     if (!size) return (void *)(uintptr_t)(align ? align : 1);
     if (align <= 16) {
+        LUST_MEM_ASK(size);
         void *p = calloc(size, 1);
         if (!p) lust_oom_size(size);
+        LUST_MEM_NOTE(size);
         return p;
     }
     void *p = lust_alloc(size, align);

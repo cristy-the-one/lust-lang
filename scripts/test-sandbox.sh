@@ -92,6 +92,43 @@ if lust_to build --sandbox "$root/tests/sandbox/path_exists.rs" -o "$work/exists
 else
   report bad runtime-stop-builds "$(head -3 "$work/exists.err")"
 fi
+# --max-memory: the program stops with exit 101 and one L0532 line when its
+# process holds more than the limit, after what it printed before. A
+# program that stays under the limit runs as the plain build does.
+mem_run() { # mem_run <exe> <mode> : runs it, leaves mem.out, mem.stderr; prints the exit code
+  printf '%s\n' "$2" | "$1" >"$work/mem.out" 2>"$work/mem.stderr"; echo $?
+}
+mem_stops() { # mem_stops <name> <exe> <mode>
+  local code; code=$(mem_run "$2" "$3")
+  if [ "$code" -eq 101 ] && [ "$(cat "$work/mem.out")" = before ] && grep -qx 'error\[L0532\]: this program was built with --max-memory 67108864 and tried to use more memory' "$work/mem.stderr"; then
+    report ok "$1"
+  else
+    report bad "$1" "exit $code, stdout $(cat "$work/mem.out"), stderr $(cat "$work/mem.stderr")"
+  fi
+}
+mem_runs() { # mem_runs <name> <exe> <mode> <last stdout line>
+  local code; code=$(mem_run "$2" "$3")
+  if [ "$code" -eq 0 ] && [ "$(tail -1 "$work/mem.out")" = "$4" ] && [ ! -s "$work/mem.stderr" ]; then
+    report ok "$1"
+  else
+    report bad "$1" "exit $code, stdout $(cat "$work/mem.out"), stderr $(cat "$work/mem.stderr")"
+  fi
+}
+if lust_to build --sandbox --max-memory 64M "$root/tests/sandbox/memory.rs" -o "$work/mem64" >"$work/mem.err" 2>&1 \
+  && lust_to build --sandbox --max-memory=1G "$root/tests/sandbox/memory.rs" -o "$work/mem1g" >>"$work/mem.err" 2>&1 \
+  && lust_to build --sandbox "$root/tests/sandbox/memory.rs" -o "$work/memnone" >>"$work/mem.err" 2>&1; then
+  mem_stops memory-held-blocks "$work/mem64" vec
+  mem_stops memory-one-request "$work/mem64" big
+  mem_stops memory-hash-table "$work/mem64" map
+  mem_runs memory-churn-is-not-held "$work/mem64" churn "churned 2048 MiB"
+  mem_runs memory-under-the-limit "$work/mem1g" vec "held 200 MiB"
+  mem_runs memory-no-limit "$work/memnone" vec "held 200 MiB"
+else
+  report bad memory-builds "$(head -3 "$work/mem.err")"
+fi
+lust_to build --max-memory 64M "$root/tests/sandbox/memory.rs" -o "$work/x" >/dev/null 2>&1; [ $? -eq 2 ] && report ok memory-needs-sandbox || report bad memory-needs-sandbox "--max-memory without --sandbox should be a usage error"
+lust_to check --sandbox --max-memory 64M "$root/tests/sandbox/memory.rs" >/dev/null 2>&1; [ $? -eq 2 ] && report ok memory-not-on-check || report bad memory-not-on-check "--max-memory on check should be a usage error"
+lust_to build --sandbox --max-memory lots "$root/tests/sandbox/memory.rs" -o "$work/x" >/dev/null 2>&1; [ $? -eq 2 ] && report ok memory-bad-value || report bad memory-bad-value "a bad --max-memory value should be a usage error"
 # The same source without the flag still reaches the file system.
 lust_to build "$root/tests/sandbox/path_exists.rs" -o "$work/exists.plain" >/dev/null 2>&1 && "$work/exists.plain" | grep -qx true \
   && report ok plain-unchanged || report bad plain-unchanged "the plain build should print true"

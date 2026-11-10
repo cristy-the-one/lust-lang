@@ -126,11 +126,38 @@ impl Diag {
         self
     }
     /// Adds a concrete edit for this diagnostic.
-    #[allow(dead_code)]
     pub fn with_edit(mut self, edit: Edit) -> Diag {
         self.edits.push(edit);
         self
     }
+}
+
+/// One edit of a rendered diagnostic with where it applies: the path of the
+/// diagnostic's file and its line, column and code (`with_edit_sink`).
+pub struct FileEdit {
+    /// Which diagnostic of the render the edit belongs to. The edits of
+    /// one diagnostic are one change: all of them apply, or none.
+    pub group: usize,
+    pub path: String,
+    pub line: u32,
+    pub col: u32,
+    pub code: &'static str,
+    pub edit: Edit,
+}
+
+thread_local! {
+    /// The edits of the diagnostics `render` writes on this thread, while a
+    /// `with_edit_sink` call is running.
+    static EDIT_SINK: std::cell::RefCell<Option<Vec<FileEdit>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f` and returns, with its result, every edit of every diagnostic it
+/// rendered on this thread (`lust fix` reads them here, not from the JSON
+/// text). The `--max-errors` cap does not limit the list.
+pub fn with_edit_sink<R>(f: impl FnOnce() -> R) -> (R, Vec<FileEdit>) {
+    EDIT_SINK.with(|s| *s.borrow_mut() = Some(Vec::new()));
+    let r = f();
+    (r, EDIT_SINK.with(|s| s.borrow_mut().take()).unwrap_or_default())
 }
 
 /// Error for a Rust syntax form whose AST shape exists (docs/ARCH.md S3b) but whose
@@ -811,6 +838,15 @@ pub fn render(diags: &mut [Diag], map: &SourceMap, src: &str, json: bool, max_er
     let omitted = total - shown;
     let hash = source_hash(src);
     let mut out = String::new();
+    EDIT_SINK.with(|sink| {
+        if let Some(sink) = sink.borrow_mut().as_mut() {
+            for (group, d) in uniq.iter().enumerate().filter(|(_, d)| !d.edits.is_empty()) {
+                let span = map.call_site(d.span);
+                let (line, col) = map.line_col(span);
+                sink.extend(d.edits.iter().map(|e| FileEdit { group, path: map.path(span.file).to_string(), line, col, code: d.code, edit: e.clone() }));
+            }
+        }
+    });
     for d in uniq.iter().take(shown) {
         let span = map.call_site(d.span);
         let path = map.path(span.file);

@@ -10,7 +10,7 @@
 #   lib\lust\tcc\bin\tcc.exe
 #   lib\lust\tcc\lib\          libtcc1.a and tcc's headers
 #   lib\lust\library\          std and adapter sources
-#   LICENSE, tcc-COPYING
+#   LICENSE, tcc-COPYING, mimalloc-LICENSE
 param([switch]$NoBuild)
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
@@ -41,6 +41,15 @@ Copy-Item (Join-Path $root 'library') (Join-Path $stage 'lib\lust\library') -Rec
 Copy-Item (Join-Path $root 'README.md'), (Join-Path $root 'LICENSE') $stage
 $copying = Join-Path $root 'third_party\tinycc\COPYING'
 if (Test-Path $copying) { Copy-Item $copying (Join-Path $stage 'tcc-COPYING') }
+# mimalloc's MIT license (lust-core links it), when the cargo registry holds the source.
+$lock = Get-Content (Join-Path $root 'Cargo.lock')
+$at = [array]::IndexOf($lock, 'name = "libmimalloc-sys"')
+if ($at -ge 0 -and $lock[$at + 1] -match '^version = "(.*)"$') {
+    $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME '.cargo' }
+    $license = Get-ChildItem -Path (Join-Path $cargoHome 'registry\src') -Filter 'LICENSE.txt' -Recurse -Depth 2 -ErrorAction SilentlyContinue |
+        Where-Object { $_.Directory.Name -eq "libmimalloc-sys-$($Matches[1])" } | Select-Object -First 1
+    if ($license) { Copy-Item $license.FullName (Join-Path $stage 'mimalloc-LICENSE') }
+}
 
 $zip = Join-Path $dist "$name.zip"
 if (Test-Path $zip) { Remove-Item -Force $zip }

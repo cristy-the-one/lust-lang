@@ -215,10 +215,15 @@ fn strict_fp() -> bool {
     STRICT_FP.load(Ordering::Relaxed) > 0
 }
 
-/// zig cc on Darwin refuses `-flto` unless this is on the command
-/// (`error: LTO requires using LLD`). None for every other compiler and target.
-fn zig_darwin_lto_arg(spec: &CcSpec) -> Option<&'static str> {
-    (strict_fp() && spec.cmd.first().is_some_and(|c| is_zig(c)) && spec.triple.contains("darwin")).then_some("-fuse-ld=lld")
+/// Takes `-flto` out of an `--opt` command for zig cc on Darwin. zig links Mach-O with its
+/// own linker, which has no LTO, and it refuses the flag on the compile and on the link
+/// (`error: LTO requires using LLD`; it has no LLD for Mach-O, so `-fuse-ld=lld` does not
+/// help). The units are still `-O2` with the strict floating-point set; only inlining across
+/// units is lost there. Every other compiler and target keeps the flag.
+fn drop_zig_darwin_lto(spec: &CcSpec, flags: &mut Vec<String>) {
+    if strict_fp() && spec.cmd.first().is_some_and(|c| is_zig(c)) && spec.triple.contains("darwin") {
+        flags.retain(|f| f != "-flto");
+    }
 }
 
 /// Flags that keep IEEE results next to a tcc build of the same C: no
@@ -329,11 +334,7 @@ fn ldflags(spec: &CcSpec, debug: bool) -> Vec<String> {
     // tcc links that library itself, and a mingw/clang link does not.
     if strict_fp() {
         v.extend(strict_fp_flags().split_whitespace().map(str::to_string));
-        // zig cc on macOS rejects -flto unless the linker is lld
-        // ("LTO requires using LLD"). The unit compile checks it too.
-        if let Some(f) = zig_darwin_lto_arg(spec) {
-            v.push(f.into());
-        }
+        drop_zig_darwin_lto(spec, &mut v);
         if spec.triple.contains("windows") {
             v.push("-lws2_32".into());
         }
@@ -853,9 +854,7 @@ pub fn build_with(
     }
     std::fs::create_dir_all(work).map_err(|e| format!("cannot create {}: {e}", work.display()))?;
     let mut flags: Vec<String> = cflags(debug).split_whitespace().map(str::to_string).collect();
-    if let Some(f) = zig_darwin_lto_arg(spec) {
-        flags.push(f.into());
-    }
+    drop_zig_darwin_lto(spec, &mut flags);
     let cxx_flags: Vec<String> = cxxflags(debug).split_whitespace().map(str::to_string).collect();
     let is_cxx = |name: &str| name.ends_with(".cc");
     let rt_max: usize = std::env::var("LUST_LL_RTINL").ok().and_then(|v| v.parse().ok()).unwrap_or(0);

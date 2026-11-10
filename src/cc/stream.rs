@@ -97,9 +97,7 @@ impl Stream {
         let jobs = num("LUST_CC_STREAM_JOBS", crate::pool::threads().max(1));
         let early = num("LUST_CC_STREAM_EARLY", (jobs / 4).max(1));
         let mut flags: Vec<String> = super::cflags(debug).split_whitespace().map(str::to_string).collect();
-        if let Some(f) = super::zig_darwin_lto_arg(&spec) {
-            flags.push(f.into());
-        }
+        super::drop_zig_darwin_lto(&spec, &mut flags);
         let owner = std::process::id();
         Some(Stream(Arc::new(Inner {
             spec,

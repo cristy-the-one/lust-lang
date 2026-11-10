@@ -25,6 +25,11 @@ about 25 ms either way, still about 7.5× tcc), so the speed cost there is
 noise. The list is what this path passes, so other builtins stay. There is
 no fast-math mode.
 
+zig cc on macOS builds without `-flto`: zig links Mach-O with its own linker,
+which has no LTO, and refuses the flag (`LTO requires using LLD`). The units
+are still `-O2` with the same floating-point set, so results do not change;
+only inlining across units is lost there.
+
 Calls are direct (`LUST_RELEASE_C` names, for this request only) so the
 optimiser can inline across units. The function table the daemon uses for
 tcc overlays is not how an `--opt` binary calls. The daemon still serves the

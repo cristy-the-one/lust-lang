@@ -1415,6 +1415,7 @@ fn main() {
             run_args: None,
             harness: false, cc: false, overlay: Default::default(),
             client: Default::default(),
+            query: None,
         };
         let mut s = Session::new(dir.join("obj"), false, key);
         let r = compile(&req, &mut s);

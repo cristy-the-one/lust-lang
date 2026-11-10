@@ -222,6 +222,9 @@ pub(crate) struct Front {
     /// patch to reuse in place of a fresh collect (driver/patch.rs
     /// `KeptProgram`).
     pub(crate) kept: [Option<super::patch::KeptProgram>; 2],
+    /// A program was kept (`patch::keep`) since `query::begin` cleared this:
+    /// the kept program is the one the request in flight collected.
+    pub(crate) kept_fresh: bool,
     /// The last successful compile's `lust-visits:` line (see
     /// `compile::Visits`), kept for tests.
     pub(crate) last_visits: String,
@@ -524,6 +527,7 @@ impl Session {
                 resolve_cache: crate::resolve::worklist::ResolveCache::new(!persistent),
                 patch: None,
                 kept: Default::default(),
+                kept_fresh: false,
                 last_visits: String::new(),
                 last_check: None,
                 std_plan: None,

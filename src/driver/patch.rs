@@ -572,6 +572,15 @@ pub(crate) struct KeptProgram {
     recheck: Vec<usize>,
 }
 
+impl KeptProgram {
+    /// True while the program describes `ast`, the front's Ast: no body
+    /// patch has detached it, and no later parse replaced the Ast it shares
+    /// (the test `reuse_kept` makes before it takes the program as it is).
+    pub(crate) fn attached_to(&self, ast: &Arc<crate::ast::Ast>) -> bool {
+        self.edits.is_none() && Arc::ptr_eq(&self.program.ast, ast)
+    }
+}
+
 impl PatchBase {
     /// Joins the `local_names` side thread now (a front image save: no
     /// thread may outlive the process that wrote the image).
@@ -644,6 +653,7 @@ pub(crate) fn keep(front: &mut Front, mut program: crate::check::collect::Progra
     program.reuse_stamp = crate::driver::gen_reuse::stamp_now();
     let recheck = std::mem::take(&mut front.template_recheck);
     front.kept[slot] = Some(KeptProgram { program, edits: None, bases: Vec::new(), prefer: false, recheck });
+    front.kept_fresh = true;
 }
 
 /// `keep` for a request that answers with errors: a program `reuse_kept`
@@ -3110,6 +3120,7 @@ pub fn run() -> i64 {
             run_args: None,
             harness: false, cc: false, overlay: Default::default(),
             client: Default::default(),
+            query: None,
         };
         let resp = compile(&req, session);
         (resp.code, resp.stderr)

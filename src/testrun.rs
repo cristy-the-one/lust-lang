@@ -471,6 +471,7 @@ pub fn run(args: &[String]) -> i32 {
         // The check below runs on the user file before the generated `main` is added.
         harness: cmd == Cmd::Check, cc: false, overlay: Default::default(),
         client: Default::default(),
+        query: None,
     };
     let check = driver::compile(&req(Cmd::Check, file.clone(), dir.join("testbin")), &mut session);
     if check.code != 0 {

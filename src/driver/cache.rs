@@ -538,6 +538,7 @@ mod tests {
             run_args: None,
             harness: false, cc: false, overlay: Default::default(),
             client: Default::default(),
+            query: None,
         }
     }
 

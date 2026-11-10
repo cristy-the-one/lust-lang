@@ -499,7 +499,9 @@ fn run() {
                 eprintln!("lust: front state off: {why}");
             }
             let start = std::time::Instant::now();
-            let cache = if req.emit_c.is_none() && req.run_args.is_none() && !req.cc { driver::cache::Cache::open(&req.file) } else { None };
+            // A query's answer is not its check's: it never reads or writes that cache.
+            let cache =
+                if req.emit_c.is_none() && req.run_args.is_none() && !req.cc && req.query.is_none() { driver::cache::Cache::open(&req.file) } else { None };
             let src = cache.as_ref().and_then(|_| std::fs::read(&req.file).ok());
             if let (Some(cache), Some(src)) = (&cache, &src)
                 && let Some(resp) = cache.lookup(&req, src, start)
@@ -520,11 +522,14 @@ fn run() {
             }
             let dir = std::env::temp_dir().join(format!("lust-{}", std::process::id()));
             let mut session = driver::Session::new(dir, false, req.session.clone());
-            session.caches.leak_at_exit = true;
+            // A query reads the program its check keeps, which a leaking
+            // one-shot compile forgets instead.
+            session.caches.leak_at_exit = req.query.is_none();
             // A panicking compile must not leave its temp dir behind:
             // clean up, then let the panic run its normal course.
             let compiled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver::compile(&req, &mut session)));
             let resp = match compiled {
+                Ok(resp) if req.query.is_some() => driver::query::answer(&req, &mut session, &resp),
                 Ok(resp) => resp,
                 Err(payload) => {
                     remove_obj_dir(session.obj_dir());

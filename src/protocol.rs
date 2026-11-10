@@ -323,6 +323,29 @@ pub struct Request {
     /// `lust-core`, never warm.
     pub cc: bool,
     pub client: Client,
+    /// `lust query`: the request is a check of the crate, and the answer is
+    /// what the checked program says about one position (driver/query.rs),
+    /// not the check's diagnostics. None for every other request.
+    pub query: Option<Query>,
+}
+
+/// What `lust query` asks about a position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueryKind {
+    /// Where the name at the position is defined.
+    Def,
+    /// The type of the expression or binding at the position.
+    Type,
+}
+
+/// One `lust query`: a position in a file of the crate, as an editor gives
+/// it (1-based line, 1-based byte column, as in diagnostics).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Query {
+    pub kind: QueryKind,
+    pub file: PathBuf,
+    pub line: u32,
+    pub col: u32,
 }
 
 /// What a compile reads from the process that asked for it, not from the compiler process:
@@ -385,7 +408,7 @@ pub enum Invocation {
     },
 }
 
-pub const USAGE: &str = "usage: lust <check|build|run> <file.rs> [--json] [--max-errors N] [--timings] [-o out] [-g] [--emit-c prefix] [-- args]\n       lust <check|build|run> <file.rs> [--manifest-path <Cargo.toml>] [--package <name>] [--bin <name> | --lib] [--features <a,b>] [--no-default-features] [--all-features] [--target <triple>] [-C panic=unwind|abort] [-C overflow-checks=on|off] [-C debug-assertions=on|off] [--offline] [--locked] [--frozen] [--sandbox]\n       lust build <file.rs> --release | --profile <name> [-o out] [--offline] [--locked] [--frozen]\n       lust build <file.rs> --release | --profile <name> --target <triple> [--target <triple>...] [crate flags] [-o out-or-dir] (lust release driver: zig cc)\n       lust check <file.rs> --rustc\n       lust test <file.rs> [filter] [--json] [--timeout SECONDS] [--max-errors N]\n       lust test <root.rs> --manifest-path <Cargo.toml> --lib | --test <name> [crate flags] [filter] [--json] [--timeout SECONDS]\n       lust explain <L####>\n       lust expand <file.rs>\n       lust capabilities [--json | --summary]\n       lust daemon\n       lust --version";
+pub const USAGE: &str = "usage: lust <check|build|run> <file.rs> [--json] [--max-errors N] [--timings] [-o out] [-g] [--emit-c prefix] [-- args]\n       lust <check|build|run> <file.rs> [--manifest-path <Cargo.toml>] [--package <name>] [--bin <name> | --lib] [--features <a,b>] [--no-default-features] [--all-features] [--target <triple>] [-C panic=unwind|abort] [-C overflow-checks=on|off] [-C debug-assertions=on|off] [--offline] [--locked] [--frozen] [--sandbox]\n       lust build <file.rs> --release | --profile <name> [-o out] [--offline] [--locked] [--frozen]\n       lust build <file.rs> --release | --profile <name> --target <triple> [--target <triple>...] [crate flags] [-o out-or-dir] (lust release driver: zig cc)\n       lust check <file.rs> --rustc\n       lust test <file.rs> [filter] [--json] [--timeout SECONDS] [--max-errors N]\n       lust test <root.rs> --manifest-path <Cargo.toml> --lib | --test <name> [crate flags] [filter] [--json] [--timeout SECONDS]\n       lust query <def|type> <file.rs> <line>:<col> [--in <file.rs>] [crate flags] [--json]\n       lust explain <L####>\n       lust expand <file.rs>\n       lust capabilities [--json | --summary]\n       lust daemon\n       lust --version";
 
 /// Crate-selection flags from the command line, before defaults are filled in.
 #[derive(Clone, Default)]
@@ -690,9 +713,24 @@ fn parse_command(args: &[String]) -> Option<Invocation> {
     }
     // `test` is `lust test`'s own crate build (`parse_test_args`): a build
     // of a test crate, which alone takes `--test <name>`.
-    if !["check", "build", "run", "test"].contains(&cmd.as_str()) {
+    if !["check", "build", "run", "test", "query"].contains(&cmd.as_str()) {
         return None;
     }
+    // `lust query <def|type> <file.rs> <line>:<col> [--in <file.rs>] [crate flags]`:
+    // a check of `<file.rs>` with the same crate flags (so it lands in the
+    // session a `lust check` of that crate warmed), then the answer for the
+    // position. `--in` names another file of the crate; the default is the
+    // file itself.
+    let query_kind = if cmd == "query" {
+        Some(match it.next()?.as_str() {
+            "def" => QueryKind::Def,
+            "type" => QueryKind::Type,
+            _ => return None,
+        })
+    } else {
+        None
+    };
+    let (mut query_at, mut query_in): (Option<(u32, u32)>, Option<PathBuf>) = (None, None);
     let mut file = PathBuf::new();
     let (mut out, mut json, mut timings, mut debug, mut emit_c, mut run_args) = (None, false, false, false, None, Vec::new());
     let (mut release, mut profile, mut rustc) = (false, None, false);
@@ -764,7 +802,16 @@ fn parse_command(args: &[String]) -> Option<Invocation> {
             "--target" => targets.push(it.next()?.clone()),
             _ if a.starts_with("--target=") => targets.push(a["--target=".len()..].to_string()),
             "--" => run_args = it.by_ref().cloned().collect(),
+            "--in" if query_kind.is_some() => query_in = Some(PathBuf::from(it.next()?)),
             _ if file.as_os_str().is_empty() => file = a.into(),
+            _ if query_kind.is_some() && query_at.is_none() => {
+                let (line, col) = a.split_once(':')?;
+                let (line, col): (u32, u32) = (line.parse().ok()?, col.parse().ok()?);
+                if line == 0 || col == 0 {
+                    return None;
+                }
+                query_at = Some((line, col));
+            }
             _ => return None,
         }
     }
@@ -775,6 +822,17 @@ fn parse_command(args: &[String]) -> Option<Invocation> {
         return None;
     }
     let abs = |p: &Path| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+    // A query is a check with a position: no output, release, oracle or run forms.
+    let query = match query_kind {
+        Some(kind) => {
+            let (line, col) = query_at?;
+            if rustc || release || profile.is_some() || out.is_some() || emit_c.is_some() || !run_args.is_empty() || timings {
+                return None;
+            }
+            Some(Query { kind, file: abs(query_in.as_deref().unwrap_or(&file)), line, col })
+        }
+        None => None,
+    };
     // Cargo canonicalizes `--manifest-path`, so `../b/Cargo.toml` names the
     // same file metadata reports. The stored path drops the Windows `\\?\`
     // prefix `canonicalize` adds: cargo check copies it into
@@ -842,6 +900,7 @@ fn parse_command(args: &[String]) -> Option<Invocation> {
                 cc: true,
                 overlay: Default::default(),
                 client: Client::current(&typed),
+                query: None,
             });
         }
         return Some(Invocation::ReleaseCc { reqs: Ok(reqs) });
@@ -891,6 +950,7 @@ fn parse_command(args: &[String]) -> Option<Invocation> {
         run_args: if run { Some(run_args.clone()) } else { None },
         harness: false, cc: false, overlay: Default::default(),
         client,
+        query,
     };
     Some(Invocation::Compile { req, run, args: run_args })
 }
@@ -1154,6 +1214,18 @@ pub fn encode(r: &Request) -> Vec<u8> {
         put_field(&mut out, path.as_bytes());
         put_field(&mut out, text.as_bytes());
     }
+    // The query, last: "<def|type> <line> <col>" and its file, or two empty fields.
+    match &r.query {
+        Some(q) => {
+            let kind = if q.kind == QueryKind::Def { "def" } else { "type" };
+            put_field(&mut out, format!("{kind} {} {}", q.line, q.col).as_bytes());
+            path_field(&mut out, Some(&q.file));
+        }
+        None => {
+            put_field(&mut out, b"");
+            put_field(&mut out, b"");
+        }
+    }
     out
 }
 
@@ -1221,6 +1293,18 @@ fn read_fields(r: &mut impl BufRead, f: &[&str]) -> Option<Request> {
     for _ in 0..n_overlay {
         overlay.insert(text(get_field(r)?)?, text(get_field(r)?)?);
     }
+    let (query_head, query_file) = (text(get_field(r)?)?, get_field(r)?);
+    let query = if query_head.is_empty() {
+        None
+    } else {
+        let mut w = query_head.split(' ');
+        let kind = match w.next()? {
+            "def" => QueryKind::Def,
+            "type" => QueryKind::Type,
+            _ => return None,
+        };
+        Some(Query { kind, line: w.next()?.parse().ok()?, col: w.next()?.parse().ok()?, file: path(query_file) })
+    };
     Some(Request {
         cmd: if f[0] == "check" { Cmd::Check } else { Cmd::Build },
         session: SessionKey {
@@ -1251,6 +1335,7 @@ fn read_fields(r: &mut impl BufRead, f: &[&str]) -> Option<Request> {
         cc: false,
         overlay: std::sync::Arc::new(overlay),
         client: Client { env, shown: if shown.is_empty() { None } else { Some(path(shown)) } },
+        query,
     })
 }
 

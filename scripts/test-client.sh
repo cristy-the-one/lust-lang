@@ -10,6 +10,8 @@
 #              kept binaries still run.
 #   cache:     hit, then miss on edit, on -g, and on a compiler id change.
 #              Eviction keeps the newest entries under the size cap.
+#   query:     `lust query def|type` cold and warm, after an edit, beside a
+#              type error, across files, and its refusals.
 #   release:   single file via rustc, a tiny Cargo project via cargo (package
 #              and bin selection, --profile), and `check --rustc` as oracle.
 # Every client call runs under the one timeout rule (scripts/timeout-lib.sh)
@@ -519,6 +521,89 @@ out=$( (cd "$d/proj" && "$lust" build --profile fast src/main.rs) 2>&1 ); rc=$?
 check "cargo: --profile build passes" test $rc -eq 0
 case "$out" in *"--profile fast"*) ok "cargo: --profile name passes through";; *) bad "cargo: --profile name passes through" "output: $out";; esac
 check "cargo: profile binary runs" test "$(runb "$d/proj/target/fast/tinyproj")" = "tiny main 42"
+
+# ---------------------------------------------------------------- query
+# `lust query <def|type> <file> <line>:<col>`: the answer is the same cold
+# and from a warm daemon, follows an edit, survives a type error in another
+# fn (the checked program is still there), and is refused when the crate
+# does not parse. A position in another file of the crate takes `--in`.
+# qis <name> <want-suffix> <query args...> : stdout ends with <want-suffix>, exit 0.
+qis() {
+  local name=$1 want=$2 out rc; shift 2
+  out=$( (cd "$d" && "$lust" query "$@") 2>/dev/null ); rc=$?
+  if [ $rc -eq 0 ] && [[ $out == *"$want" ]]; then ok "$name"; else bad "$name" "exit $rc, output: $out, want: $want"; fi
+}
+# qno <name> <query args...> : exit 1, nothing on stdout, a reason on stderr.
+qno() {
+  local name=$1 out err rc; shift
+  out=$( (cd "$d" && "$lust" query "$@") 2>"$work/query.err" ); rc=$?
+  err=$(cat "$work/query.err")
+  if [ $rc -eq 1 ] && [ -z "$out" ] && [[ $err == error:* ]]; then ok "$name"; else bad "$name" "exit $rc, stdout: $out, stderr: $err"; fi
+}
+query_src() {
+  cat <<'RS'
+fn double(n: i32) -> i32 {
+    n * 2
+}
+
+fn main() {
+    let total = double(21);
+    let name = String::from("x");
+    println!("{total} {name}");
+}
+RS
+}
+d=$(fresh querycold)
+query_src >"$d/q.rs"
+export LUST_NO_DAEMON=1
+qis "query cold: type of a local" "i32" type q.rs 6:9
+qis "query cold: type of a String local" "String" type q.rs 7:9
+qis "query cold: definition of a called fn" "q.rs:1:4" def q.rs 6:17
+qis "query cold: definition of a parameter use" "q.rs:1:11" def q.rs 2:5
+qno "query cold: a line past the end is refused" type q.rs 99:1
+qno "query cold: a position outside a fn body is refused" def q.rs 1:4
+out=$( (cd "$d" && "$lust" query type q.rs 6:9 --json) 2>/dev/null )
+case "$out" in '{"schema":1,"kind":"type","type":"i32",'*'"span":{"start":'*'"line":6,"col":9,'*) ok "query cold: --json answer";; *) bad "query cold: --json answer" "output: $out";; esac
+(cd "$d" && "$lust" query type q.rs) >/dev/null 2>&1; rc=$?
+check "query: a missing position is a usage error" test $rc -eq 2
+(cd "$d" && "$lust" query what q.rs 6:9) >/dev/null 2>&1; rc=$?
+check "query: an unknown kind is a usage error" test $rc -eq 2
+unset LUST_NO_DAEMON
+if is_daemon_endpoint "$(sock "$d")"; then bad "query cold: no daemon starts" "socket exists"; else ok "query cold: no daemon starts"; fi
+
+d=$(fresh querywarm); daemon_dirs+=("$d")
+query_src >"$d/q.rs"
+(cd "$d" && "$lust" check q.rs) >/dev/null 2>&1
+check "query warm: daemon socket appears" wait_socket "$d"
+qis "query warm: type of a local" "i32" type q.rs 6:9
+qis "query warm: definition of a called fn" "q.rs:1:4" def q.rs 6:17
+# A blank line on top moves every position down one line.
+{ echo; query_src; } >"$d/q.rs"
+qis "query warm: definition follows an edit" "q.rs:2:4" def q.rs 7:17
+qis "query warm: type follows an edit" "String" type q.rs 8:9
+# A type error in another fn: the check fails, the program is still there.
+printf 'fn bad() -> i32 { "s" }\n' >>"$d/q.rs"
+(cd "$d" && "$lust" check q.rs) >/dev/null 2>&1; rc=$?
+check "query warm: the crate now fails its check" test $rc -eq 1
+qis "query warm: answers beside a type error" "String" type q.rs 8:9
+# A parse error leaves no program of this text.
+printf 'fn (\n' >>"$d/q.rs"
+qno "query warm: refused when the file does not parse" type q.rs 8:9
+{ echo; query_src; } >"$d/q.rs"
+qis "query warm: answers again after the fix" "q.rs:2:4" def q.rs 7:17
+stop_daemon "$d"; sleep 0.3
+
+d=$(fresh querymods); daemon_dirs+=("$d")
+printf 'mod util;\nfn main() { let v = util::twice(4); println!("{v}"); }\n' >"$d/main.rs"
+printf 'pub fn twice(n: u64) -> u64 { let m = n + n; m }\n' >"$d/util.rs"
+qis "query mods: definition in another file" "util.rs:1:8" def main.rs 2:27
+(cd "$d" && "$lust" check main.rs) >/dev/null 2>&1
+check "query mods: daemon socket appears" wait_socket "$d"
+qis "query mods: warm definition in another file" "util.rs:1:8" def main.rs 2:27
+qis "query mods: type at a position in another file" "u64" type main.rs 1:35 --in util.rs
+qis "query mods: definition inside another file" "util.rs:1:35" def main.rs 1:46 --in util.rs
+qno "query mods: a file outside the crate is refused" type main.rs 1:1 --in nothere.rs
+stop_daemon "$d"; sleep 0.3
 
 # Timeout report (see the shim at the top). Slow retries do not fail; every
 # hang does, even when the checks around the hung call happened to pass.

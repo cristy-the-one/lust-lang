@@ -4799,7 +4799,7 @@ fn collect_inline_modules(items: &[Item], fi: usize, prefix: &[Sym], tables: &Re
 /// in such a module (false accepts), so lust rejects the attribute.
 fn no_prelude_unsupported(attrs: &[Attr], interner: &Interner, diags: &mut Vec<Diag>) {
     for a in attrs.iter().filter(|a| a.path.len() == 1 && interner.get(a.path[0].name) == "no_implicit_prelude") {
-        diags.push(crate::diag::not_yet("L0522", a.span, "`#[no_implicit_prelude]`"));
+        diags.push(Diag::new("L0522", a.span, crate::rewrite::NO_PRELUDE, "Remove the attribute: lust resolves names with the prelude in scope."));
     }
 }
 

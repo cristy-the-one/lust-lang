@@ -22,6 +22,7 @@ mod diag;
 mod driver;
 mod expand;
 mod explain;
+mod fix;
 mod image;
 mod srctext;
 mod sys_host;
@@ -36,6 +37,7 @@ mod pool;
 mod protocol;
 #[allow(dead_code)] // Wired into the driver by the worklist increment.
 mod resolve;
+mod rewrite;
 mod scan;
 mod stdload;
 mod stdloc;
@@ -410,6 +412,7 @@ fn run() {
         Some("explain") => std::process::exit(explain::run(&args[1..])),
         Some("capabilities") => std::process::exit(capabilities::run(&args[1..])),
         Some("expand") => std::process::exit(expand::run_expand(&args[1..])),
+        Some("fix") => std::process::exit(fix::run(&args[1..])),
         _ => {}
     }
     // A CI job may check its sources out while lust restores its front image
@@ -502,7 +505,7 @@ fn run() {
             // `--opt=bg` must reach compile: a whole-request hit would replay the
             // fast binary and never install a cached optimised one. A query's
             // answer is not its check's: it never reads or writes that cache.
-            let cache = if req.emit_c.is_none() && req.run_args.is_none() && !req.cc && !req.opt_bg && req.query.is_none() {
+            let cache = if req.emit_c.is_none() && req.run_args.is_none() && !req.cc && !req.opt_bg && req.query.is_none() && req.mark_unread.is_empty() {
                 driver::cache::Cache::open(&req.file)
             } else {
                 None
@@ -529,12 +532,16 @@ fn run() {
             let mut session = driver::Session::new(dir, false, req.session.clone());
             // A query reads the program its check keeps, which a leaking
             // one-shot compile forgets instead.
-            session.caches.leak_at_exit = req.query.is_none();
+            session.caches.leak_at_exit = req.query.is_none() && req.mark_unread.is_empty();
             // A panicking compile must not leave its temp dir behind:
             // clean up, then let the panic run its normal course.
             let compiled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver::compile(&req, &mut session)));
             let resp = match compiled {
                 Ok(resp) if req.query.is_some() => driver::query::answer(&req, &mut session, &resp),
+                Ok(mut resp) if !req.mark_unread.is_empty() => {
+                    driver::unread::append(&req, &mut session, &mut resp);
+                    resp
+                }
                 Ok(resp) => resp,
                 Err(payload) => {
                     remove_obj_dir(session.obj_dir());

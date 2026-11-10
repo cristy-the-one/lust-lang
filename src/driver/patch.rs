@@ -3121,6 +3121,7 @@ pub fn run() -> i64 {
             harness: false, cc: false, opt_bg: false, overlay: Default::default(),
             client: Default::default(),
             query: None,
+            mark_unread: Vec::new(),
         };
         let resp = compile(&req, session);
         (resp.code, resp.stderr)

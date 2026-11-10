@@ -2305,6 +2305,15 @@ impl Evaluator {
                 Flow::Val(v) => v,
                 other => return Ok(other),
             },
+            // A closure has a rewrite of its own (src/rewrite.rs): a named fn.
+            Expr::Closure { .. } => {
+                return Err(Diag::new(
+                    C_OUTSIDE,
+                    span,
+                    crate::rewrite::CLOSURE_CONST,
+                    "Write the closure as a named fn next to the item, and name that fn here.",
+                ));
+            }
             _ => return Err(outside(span, "this expression")),
         };
         Ok(Flow::Val(v))
@@ -5740,10 +5749,10 @@ impl Evaluator {
                     }
                     if (want_some && *variant == 1) || (!want_some && *variant == 0) {
                         if let Pat::TupleStruct { elems, .. } = cx.ast().pat(pat)
-                            && elems.len() == 1
+                            && let Some(sub) = cx.ast().one_field_pat(elems)
                         {
                             let elem_ty = cx.tys_ref().option_elem(t).unwrap_or(ERROR);
-                            return self.match_pat(cx, env, elems[0], &fields[0].clone(), elem_ty, _in_match, binds);
+                            return self.match_pat(cx, env, sub, &fields[0].clone(), elem_ty, _in_match, binds);
                         }
                         if !want_some {
                             return Ok(true);
@@ -5758,10 +5767,10 @@ impl Evaluator {
                     let want_err = cx.sym_text(segs[segs.len() - 1].name) == "Err";
                     if (want_ok && *variant == 0) || (want_err && *variant == 1) {
                         if let Pat::TupleStruct { elems, .. } = cx.ast().pat(pat)
-                            && elems.len() == 1
+                            && let Some(sub) = cx.ast().one_field_pat(elems)
                         {
                             let elem_ty = if want_ok { ok_ty } else { err_ty };
-                            return self.match_pat(cx, env, elems[0], &fields[0].clone(), elem_ty, _in_match, binds);
+                            return self.match_pat(cx, env, sub, &fields[0].clone(), elem_ty, _in_match, binds);
                         }
                         return Ok(true);
                     }

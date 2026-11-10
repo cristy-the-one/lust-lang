@@ -472,6 +472,7 @@ pub fn run(args: &[String]) -> i32 {
         harness: cmd == Cmd::Check, cc: false, opt_bg: false, overlay: Default::default(),
         client: Default::default(),
         query: None,
+        mark_unread: Vec::new(),
     };
     let check = driver::compile(&req(Cmd::Check, file.clone(), dir.join("testbin")), &mut session);
     if check.code != 0 {

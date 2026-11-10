@@ -35,7 +35,7 @@ pub fn is_passthrough(name: &str) -> bool {
 /// the larger value applies, so lust never allows a depth rustc rejects.
 pub fn rustc_depth(name: &str, inner: &[Tt]) -> (u32, u32) {
     // The argument count `split_args` would give, without copying them.
-    let commas = inner.iter().filter(|t| t.is_tok(Tok::Comma)).count();
+    let commas = arg_commas(inner).len();
     let args = if inner.is_empty() { 0 } else { commas + 1 - usize::from(inner.last().is_some_and(|t| t.is_tok(Tok::Comma))) };
     match name {
         "println" | "eprintln" if args == 0 => (2, 2),
@@ -360,12 +360,43 @@ fn cfg_expr(trees: &[Tt], i: &mut usize, env: &CfgEnv, st: &impl CfgRead) -> Res
     }
 }
 
+/// The indexes of the commas that separate the arguments of a macro call.
+/// A comma inside a turbofish is not one (`f::<A, B>(x)`, `Err::<u8, E>(e)`):
+/// `<` and `>` are not delimiters in a token tree, and rustc's `$x:expr`
+/// reads the whole path. Generic arguments start at `::<`, nest by `<`, and
+/// end at the matching `>` (`>>` ends two). A list that never closes its
+/// `::<` is not a turbofish: every comma then separates, as before.
+pub fn arg_commas(trees: &[Tt]) -> Vec<usize> {
+    let (mut out, mut all) = (Vec::new(), Vec::new());
+    let mut depth = 0usize;
+    for (i, t) in trees.iter().enumerate() {
+        if t.is_tok(Tok::Comma) {
+            all.push(i);
+        }
+        if depth == 0 {
+            if t.is_tok(Tok::Comma) {
+                out.push(i);
+            } else if t.is_tok(Tok::Lt) && i > 0 && trees[i - 1].is_tok(Tok::PathSep) {
+                depth = 1;
+            }
+        } else if t.is_tok(Tok::Lt) {
+            depth += 1;
+        } else if t.is_tok(Tok::Gt) {
+            depth -= 1;
+        } else if t.is_tok(Tok::Shr) {
+            depth = depth.saturating_sub(2);
+        }
+    }
+    if depth == 0 { out } else { all }
+}
+
 /// Splits call argument trees at top-level commas. A trailing comma's
 /// empty final piece is dropped, as in a call's own grammar.
 pub fn split_args(trees: &[Tt]) -> Vec<Vec<Tt>> {
     let mut parts: Vec<Vec<Tt>> = vec![Vec::new()];
-    for tree in trees {
-        if tree.is_tok(Tok::Comma) {
+    let commas = arg_commas(trees);
+    for (i, tree) in trees.iter().enumerate() {
+        if commas.contains(&i) {
             parts.push(Vec::new());
         } else {
             parts.last_mut().unwrap().push(tree.clone());
@@ -634,7 +665,7 @@ pub fn assert_text_too_long(span: Span) -> Diag {
     err(
         C_UNSUPPORTED,
         span,
-        "`assert!` with no message on a long or item-holding condition is not supported yet",
+        crate::rewrite::ASSERT_LONG,
         "Add a message: assert!(cond, \"...\"), or split the condition.",
     )
 }
@@ -887,7 +918,7 @@ fn matches_macro(st: &mut Expander, call: &Call) -> Result<Vec<Tt>, Diag> {
     let span = call.span;
     // Split once, at the first top-level comma: before it the value,
     // after it the pattern (with any `if` guard as written).
-    let Some(comma) = call.inner.iter().position(|t| t.is_tok(Tok::Comma)) else {
+    let Some(comma) = arg_commas(&call.inner).first().copied() else {
         return Err(err(C_CALL, span, "matches! takes a value and a pattern", "Write matches!(value, pattern)."));
     };
     let value = call.inner[..comma].to_vec();
@@ -913,7 +944,7 @@ fn matches_macro(st: &mut Expander, call: &Call) -> Result<Vec<Tt>, Diag> {
 /// parser until its `Arguments` type lands with source std (6.4).
 fn write_macro(st: &mut Expander, newline: bool, call: &Call) -> Result<Vec<Tt>, Diag> {
     let span = call.span;
-    let Some(comma) = call.inner.iter().position(|t| t.is_tok(Tok::Comma)) else {
+    let Some(comma) = arg_commas(&call.inner).first().copied() else {
         // writeln!(dst) alone writes one newline.
         if newline && !call.inner.is_empty() {
             let dst = call.inner.clone();

@@ -1433,6 +1433,7 @@ pub fn serve(sock: &Path) -> ! {
             run_args: None,
             harness: false, cc: false, opt_bg: false, overlay: Default::default(),
             client: protocol::Client::default(),
+            query: None,
             file: file.clone(),
         };
         let entry = entry_for(&mut sessions, &base, &req.session, req.client.env.as_deref(), &mut made);
@@ -1509,7 +1510,16 @@ pub fn serve(sock: &Path) -> ! {
                     replace_session(entry, &req.session);
                     entry.refresh_key = rk;
                 }
-                compile_guarded(entry, &req, &mut jobs)
+                if req.query.is_some() {
+                    // A query is its check, then the answer from the session
+                    // that check left (a fresh one after a panic or a guard
+                    // recompute). The guard verifies the check's answer.
+                    driver::query::begin(&mut entry.session);
+                    let check = compile_guarded(entry, &req, &mut jobs);
+                    driver::query::answer(&req, &mut entry.session, &check)
+                } else {
+                    compile_guarded(entry, &req, &mut jobs)
+                }
             }
             Err(_) => Response { stderr: "error: bad request\n".into(), code: 2, ..Default::default() },
         };
@@ -1593,6 +1603,7 @@ mod tests {
             run_args: None,
             harness: false, cc: false, opt_bg: false, overlay: Default::default(),
             client: protocol::Client::default(),
+            query: None,
             file: file.to_path_buf(),
         }
     }

@@ -6591,6 +6591,7 @@ fn main() { println!(\"{}\", f0() + 5i64.d()); }
             run_args: None,
             harness: false, cc: false, opt_bg: false, overlay: Default::default(),
             client: Default::default(),
+            query: None,
         }
     }
 

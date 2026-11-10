@@ -1416,6 +1416,7 @@ fn main() {
             harness: false, cc: false, opt_bg: false, overlay: Default::default(),
             client: Default::default(),
             query: None,
+            mark_unread: Vec::new(),
         };
         let mut s = Session::new(dir.join("obj"), false, key);
         let r = compile(&req, &mut s);

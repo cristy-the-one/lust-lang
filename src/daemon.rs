@@ -1434,6 +1434,7 @@ pub fn serve(sock: &Path) -> ! {
             harness: false, cc: false, opt_bg: false, overlay: Default::default(),
             client: protocol::Client::default(),
             query: None,
+            mark_unread: Vec::new(),
             file: file.clone(),
         };
         let entry = entry_for(&mut sessions, &base, &req.session, req.client.env.as_deref(), &mut made);
@@ -1517,6 +1518,11 @@ pub fn serve(sock: &Path) -> ! {
                     driver::query::begin(&mut entry.session);
                     let check = compile_guarded(entry, &req, &mut jobs);
                     driver::query::answer(&req, &mut entry.session, &check)
+                } else if !req.mark_unread.is_empty() {
+                    // The marks come from the program this compile keeps.
+                    let mut resp = compile_guarded(entry, &req, &mut jobs);
+                    driver::unread::append(&req, &mut entry.session, &mut resp);
+                    resp
                 } else {
                     compile_guarded(entry, &req, &mut jobs)
                 }
@@ -1604,6 +1610,7 @@ mod tests {
             harness: false, cc: false, opt_bg: false, overlay: Default::default(),
             client: protocol::Client::default(),
             query: None,
+            mark_unread: Vec::new(),
             file: file.to_path_buf(),
         }
     }

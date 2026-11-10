@@ -21,6 +21,7 @@ pub(crate) mod gen_reuse;
 pub mod graph;
 mod patch;
 pub mod query;
+pub mod unread;
 pub(crate) mod sig_nodes;
 mod span_shift;
 mod session;

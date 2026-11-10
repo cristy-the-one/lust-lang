@@ -336,6 +336,10 @@ pub struct Request {
     /// what the checked program says about one position (driver/query.rs),
     /// not the check's diagnostics. None for every other request.
     pub query: Option<Query>,
+    /// `--mark-unread <path>`: fns whose calls the answer lists when their
+    /// result is never read (driver/unread.rs). It changes the answer, not
+    /// what is built, so it is in no session or cache key.
+    pub mark_unread: Vec<String>,
 }
 
 /// What `lust query` asks about a position.
@@ -417,7 +421,7 @@ pub enum Invocation {
     },
 }
 
-pub const USAGE: &str = "usage: lust <check|build|run> <file.rs> [--json] [--max-errors N] [--timings] [-o out] [-g] [--emit-c prefix] [-- args]\n       lust <check|build|run> <file.rs> [--manifest-path <Cargo.toml>] [--package <name>] [--bin <name> | --lib] [--features <a,b>] [--no-default-features] [--all-features] [--target <triple>] [-C panic=unwind|abort] [-C overflow-checks=on|off] [-C debug-assertions=on|off] [--offline] [--locked] [--frozen] [--sandbox] [--opt | --opt=bg]\n       lust build <file.rs> --release | --profile <name> [-o out] [--offline] [--locked] [--frozen]\n       lust build <file.rs> --release | --profile <name> --target <triple> [--target <triple>...] [crate flags] [-o out-or-dir] (lust release driver: zig cc)\n       lust check <file.rs> --rustc\n       lust test <file.rs> [filter] [--json] [--timeout SECONDS] [--max-errors N]\n       lust test <root.rs> --manifest-path <Cargo.toml> --lib | --test <name> [crate flags] [filter] [--json] [--timeout SECONDS]\n       lust query <def|type> <file.rs> <line>:<col> [--in <file.rs>] [crate flags] [--json]\n       lust explain <L####>\n       lust expand <file.rs>\n       lust capabilities [--json | --summary]\n       lust daemon\n       lust --version";
+pub const USAGE: &str = "usage: lust <check|build|run> <file.rs> [--json] [--max-errors N] [--timings] [-o out] [-g] [--emit-c prefix] [--mark-unread <fn path>]... [-- args]\n       lust <check|build|run> <file.rs> [--manifest-path <Cargo.toml>] [--package <name>] [--bin <name> | --lib] [--features <a,b>] [--no-default-features] [--all-features] [--target <triple>] [-C panic=unwind|abort] [-C overflow-checks=on|off] [-C debug-assertions=on|off] [--offline] [--locked] [--frozen] [--sandbox] [--opt | --opt=bg]\n       lust build <file.rs> --release | --profile <name> [-o out] [--offline] [--locked] [--frozen]\n       lust build <file.rs> --release | --profile <name> --target <triple> [--target <triple>...] [crate flags] [-o out-or-dir] (lust release driver: zig cc)\n       lust check <file.rs> --rustc\n       lust test <file.rs> [filter] [--json] [--timeout SECONDS] [--max-errors N]\n       lust test <root.rs> --manifest-path <Cargo.toml> --lib | --test <name> [crate flags] [filter] [--json] [--timeout SECONDS]\n       lust query <def|type> <file.rs> <line>:<col> [--in <file.rs>] [crate flags] [--json]\n       lust explain <L####>\n       lust expand <file.rs>\n       lust capabilities [--json | --summary]\n       lust daemon\n       lust --version";
 
 /// Crate-selection flags from the command line, before defaults are filled in.
 #[derive(Clone, Default)]
@@ -740,6 +744,7 @@ fn parse_command(args: &[String]) -> Option<Invocation> {
         None
     };
     let (mut query_at, mut query_in): (Option<(u32, u32)>, Option<PathBuf>) = (None, None);
+    let mut mark_unread: Vec<String> = Vec::new();
     let mut file = PathBuf::new();
     let (mut out, mut json, mut timings, mut debug, mut emit_c, mut run_args) = (None, false, false, false, None, Vec::new());
     let (mut release, mut profile, mut rustc) = (false, None, false);
@@ -816,6 +821,8 @@ fn parse_command(args: &[String]) -> Option<Invocation> {
             _ if a.starts_with("--target=") => targets.push(a["--target=".len()..].to_string()),
             "--" => run_args = it.by_ref().cloned().collect(),
             "--in" if query_kind.is_some() => query_in = Some(PathBuf::from(it.next()?)),
+            "--mark-unread" => mark_unread.push(it.next()?.clone()),
+            _ if a.starts_with("--mark-unread=") => mark_unread.push(a["--mark-unread=".len()..].to_string()),
             _ if file.as_os_str().is_empty() => file = a.into(),
             _ if query_kind.is_some() && query_at.is_none() => {
                 let (line, col) = a.split_once(':')?;
@@ -835,6 +842,11 @@ fn parse_command(args: &[String]) -> Option<Invocation> {
         return None;
     }
     let abs = |p: &Path| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+    // The marks are part of a `--json` answer of a dev check or build.
+    let path_ok = |w: &String| !w.is_empty() && w.split("::").all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_alphanumeric() || c == '_'));
+    if !mark_unread.is_empty() && (!json || rustc || release || profile.is_some() || query_kind.is_some() || !mark_unread.iter().all(path_ok)) {
+        return None;
+    }
     // A query is a check with a position: no output, release, oracle or run forms.
     let query = match query_kind {
         Some(kind) => {
@@ -915,6 +927,7 @@ fn parse_command(args: &[String]) -> Option<Invocation> {
                 overlay: Default::default(),
                 client: Client::current(&typed),
                 query: None,
+                mark_unread: Vec::new(),
             });
         }
         return Some(Invocation::ReleaseCc { reqs: Ok(reqs) });
@@ -976,6 +989,7 @@ fn parse_command(args: &[String]) -> Option<Invocation> {
         overlay: Default::default(),
         client,
         query,
+        mark_unread,
     };
     Some(Invocation::Compile { req, run, args: run_args })
 }
@@ -1253,6 +1267,8 @@ pub fn encode(r: &Request) -> Vec<u8> {
             put_field(&mut out, b"");
         }
     }
+    // The `--mark-unread` paths, one per line.
+    put_field(&mut out, r.mark_unread.join("\n").as_bytes());
     out
 }
 
@@ -1332,6 +1348,7 @@ fn read_fields(r: &mut impl BufRead, f: &[&str]) -> Option<Request> {
         };
         Some(Query { kind, line: w.next()?.parse().ok()?, col: w.next()?.parse().ok()?, file: path(query_file) })
     };
+    let mark_unread: Vec<String> = text(get_field(r)?)?.lines().map(str::to_string).collect();
     Some(Request {
         cmd: if f[0] == "check" { Cmd::Check } else { Cmd::Build },
         session: SessionKey {
@@ -1370,6 +1387,7 @@ fn read_fields(r: &mut impl BufRead, f: &[&str]) -> Option<Request> {
         overlay: std::sync::Arc::new(overlay),
         client: Client { env, shown: if shown.is_empty() { None } else { Some(path(shown)) } },
         query,
+        mark_unread,
     })
 }
 

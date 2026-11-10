@@ -8,7 +8,7 @@
 # Layout matches scripts/release.sh (lust finds lib\lust next to its executable):
 #   bin\lust.exe, bin\lust-core.exe
 #   lib\lust\tcc\bin\tcc.exe
-#   lib\lust\tcc\lib\          libtcc1.a and tcc's headers
+#   lib\lust\tcc\lib\tcc\      libtcc1.a and tcc's headers
 #   lib\lust\library\          std and adapter sources
 #   LICENSE, tcc-COPYING, mimalloc-LICENSE
 param([switch]$NoBuild)
@@ -36,7 +36,10 @@ if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
 New-Item -ItemType Directory -Force -Path (Join-Path $stage 'bin'), (Join-Path $stage 'lib\lust\tcc\bin'), (Join-Path $stage 'lib\lust\tcc\lib') | Out-Null
 Copy-Item (Join-Path $root 'target\release\lust.exe'), (Join-Path $root 'target\release\lust-core.exe') (Join-Path $stage 'bin')
 Copy-Item (Join-Path $tcc 'bin\tcc.exe') (Join-Path $stage 'lib\lust\tcc\bin')
-Copy-Item (Join-Path $tcc 'lib\tcc\*') (Join-Path $stage 'lib\lust\tcc\lib') -Recurse -Force
+# The directory itself: lust reads tcc's runtime at lib\lust\tcc\lib\tcc (src/tcc.rs
+# `tcc_paths`), as on Linux and macOS. With its contents one level up, the packaged tcc
+# did not find its own headers.
+Copy-Item (Join-Path $tcc 'lib\tcc') (Join-Path $stage 'lib\lust\tcc\lib') -Recurse -Force
 Copy-Item (Join-Path $root 'library') (Join-Path $stage 'lib\lust\library') -Recurse -Force
 Copy-Item (Join-Path $root 'README.md'), (Join-Path $root 'LICENSE') $stage
 $copying = Join-Path $root 'third_party\tinycc\COPYING'

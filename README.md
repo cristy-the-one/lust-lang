@@ -291,6 +291,8 @@ bash scripts/ci.sh
 ```sh
 lust check main.rs [--json] [--timings]     # type check and borrow check
 lust watch check main.rs [check flags]      # re-check when a source is saved
+lust query type main.rs 12:9 [--json]       # the type of the expression at line 12, column 9
+lust query def main.rs 12:17 [--in util.rs]  # where the name at that position is defined
 lust run main.rs [-- args]                  # build with tcc and run
 lust build main.rs [-o out]                 # build a dev binary
 lust test main.rs [filter]                  # run #[test] functions
@@ -303,6 +305,8 @@ lust capabilities --json                    # what the subset supports and rejec
 ```
 
 `lust watch check` repeats that check when a source file, `Cargo.toml`, or `Cargo.lock` is saved. It keeps the working directory and the check flags (target, features, profile, `--sandbox`) and sends each check through the same client, so an already warm daemon session stays warm. `target/`, `.lust-cache`, and `$CARGO_TARGET_DIR` are not watched. Edits that land together become one check: the quiet period restarts when the saved bytes change, and a notification that does not change those bytes does not start another. An edit that lands while a check is running schedules one more check, and the diagnostics from the check that was in flight are marked `stale` until a later check matches the saved tree (`current`). Ctrl-C stops the watcher, the check it is running, and a daemon that this watch started. `watch` does not run tests or build. The watcher is a separate program (`lust-watch`); `check`, `build`, and `run` do not load it.
+
+`lust query` asks the checked program about one position, for an editor or an agent. It is a check of the crate with the same flags as `lust check`, followed by a lookup, so a warm daemon answers from the program it already holds and takes in any edit since the last check: on a one-file program a warm query takes about 6 ms, the client's start included. The position is a 1-based line and byte column, as in diagnostics; `--in <file.rs>` names another file of the crate. `type` prints the type of the smallest expression or pattern at the position. `def` prints `file:line:col` of the definition of a local, a fn, a method, or a struct or enum. With `--json` both print one object with the span encoding of the diagnostics. The exit code is 0 with the answer on stdout, or 1 with the reason on stderr. A query still answers when another fn has a type error. It is refused when the file does not parse. Not covered yet: positions outside fn bodies (signatures, fields, items), names inside a macro call, the definitions of fields, consts and statics, and anything defined in std.
 
 A target in a Cargo workspace:
 

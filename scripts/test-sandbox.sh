@@ -129,6 +129,50 @@ fi
 lust_to build --max-memory 64M "$root/tests/sandbox/memory.rs" -o "$work/x" >/dev/null 2>&1; [ $? -eq 2 ] && report ok memory-needs-sandbox || report bad memory-needs-sandbox "--max-memory without --sandbox should be a usage error"
 lust_to check --sandbox --max-memory 64M "$root/tests/sandbox/memory.rs" >/dev/null 2>&1; [ $? -eq 2 ] && report ok memory-not-on-check || report bad memory-not-on-check "--max-memory on check should be a usage error"
 lust_to build --sandbox --max-memory lots "$root/tests/sandbox/memory.rs" -o "$work/x" >/dev/null 2>&1; [ $? -eq 2 ] && report ok memory-bad-value || report bad memory-bad-value "a bad --max-memory value should be a usage error"
+# --time-limit: a spin and a long sleep stop with exit 101 and one L0533
+# line, soon. A program that finishes inside the limit runs as usual.
+time_run() { # time_run <exe> <mode> : leaves time.out, time.stderr; prints the exit code
+  set +o pipefail
+  printf '%s\n' "$2" | timeout 5 "$1" >"$work/time.out" 2>"$work/time.stderr"
+  local code=${PIPESTATUS[1]}
+  set -o pipefail
+  echo "$code"
+}
+time_stops() { # time_stops <name> <exe> <mode>
+  local start end code
+  start=$(date +%s)
+  code=$(time_run "$2" "$3")
+  end=$(date +%s)
+  if [ "$code" -eq 101 ] && [ "$(head -1 "$work/time.out")" = before ] && ! grep -q after "$work/time.out" \
+    && grep -qx 'error\[L0533\]: this program was built with --time-limit 300ms and tried to run longer' "$work/time.stderr" \
+    && [ $((end - start)) -lt 3 ]; then
+    report ok "$1"
+  else
+    report bad "$1" "exit $code after $((end - start))s, stdout $(cat "$work/time.out"), stderr $(cat "$work/time.stderr")"
+  fi
+}
+if lust_to build --sandbox --time-limit 300ms "$root/tests/sandbox/time.rs" -o "$work/time300" >"$work/time.err" 2>&1 \
+  && lust_to build --sandbox --time-limit=2s "$root/tests/sandbox/time.rs" -o "$work/time2s" >>"$work/time.err" 2>&1; then
+  time_stops time-spin "$work/time300" spin
+  time_stops time-sleep "$work/time300" sleep
+  code=$(time_run "$work/time300" finish)
+  if [ "$code" -eq 0 ] && [ "$(tail -1 "$work/time.out")" = done ] && [ ! -s "$work/time.stderr" ]; then
+    report ok time-under-the-limit
+  else
+    report bad time-under-the-limit "exit $code, stdout $(cat "$work/time.out"), stderr $(cat "$work/time.stderr")"
+  fi
+  code=$(time_run "$work/time2s" finish)
+  if [ "$code" -eq 0 ] && [ "$(tail -1 "$work/time.out")" = done ]; then
+    report ok time-seconds-suffix
+  else
+    report bad time-seconds-suffix "exit $code, stdout $(cat "$work/time.out"), stderr $(cat "$work/time.stderr")"
+  fi
+else
+  report bad time-builds "$(head -3 "$work/time.err")"
+fi
+lust_to build --time-limit 1s "$root/tests/sandbox/time.rs" -o "$work/x" >/dev/null 2>&1; [ $? -eq 2 ] && report ok time-needs-sandbox || report bad time-needs-sandbox "--time-limit without --sandbox should be a usage error"
+lust_to check --sandbox --time-limit 1s "$root/tests/sandbox/time.rs" >/dev/null 2>&1; [ $? -eq 2 ] && report ok time-not-on-check || report bad time-not-on-check "--time-limit on check should be a usage error"
+lust_to build --sandbox --time-limit fast "$root/tests/sandbox/time.rs" -o "$work/x" >/dev/null 2>&1; [ $? -eq 2 ] && report ok time-bad-value || report bad time-bad-value "a bad --time-limit value should be a usage error"
 # The same source without the flag still reaches the file system.
 lust_to build "$root/tests/sandbox/path_exists.rs" -o "$work/exists.plain" >/dev/null 2>&1 && "$work/exists.plain" | grep -qx true \
   && report ok plain-unchanged || report bad plain-unchanged "the plain build should print true"

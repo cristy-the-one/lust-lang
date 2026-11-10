@@ -1850,10 +1850,85 @@ lust_u128 lust_dur_as(lust_Duration d, uint64_t per_sec, uint64_t nanos_per) LUS
 #endif
 #endif
 
+/* `--sandbox --time-limit` (docs/sandbox.md). The deadline is a monotonic
+   millisecond count; 0 means no limit. main sets it (`lust_time_limit_set`)
+   before the program runs. A loop back-edge calls `lust_time_check` (the
+   clock, every iteration). A function entry calls `lust_time_tick` (the
+   clock every 64th call), which stops a recursion that never loops.
+   `thread::sleep` is shortened so one call cannot run past the deadline.
+   The sandbox refuses thread spawning, so these globals are not shared.
+   A straight-line body with no call and no sleep is not probed; the host
+   wall clock stays the backstop for that shape, as it does for a stack
+   overflow (`fatal runtime error: stack overflow`). */
+#ifdef LUST_IMPL
+static uint64_t lust_time_deadline_ms;
+static uint64_t lust_time_limit_ms;
+static uint32_t lust_time_calls;
+
+static uint64_t lust_time_now_ms(void) {
+    long ts[2];
+    lust_mono_now(ts);
+    if (ts[0] < 0) return 0;
+    return (uint64_t)ts[0] * 1000ull + (uint64_t)ts[1] / 1000000ull;
+}
+
+static void lust_time_stop(void) {
+    char text[32];
+    uint64_t n = lust_time_limit_ms;
+    if (n >= 60000ull && n % 60000ull == 0) sprintf(text, "%llum", (unsigned long long)(n / 60000ull));
+    else if (n >= 1000ull && n % 1000ull == 0) sprintf(text, "%llus", (unsigned long long)(n / 1000ull));
+    else sprintf(text, "%llums", (unsigned long long)n);
+    lust_print_flush();
+    fprintf(stderr, "error[L0533]: this program was built with --time-limit %s and tried to run longer\n", text);
+    fflush(stderr);
+    exit(101);
+}
+
+/* 1 when `*d` was shortened to the time still left. Already past the
+   deadline does not return. A sleep shorter than the time left is unchanged. */
+static int lust_time_cap(lust_Duration *d) {
+    uint64_t now, left, sec;
+    uint32_t nano;
+    if (!lust_time_deadline_ms) return 0;
+    now = lust_time_now_ms();
+    if (now >= lust_time_deadline_ms) lust_time_stop();
+    left = lust_time_deadline_ms - now;
+    sec = left / 1000ull;
+    nano = (uint32_t)(left % 1000ull) * 1000000u;
+    if (d->secs < sec || (d->secs == sec && d->nanos < nano)) return 0;
+    d->secs = sec;
+    d->nanos = nano;
+    return 1;
+}
+#endif
+
+void lust_time_limit_set(uint64_t ms) LUST_BODY({
+    uint64_t now, dl;
+    lust_time_limit_ms = ms;
+    now = lust_time_now_ms();
+    dl = now + ms;
+    if (dl < now) dl = ~0ull;
+    if (!dl) dl = 1;
+    lust_time_deadline_ms = dl;
+})
+
+void lust_time_check(void) LUST_BODY({
+    if (lust_time_deadline_ms && lust_time_now_ms() >= lust_time_deadline_ms) lust_time_stop();
+})
+
+void lust_time_tick(void) LUST_BODY({
+    if (!lust_time_deadline_ms) return;
+    if ((++lust_time_calls & 63u) != 0) return;
+    if (lust_time_now_ms() >= lust_time_deadline_ms) lust_time_stop();
+})
+
 /* `thread::sleep`: nanosleep through syscall (no <time.h> in the runtime
    text), resumed after a signal. On Darwin, libc nanosleep (runtime.h
-   included <time.h> there), the same loop. */
+   included <time.h> there), the same loop. A sleep that would run past
+   `--time-limit` waits only for the time left, then the limit stops the
+   program if that wait reached the deadline. */
 void lust_thread_sleep(lust_Duration d) LUST_BODY({
+    int capped = lust_time_cap(&d);
 #ifdef _WIN32
     while (d.secs > 0 || d.nanos > 0) {
         uint64_t ms = d.secs > 4000000 ? 4000000000ull : d.secs * 1000 + d.nanos / 1000000;
@@ -1884,4 +1959,5 @@ void lust_thread_sleep(lust_Duration d) LUST_BODY({
     (void)d;
     sched_yield();
 #endif
+    if (capped) lust_time_check();
 })

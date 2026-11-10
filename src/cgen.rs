@@ -3193,6 +3193,13 @@ impl FnGen<'_, '_> {
         if zc {
             self.flags_at_term = self.flags_maybe_set();
         }
+        // `--time-limit`: a function entry is a probe. The clock is read
+        // every 64th call (`lust_time_tick`), so a recursion stops and a
+        // program with no loop still cannot call forever. No probe when
+        // the build has no limit, so that C is unchanged.
+        if p.time_limit_ms != 0 {
+            self.out.push_str("  lust_time_tick();\n");
+        }
         self.blocks(&order);
         self.kstr_finish();
         self.out.push_str("}\n");
@@ -4355,24 +4362,47 @@ impl FnGen<'_, '_> {
         }
     }
 
+    /// A jump back to this block or an earlier one is a loop edge. With
+    /// `--time-limit` it probes the clock before the jump. A forward jump
+    /// is the text it always was, so a build with no limit emits the same C.
+    fn time_back(&self, target: u32) -> bool {
+        self.p.time_limit_ms != 0 && (target as usize) <= self.cur_bb
+    }
+
+    /// `goto bbN;`, or the same goto with a time probe in front of a back-edge.
+    fn goto_arm(&self, target: u32) -> String {
+        if self.time_back(target) {
+            format!("{{ lust_time_check(); goto bb{target}; }}")
+        } else {
+            format!("goto bb{target};")
+        }
+    }
+
+    fn timed_goto(&mut self, target: u32) {
+        if self.time_back(target) {
+            self.out.push_str("  lust_time_check();\n");
+        }
+        let _ = writeln!(self.out, "  goto bb{target};");
+    }
+
     fn term(&mut self, t: &Terminator, span: Span, next_block: Option<usize>) {
         let loc = self.loc(span);
         let mut post = Vec::new();
         match t {
             Terminator::Goto(b) => {
-                let _ = writeln!(self.out, "  goto bb{};", b.0);
+                self.timed_goto(b.0);
             }
             Terminator::If(o, a, b) => {
                 let (c, _) = self.operand(o, &loc, &mut post);
-                let _ = writeln!(self.out, "  if ({c}) goto bb{}; else goto bb{};", a.0, b.0);
+                let _ = writeln!(self.out, "  if ({c}) {} else {};", self.goto_arm(a.0), self.goto_arm(b.0));
             }
             Terminator::Switch(o, cases, other) => {
                 let (c, _) = self.operand(o, &loc, &mut post);
                 let _ = write!(self.out, "  switch ({c}) {{");
                 for (v, b) in cases {
-                    let _ = write!(self.out, " case {v}: goto bb{};", b.0);
+                    let _ = write!(self.out, " case {v}: {}", self.goto_arm(b.0));
                 }
-                let _ = writeln!(self.out, " default: goto bb{}; }}", other.0);
+                let _ = writeln!(self.out, " default: {} }}", self.goto_arm(other.0));
             }
             Terminator::Call { target, args, dest, next, unwind } => {
                 // Calls carry a cleanup (unwind) successor since
@@ -4466,7 +4496,7 @@ impl FnGen<'_, '_> {
                     self.out.push_str(&text);
                 }
                 if Some(next.0 as usize) != next_block {
-                    let _ = writeln!(self.out, "  goto bb{};", next.0);
+                    self.timed_goto(next.0);
                 }
             }
             Terminator::Return => {
@@ -10941,6 +10971,8 @@ pub struct UnwindInit {
     pub hook_runner: Option<u32>,
     /// `--max-memory` (0: none): main sets the runtime's limit first.
     pub max_memory: u64,
+    /// `--time-limit` in milliseconds (0: none): main sets the deadline first.
+    pub time_limit_ms: u64,
 }
 
 /// The `main_unit` argument for `p` (`slot_of` maps a fn to its slot).
@@ -10958,7 +10990,7 @@ pub fn unwind_init(p: &Program, slot_of: impl Fn(LocalDefId) -> u32) -> Option<U
         .map(|i| slot_of(LocalDefId(i as u32)));
     let (a, b) = crate::check::any::type_id_words(p, &p.tys, REF_STR);
     let (c, d) = crate::check::any::type_id_words(p, &p.tys, STRING);
-    Some(UnwindInit { unwind: p.unwind, tables: p.unwind_tables, ids: [a, b, c, d], hook_runner: runner, max_memory: p.max_memory })
+    Some(UnwindInit { unwind: p.unwind, tables: p.unwind_tables, ids: [a, b, c, d], hook_runner: runner, max_memory: p.max_memory, time_limit_ms: p.time_limit_ms })
 }
 
 /// The location unit: the per-slot line and file tables and
@@ -11004,10 +11036,19 @@ pub fn main_unit(main_slot: u32, overlays: &[usize], init: Option<UnwindInit>) -
     let tables = init.as_ref().is_some_and(|i| i.unwind && i.tables);
     let runner_slot = init.as_ref().and_then(|i| i.hook_runner);
     let (init, runner) = match init {
-        Some(UnwindInit { unwind, tables, ids: [a, b, c, d], hook_runner, max_memory }) => (
+        Some(UnwindInit { unwind, tables, ids: [a, b, c, d], hook_runner, max_memory, time_limit_ms }) => (
             format!(
                 "{}\n  lust_unw_init({}, {a}ull, {b}ull, {c}ull, {d}ull);",
-                if max_memory != 0 { format!("\n  lust_mem_limit_set({max_memory}ull);") } else { String::new() },
+                {
+                    let mut prefix = String::new();
+                    if max_memory != 0 {
+                        prefix.push_str(&format!("\n  lust_mem_limit_set({max_memory}ull);"));
+                    }
+                    if time_limit_ms != 0 {
+                        prefix.push_str(&format!("\n  lust_time_limit_set({time_limit_ms}ull);"));
+                    }
+                    prefix
+                },
                 if unwind && tables { 2 } else { unwind as u8 }
             ),
             hook_runner.map_or(String::new(), |s| {

@@ -44,7 +44,8 @@ the program's stdout is lust's.
 | 101 | `thread 'main' (<tid>) panicked at <file>:<line>:<col>:` then the message | A panic. The line is rustc's, byte for byte (rule zero), so a host parses one format for both builds. `<file>` is the path as the build command named it. |
 | 101 | `error[L0532]: this program was built with --sandbox and tried to use <family>` | The codegen stop (above). Nothing ran past it. |
 | 101 | `error[L0532]: this program was built with --max-memory <bytes> and tried to use more memory` | The memory limit (below). What the program printed before it is flushed first. |
-| any other | whatever the program wrote | `std::process::exit(n)`, or a signal (killed by the host on a time limit). |
+| 101 | `error[L0533]: this program was built with --time-limit <duration> and tried to run longer` | The time limit (below). What the program printed before it is flushed first. |
+| any other | whatever the program wrote | `std::process::exit(n)`, or a signal (killed by the host, which keeps its own wall clock as the backstop). |
 
 Check and build errors come before any run, as JSON with `--json`, each
 with its `edits`.
@@ -76,9 +77,41 @@ Limits of the limit:
 - The stack is not part of this limit. A stack overflow is its own stop
   (`fatal runtime error: stack overflow`, then an abort).
 
+## The time limit
+
+`lust build --sandbox --time-limit <duration>` (and `lust run`) builds a
+deadline into the program. `<duration>` is a number of seconds (`2`, `2s`),
+milliseconds (`500ms`), or minutes (`1m`). The program stops, as the table
+above shows, when it has run longer than that. The flag needs `--sandbox`,
+and a limit is its own daemon session, like `--sandbox` and `--max-memory`.
+`check` does not take it: a check does not run the program.
+
+The clock is monotonic. `main` records the deadline before the program
+runs. Three probes read it:
+
+- A jump back to the same block or an earlier one (a loop) checks every
+  iteration.
+- A function entry checks every 64th call, so a recursion that never
+  loops still stops.
+- `thread::sleep` waits only for the time still left. A sleep that would
+  run past the deadline does not.
+
+The stop comes at the next probe after the deadline, so one long loop
+body or one of those 64 calls can run past it. What the limit does not
+see:
+
+- A straight-line body that does not loop, call, or sleep. The host's
+  wall clock is the backstop for that shape.
+- The stack. A recursion that fills the stack first is the stack-overflow
+  stop, not L0533.
+
+The host should keep its own wall clock anyway. This limit is the stop
+the program can report; the host kill is what happens when the probes
+do not run.
+
 ## What it does not do
 
-- It does not limit time. The host kills a program that runs too long.
+- It does not limit time unless the build asks (`--time-limit`, above).
   Memory has a limit when the build asks for one (`--max-memory`, above).
 - It does not change what an allowed program prints. A sandboxed program
   that only uses allowed services behaves as the rustc build of the same

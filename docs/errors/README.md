@@ -65,6 +65,7 @@ ranges; `scripts/check-codes.sh` enforces it. Read it before you add a code.
 | [L0530](L0530.md) | unsupported edition |
 | [L0531](L0531.md) | unsupported deny-level lint |
 | [L0532](L0532.md) | refused in a sandboxed build |
+| [L0533](L0533.md) | ran past `--time-limit` |
 | [L0522](L0522.md) | this attribute is not supported yet |
 | [L0523](L0523.md) | unstable cfg predicate |
 | [L0524](L0524.md) | attribute used wrongly |

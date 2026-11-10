@@ -1891,7 +1891,8 @@ pub fn summary() -> String {
     }
     out.push_str(
         "With --sandbox: the program reads stdin and writes stdout and stderr only; std::fs, std::net, std::env, \
-         std::os, std::process other than exit, thread spawning and include_str! are refused (L0532).\n",
+         std::os, std::process other than exit, thread spawning and include_str! are refused (L0532). \
+         `--time-limit` (with `--sandbox`, on build and run) stops the program when it runs longer (L0533).\n",
     );
     out
 }

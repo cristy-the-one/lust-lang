@@ -2,9 +2,12 @@
 # Checks every `lust explain` page in docs/errors/:
 #   1. Every L#### code in src/ has a page, and every page is listed in the index.
 #   2. The wrong example fails under `lust build` with exactly that code present.
+#      A page marked `<!-- runtime-stop -->` is valid Rust: the wrong example
+#      builds, and running it exits with the code on stderr.
 #   3. The wrong example fails under rustc too, unless the page carries the marker
 #      `<!-- rustc-wrong: pass -->` (valid Rust that lust rejects on purpose).
-#   4. The fixed example builds under both lust and rustc.
+#   4. The fixed example builds under both lust and rustc. A runtime-stop page
+#      also runs the fixed example.
 # Usage: scripts/check-explain.sh [filter]
 set -uo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -71,6 +74,35 @@ for page in "$root"/docs/errors/L*.md; do
   lust_args=$(sed -n 's|.*<!-- lust-args: \(.*\) -->.*|\1|p' "$page" | head -1 | sed "s|{work}|$work|g")
   if [ ! -s "$work/$code-wrong.rs" ] || [ ! -s "$work/$code-fixed.rs" ]; then
     report bad "$code" "missing a Wrong or Fixed example"; continue
+  fi
+  # A runtime stop (L0533) is valid Rust. The wrong example builds, then
+  # the program exits with the code on stderr. The fixed example runs.
+  if grep -q 'runtime-stop' "$page"; then
+    # shellcheck disable=SC2086 # lust_args is a word list by design
+    if ! "$lust" build "$work/$code-wrong.rs" -o "$work/$code.bin" $lust_args >"$work/$code-rt.lerr" 2>&1; then
+      report bad "$code" "lust rejected the runtime example: $(head -3 "$work/$code-rt.lerr")"; continue
+    fi
+    timeout 5 "$work/$code.bin" >"$work/$code-rt.out" 2>"$work/$code-rt.err"
+    rc=$?
+    if [ $rc -eq 0 ] || [ $rc -eq 124 ] || ! grep -q "$code" "$work/$code-rt.err"; then
+      report bad "$code" "runtime stop: exit $rc, stderr $(head -3 "$work/$code-rt.err")"; continue
+    fi
+    if ! rustc "${rustc_flags[@]}" "$work/$code-wrong.rs" -o "$work/$code.rbin" >"$work/$code-rt.rerr" 2>&1; then
+      report bad "$code" "rustc rejects the runtime example: $(head -3 "$work/$code-rt.rerr")"; continue
+    fi
+    # shellcheck disable=SC2086
+    if ! "$lust" build "$work/$code-fixed.rs" -o "$work/$code-fixed.bin" $lust_args >"$work/$code-fixed.lerr" 2>&1; then
+      report bad "$code" "lust rejects the fixed example: $(head -3 "$work/$code-fixed.lerr")"; continue
+    fi
+    timeout 5 "$work/$code-fixed.bin" >"$work/$code-fixed.out" 2>"$work/$code-fixed.run"
+    if [ $? -ne 0 ]; then
+      report bad "$code" "the fixed example did not run: $(head -3 "$work/$code-fixed.run")"; continue
+    fi
+    if ! rustc "${rustc_flags[@]}" "$work/$code-fixed.rs" -o "$work/$code.rbin" >"$work/$code-fixed.rerr" 2>&1; then
+      report bad "$code" "rustc rejects the fixed example: $(head -3 "$work/$code-fixed.rerr")"; continue
+    fi
+    report ok "$code"
+    continue
   fi
   # 2. Wrong under lust.
   # shellcheck disable=SC2086 # lust_args is a word list by design

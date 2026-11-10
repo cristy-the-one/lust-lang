@@ -241,6 +241,17 @@ impl LineIndex {
         LineIndex::with_wide(starts, wide)
     }
 
+    /// The byte offset of 1-based `line` and byte column `col` (what
+    /// `line_col` gives back). None for a line the text does not have or a
+    /// column past the start of the next line.
+    pub fn offset_of(&self, line: u32, col: u32) -> Option<u32> {
+        let start = *self.starts.get((line as usize).checked_sub(1)?)?;
+        let off = start.checked_add(col.checked_sub(1)?)?;
+        match self.starts.get(line as usize) {
+            Some(&next) if off >= next => None,
+            _ => Some(off),
+        }
+    }
     pub fn line_col(&self, offset: u32) -> (u32, u32) {
         let line = self.starts.partition_point(|&s| s <= offset) - 1;
         (line as u32 + 1, offset - self.starts[line] + 1)
@@ -680,7 +691,7 @@ impl SourceMap {
 }
 
 /// A span as a JSON object: byte range plus 1-based line and column of both ends.
-fn span_json(map: &SourceMap, span: Span) -> String {
+pub(crate) fn span_json(map: &SourceMap, span: Span) -> String {
     let (line, col) = map.line_col(span);
     let (end_line, end_col) = map.line_col_at(span.file, span.hi);
     format!(

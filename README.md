@@ -147,7 +147,7 @@ The daemon exits after 30 idle minutes (`LUST_DAEMON_IDLE`, for example `10m`; `
 
 ## Build and use
 
-Linux x86_64, Windows x86_64 (MSVC, Windows 10 or 11, PowerShell 7), and macOS arm64 (Apple Silicon, macOS 14 or newer). The daemon listens on a Unix socket on Linux and macOS, and on `127.0.0.1` on Windows (the socket path is a one-line address file). macOS x86_64 is not in CI: GitHub no longer provides an Intel macOS runner, and this repo's workflow has no macOS architecture matrix.
+Linux x86_64, Windows x86_64 (MSVC, Windows 10 or 11, PowerShell 7), and macOS arm64 (Apple Silicon, macOS 14 or newer). The daemon listens on a Unix socket on Linux and macOS, and on `127.0.0.1` on Windows (the socket path is a one-line address file). macOS x86_64 is not supported yet: CI runs the gate on `macos-15-intel` for pushes to `next`, as a job that cannot fail the run, to find what breaks there.
 
 ### From the release
 
@@ -168,7 +168,7 @@ You need a Rust toolchain and a C build environment. The first step clones `tiny
 ```sh
 scripts/build-tcc.sh      # builds the pinned tinycc into third_party/tcc
 cargo build --release     # builds `lust` (client) and `lust-core` (compiler)
-scripts/release.sh        # optional: builds dist/lust-<version>-x86_64-linux.tar.gz
+scripts/release.sh        # optional: builds dist/lust-<version>-x86_64-linux.tar.gz (aarch64-macos on Apple silicon)
 ```
 
 `scripts/build.sh` builds a profile that compiles faster, for test runs.
@@ -284,7 +284,7 @@ bash scripts/ci.sh
 - A one-shot `lust run` forks only when this process has a single Mach thread (`task_threads`). Otherwise it runs a temporary executable.
 - Float methods (`sin`, `cos`, and the rest) call the system libm, which is what rustc 1.99 uses on macOS. Results are compared to rustc on the same machine.
 - The front-image save (`LUST_FRONT_STATE`) stays Linux-only. Warm incremental checks in the daemon do not use it.
-- CI runs the same `scripts/ci.sh` gate on `macos-latest` (arm64). ASan is not run there. macOS x86_64 is not a hosted job.
+- CI runs the same `scripts/ci.sh` gate on `macos-latest` (arm64). ASan is not run there. macOS x86_64 runs as a job that cannot fail the run.
 
 ### Use
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Builds the release package for linux x86_64: dist/lust-<version>-x86_64-linux.tar.gz.
+# Builds the release package of this host: dist/lust-<version>-x86_64-linux.tar.gz on Linux
+# x86_64, dist/lust-<version>-aarch64-macos.tar.gz on Apple silicon.
 # The Windows package is scripts/release.ps1 (dist/lust-<version>-x86_64-windows.zip).
 #
 #   scripts/release.sh            # cargo build --release, then pack and print the sha256
@@ -11,6 +12,8 @@
 #   lib/lust/tcc/lib/tcc/         libtcc1.a and tcc's headers (libtcc itself is linked in)
 #   lib/lust/library/             std and adapter sources read at run time (library/deps)
 #   LICENSE, tcc-COPYING          lust's MIT license; tcc's LGPL 2.1 (from the tinycc checkout)
+#   mimalloc-LICENSE              mimalloc's MIT license (lust-core links it), when the cargo
+#                                 registry holds the libmimalloc-sys source
 # The runtime C and the std sources lust splices are built into lust-core.
 # tcc comes from $LUST_TCC_HOME, else third_party/tcc (scripts/build-tcc.sh), as in build.rs.
 set -euo pipefail
@@ -19,7 +22,11 @@ cd "$root"
 build=1
 [ "${1:-}" = "--no-build" ] && build=0
 version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
-[ "$(uname -sm)" = "Linux x86_64" ] || { echo "release.sh: only linux x86_64 is packaged" >&2; exit 2; }
+case "$(uname -sm)" in
+  "Linux x86_64") platform=x86_64-linux ;;
+  "Darwin arm64") platform=aarch64-macos ;;
+  *) echo "release.sh: only linux x86_64 and macOS arm64 are packaged (Windows: scripts/release.ps1)" >&2; exit 2 ;;
+esac
 tcc=${LUST_TCC_HOME:-$root/third_party/tcc}
 [ -x "$tcc/bin/tcc" ] && [ -f "$tcc/lib/tcc/libtcc1.a" ] || { echo "release.sh: no tcc in $tcc (run scripts/build-tcc.sh)" >&2; exit 2; }
 tcc_license=$tcc/../tinycc/COPYING
@@ -28,7 +35,7 @@ if [ $build = 1 ]; then
   LUST_TCC_HOME=$tcc cargo build --release --locked --bin lust --bin lust-core
 fi
 
-name=lust-$version-x86_64-linux
+name=lust-$version-$platform
 out=$root/dist
 stage=$out/$name
 rm -rf "$stage" "$out/$name.tar.gz"
@@ -39,10 +46,27 @@ cp -r "$tcc/lib/tcc" "$stage/lib/lust/tcc/lib/"
 cp -r library "$stage/lib/lust/library"
 cp README.md LICENSE "$stage/"
 cp "$tcc_license" "$stage/tcc-COPYING"
+mimalloc_version=$(grep -A1 '^name = "libmimalloc-sys"' Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p')
+mimalloc_license=$(ls "${CARGO_HOME:-$HOME/.cargo}"/registry/src/*/"libmimalloc-sys-$mimalloc_version/LICENSE.txt" 2>/dev/null | head -n 1 || true)
+if [ -n "$mimalloc_license" ]; then cp "$mimalloc_license" "$stage/mimalloc-LICENSE"; fi
 
 # Reproducible tar: sorted names, fixed owner and mtime (the commit time).
 mtime=$(git log -1 --format=%ct 2>/dev/null || echo 0)
-tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$mtime" -C "$out" -cf - "$name" | gzip -n -9 > "$out/$name.tar.gz"
+# GNU tar has the flags for that. macOS's own tar does not: Homebrew's gtar when it is
+# there, else a plain archive (same files, not byte-reproducible).
+gnu_tar=tar
+if ! tar --version 2>/dev/null | grep -q GNU; then gnu_tar=$(command -v gtar || true); fi
+if [ -n "$gnu_tar" ]; then
+  "$gnu_tar" --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$mtime" -C "$out" -cf - "$name" | gzip -n -9 > "$out/$name.tar.gz"
+else
+  tar -C "$out" -cf - "$name" | gzip -n -9 > "$out/$name.tar.gz"
+fi
 rm -rf "$stage"
-(cd "$out" && sha256sum "$name.tar.gz" | tee "$name.tar.gz.sha256")
-echo "glibc needed: $(objdump -T "$root/target/release/lust-core" "$tcc/bin/tcc" 2>/dev/null | grep -v ' w ' | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
+if command -v sha256sum >/dev/null 2>&1; then
+  (cd "$out" && sha256sum "$name.tar.gz" | tee "$name.tar.gz.sha256")
+else
+  (cd "$out" && shasum -a 256 "$name.tar.gz" | tee "$name.tar.gz.sha256")
+fi
+if [ "$platform" = x86_64-linux ]; then
+  echo "glibc needed: $(objdump -T "$root/target/release/lust-core" "$tcc/bin/tcc" 2>/dev/null | grep -v ' w ' | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
+fi

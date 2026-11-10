@@ -36,6 +36,9 @@ typedef int lust_pthread_once_t;
 #else
 void free(void *);
 void abort(void);
+void *malloc(size_t);
+void *realloc(void *, size_t);
+char *getenv(const char *);
 void *memset(void *, int, size_t);
 void *memcpy(void *, const void *, size_t);
 #define LUST_BODY(...) ;

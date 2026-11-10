@@ -1,7 +1,6 @@
 name: CI
 
-# There is no git remote yet, so this workflow has never run. It is kept
-# valid (actionlint) and runs the same scripts/ci.sh gate as a dev box.
+# Runs the same scripts/ci.sh gate as a dev box, on Linux, Windows and macOS.
 # A feature-branch commit is tested by pull_request only. push on every
 # branch was starting a second full run of the same SHA.
 # Both events include next and main. The macOS job below has no `if:`,
@@ -60,6 +59,7 @@ jobs:
         env:
           LUST_TCC_HOME: ${{ github.workspace }}/third_party/tcc
           LUST_GATE_FILTER: ${{ github.event.inputs.gate_filter }}
+          LUST_OPT_CORPUS: "1"
         run: bash scripts/ci.sh
       - name: Publish gate failures
         if: failure()
@@ -99,6 +99,16 @@ jobs:
         with:
           path: ~/.cargo/registry
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+      # zig cc is the optimised-build compiler Lime Slice will ship. It has to
+      # be ahead of other `zig` names; spec_for prefers `zig` on PATH.
+      - name: Install zig
+        shell: pwsh
+        run: |
+          $ver = "0.14.1"
+          $name = "zig-x86_64-windows-$ver"
+          Invoke-WebRequest -Uri "https://ziglang.org/download/$ver/$name.zip" -OutFile "$env:TEMP\zig.zip"
+          Expand-Archive "$env:TEMP\zig.zip" -DestinationPath "$env:TEMP\zig-root"
+          echo "$env:TEMP\zig-root\$name" >> $env:GITHUB_PATH
       # Same gate as Linux (scripts/ci.sh). ASan is skipped in the script
       # off Linux. Git Bash runs the scripts; the MSVC environment is loaded
       # first so cargo can link with link.exe and build mimalloc.
@@ -107,6 +117,7 @@ jobs:
         env:
           LUST_TCC_HOME: ${{ github.workspace }}/third_party/tcc
           LUST_GATE_FILTER: ${{ github.event.inputs.gate_filter }}
+          LUST_OPT_CORPUS: "1"
         run: |
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
           Import-Module "$vs\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
@@ -181,10 +192,19 @@ jobs:
         with:
           path: ~/.cargo/registry
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+      - name: Install zig
+        run: |
+          ver=0.14.1
+          name="zig-aarch64-macos-$ver"
+          curl -fsSL "https://ziglang.org/download/$ver/$name.tar.xz" -o /tmp/zig.tar.xz
+          mkdir -p "$HOME/zig"
+          tar -xJf /tmp/zig.tar.xz -C "$HOME/zig"
+          echo "$HOME/zig/$name" >> "$GITHUB_PATH"
       - name: Run CI gate
         env:
           LUST_TCC_HOME: ${{ github.workspace }}/third_party/tcc
           LUST_GATE_FILTER: ${{ github.event.inputs.gate_filter }}
+          LUST_OPT_CORPUS: "1"
         run: bash scripts/ci.sh
       - name: Publish gate failures
         if: failure()

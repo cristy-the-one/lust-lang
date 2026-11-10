@@ -4709,17 +4709,38 @@ impl<'p> Lower<'p> {
     /// `f(r, r.len())` uses `r` after the move: rustc E0382). Struct
     /// literals do the same for their fields.
     pub(super) fn ordered_operands(&mut self, es: &[ExprId]) -> Vec<Operand> {
-        (0..es.len()).map(|i| self.ordered_operand(es, i)).collect()
+        // `later[i]`: an expression after `i` has an effect. One pass from
+        // the end: asking each operand about its whole tail is quadratic,
+        // and a static table of 16k literals spent 127 ms there. The answer
+        // reads only the AST and the checked types, so lowering the earlier
+        // operands does not change it.
+        let mut later = vec![false; es.len()];
+        let mut any = false;
+        for i in (0..es.len()).rev() {
+            later[i] = any;
+            any = any || self.has_effect(es[i]);
+        }
+        (0..es.len()).map(|i| self.ordered_operand_with(es[i], later[i])).collect()
+    }
+
+    /// True when evaluating `e` as a list operand can write or move a place
+    /// an earlier operand names. A `&mut` path argument is a reborrow (or a
+    /// move) of its place at that argument (`f(c.p, c)` with `c: &mut S`):
+    /// an earlier operand's value is read before it, as in rustc.
+    fn has_effect(&self, e: ExprId) -> bool {
+        !self.inert_expr(e) || self.mut_ref_path(e)
     }
 
     /// Operand `i` of `es` under the `ordered_operands` rule.
     fn ordered_operand(&mut self, es: &[ExprId], i: usize) -> Operand {
-        let e = es[i];
+        let later_effects = es[i + 1..].iter().any(|&x| self.has_effect(x));
+        self.ordered_operand_with(es[i], later_effects)
+    }
+
+    /// The operand of `e`, held in a temporary when a later operand of its
+    /// list has an effect (`later_effects`).
+    fn ordered_operand_with(&mut self, e: ExprId, later_effects: bool) -> Operand {
         let o = self.operand(e);
-        // A later `&mut` path argument is a reborrow (or a move) of its
-        // place at that argument (`f(c.p, c)` with `c: &mut S`): this one's
-        // value is read before it, as in rustc.
-        let later_effects = es[i + 1..].iter().any(|&x| !self.inert_expr(x) || self.mut_ref_path(x));
         match o {
             Operand::Copy(ref pl) | Operand::Move(ref pl)
                 if later_effects && !(pl.proj.is_empty() && self.body.locals[pl.local as usize].name.is_none()) =>

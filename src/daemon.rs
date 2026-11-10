@@ -502,6 +502,9 @@ fn shutdown(sock: &Path, base: &Path, sessions: &HashMap<SessionKey, Entry>, why
     for dir in &base_dirs {
         driver::sweep_bases(dir, std::process::id());
     }
+    // Background `--opt` compiles are children of this process. Kill them
+    // before exit; on Linux the parent-death signal covers a crash too.
+    driver::kill_background();
     let _ = std::fs::remove_dir_all(base);
     let _ = std::fs::remove_file(sock);
     eprintln!("lust daemon: {why}, exiting");
@@ -1428,7 +1431,7 @@ pub fn serve(sock: &Path) -> ! {
             emit_c: None,
             max_errors: 20,
             run_args: None,
-            harness: false, cc: false, overlay: Default::default(),
+            harness: false, cc: false, opt_bg: false, overlay: Default::default(),
             client: protocol::Client::default(),
             query: None,
             file: file.clone(),
@@ -1598,7 +1601,7 @@ mod tests {
             emit_c: None,
             max_errors: 20,
             run_args: None,
-            harness: false, cc: false, overlay: Default::default(),
+            harness: false, cc: false, opt_bg: false, overlay: Default::default(),
             client: protocol::Client::default(),
             query: None,
             file: file.to_path_buf(),

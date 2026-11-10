@@ -203,6 +203,25 @@ impl Ast {
     pub fn pat(&self, id: PatId) -> &Pat {
         &self.pats[id.0 as usize]
     }
+    /// The pattern of the one field in the element list of a one-field
+    /// tuple pattern (`Some(..)`, `Ok(..)`, `Err(..)`): the element itself,
+    /// or the element beside one `..` (`Some(x, ..)`, `Some(.., x)`). A lone
+    /// `..` is its own answer: it stands for the field. None for any other
+    /// list, which does not fit one field.
+    pub fn one_field_pat(&self, elems: &[PatId]) -> Option<PatId> {
+        let rest = |e: PatId| matches!(self.pat(e), Pat::Rest);
+        match *elems {
+            [x] => Some(x),
+            [x, r] if rest(r) && !rest(x) => Some(x),
+            [r, x] if rest(r) && !rest(x) => Some(x),
+            _ => None,
+        }
+    }
+    /// `one_field_pat` for a pattern the checker accepted (it refuses any
+    /// other list): never None there.
+    pub fn payload_pat(&self, elems: &[PatId]) -> PatId {
+        self.one_field_pat(elems).unwrap_or(elems[0])
+    }
     pub fn pat_span(&self, id: PatId) -> Span {
         self.pat_spans[id.0 as usize]
     }

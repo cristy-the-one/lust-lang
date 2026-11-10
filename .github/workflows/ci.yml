@@ -150,9 +150,8 @@ jobs:
             dist/*.zip
             dist/*.sha256
 
-  # GitHub-hosted macOS is arm64 (macos-latest). The old macos-13
-  # Intel image is retired, and this workflow has no macOS architecture
-  # matrix, so x86_64 macOS is not a hosted job. See the README.
+  # GitHub-hosted macOS is arm64 (macos-latest). x86_64 macOS has its own
+  # job at the end of this file, which is not part of the gate yet.
   # A queued arm64 job that never gets a runner is cancelled after about
   # 15 minutes ("not acquired by Runner of type hosted"). That is runner
   # capacity, not a build failure; re-run the job.
@@ -218,5 +217,67 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ci-failures-macos
+          path: ci-failures.txt
+          if-no-files-found: ignore
+
+  # Intel macOS: a first look, not part of the gate. Nothing in lust refuses
+  # x86_64 macOS, and nobody has run it there. `macos-15-intel` is the last
+  # hosted Intel image. The job cannot fail a run (`continue-on-error`), and
+  # it skips pull requests: it runs on pushes to next and main and by hand,
+  # and its failure list is the artifact `ci-failures-macos-x86_64`.
+  macos-x86_64:
+    if: github.event_name != 'pull_request'
+    continue-on-error: true
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bash 5 and GNU userland
+        run: brew install bash coreutils findutils gnu-sed
+      - name: Cache pinned tcc
+        id: tcc
+        uses: actions/cache@v4
+        with:
+          path: |
+            third_party/tcc
+            third_party/tinycc
+          key: tcc-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-tcc.sh', 'third_party/patches/tinycc-macos-tbd-reexports.patch') }}
+      - name: Build pinned tcc
+        if: steps.tcc.outputs.cache-hit != 'true'
+        run: scripts/build-tcc.sh
+      - name: Install rustc 1.99
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.99.0
+            # shellcheck disable=SC1091
+            source "$HOME/.cargo/env"
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+          rustup set profile minimal
+          rustup toolchain install 1.99.0
+          rustup default 1.99.0
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+      - name: Install zig
+        run: |
+          ver=0.14.1
+          name="zig-x86_64-macos-$ver"
+          curl -fsSL "https://ziglang.org/download/$ver/$name.tar.xz" -o /tmp/zig.tar.xz
+          mkdir -p "$HOME/zig"
+          tar -xJf /tmp/zig.tar.xz -C "$HOME/zig"
+          echo "$HOME/zig/$name" >> "$GITHUB_PATH"
+      - name: Run CI gate
+        env:
+          LUST_TCC_HOME: ${{ github.workspace }}/third_party/tcc
+          LUST_GATE_FILTER: ${{ github.event.inputs.gate_filter }}
+          LUST_OPT_CORPUS: "1"
+        run: bash scripts/ci.sh
+      - name: Upload gate failure list
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-failures-macos-x86_64
           path: ci-failures.txt
           if-no-files-found: ignore

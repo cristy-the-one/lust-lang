@@ -6414,10 +6414,10 @@ impl<'p> Lower<'p> {
                 self.guard_binding(local, mode, self.ck.pat_ty(pat), place, span, bound);
             }
             (Pat::TupleStruct { elems, .. }, PatRes::Opt(true)) => {
-                self.bind_pat_guard(elems[0], place.project(Proj::Downcast(1)).project(Proj::Field(0)), bound);
+                self.bind_pat_guard(p.ast.payload_pat(elems), place.project(Proj::Downcast(1)).project(Proj::Field(0)), bound);
             }
             (Pat::TupleStruct { elems, .. }, PatRes::Res(is_ok)) => {
-                self.bind_pat_guard(elems[0], place.project(Proj::Downcast((!is_ok) as u32)).project(Proj::Field(0)), bound);
+                self.bind_pat_guard(p.ast.payload_pat(elems), place.project(Proj::Downcast((!is_ok) as u32)).project(Proj::Field(0)), bound);
             }
             (Pat::TupleStruct { .. } | Pat::Struct { .. }, PatRes::Variant(a, v)) => {
                 let base = if p.adt(a).is_enum { place.project(Proj::Downcast(v)) } else { place };
@@ -6757,7 +6757,7 @@ impl<'p> Lower<'p> {
             b.term = Terminator::Switch(Operand::Copy(Place::local(d)), vec![(some as u32, ok)], fail);
             self.cur = ok;
             if let (true, Pat::TupleStruct { elems, .. }) = (some, p.ast.pat(pat)) {
-                self.test_pat(elems[0], place.project(Proj::Downcast(1)).project(Proj::Field(0)), fail);
+                self.test_pat(p.ast.payload_pat(elems), place.project(Proj::Downcast(1)).project(Proj::Field(0)), fail);
             }
             return;
         }
@@ -6784,7 +6784,7 @@ impl<'p> Lower<'p> {
             b.term = Terminator::Switch(Operand::Copy(Place::local(d)), vec![((!is_ok) as u32, ok)], fail);
             self.cur = ok;
             if let Pat::TupleStruct { elems, .. } = p.ast.pat(pat) {
-                self.test_pat(elems[0], place.project(Proj::Downcast((!is_ok) as u32)).project(Proj::Field(0)), fail);
+                self.test_pat(p.ast.payload_pat(elems), place.project(Proj::Downcast((!is_ok) as u32)).project(Proj::Field(0)), fail);
             }
             return;
         }
@@ -7105,10 +7105,10 @@ impl<'p> Lower<'p> {
                 self.bind_one(local, mode, place, value_ty, span);
             }
             (Pat::TupleStruct { elems, .. }, PatRes::Opt(true)) => {
-                self.bind_pat(elems[0], place.project(Proj::Downcast(1)).project(Proj::Field(0)));
+                self.bind_pat(p.ast.payload_pat(elems), place.project(Proj::Downcast(1)).project(Proj::Field(0)));
             }
             (Pat::TupleStruct { elems, .. }, PatRes::Res(is_ok)) => {
-                self.bind_pat(elems[0], place.project(Proj::Downcast((!is_ok) as u32)).project(Proj::Field(0)));
+                self.bind_pat(p.ast.payload_pat(elems), place.project(Proj::Downcast((!is_ok) as u32)).project(Proj::Field(0)));
             }
             // The payload binding takes the Entry by value, read as the
             // variant's entry type (`_` leaves it in place).

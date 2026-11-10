@@ -1,10 +1,15 @@
 name: Release packages
 
-# Builds the Linux tarball and the Windows zip and uploads them as workflow
-# artifacts. It does not publish a GitHub Release. Run it by hand from the
-# Actions tab (workflow_dispatch).
+# Builds the Linux tarball, the macOS arm64 tarball and the Windows zip.
+# Run by hand from the Actions tab (workflow_dispatch), it uploads them as
+# workflow artifacts and publishes nothing. A pushed tag `v<version>` also
+# publishes them as the assets of a GitHub Release of that name (the
+# `publish` job), so a project that bundles lust can download a package by
+# version and check its sha256, and need not build lust from source.
 on:
   workflow_dispatch:
+  push:
+    tags: ['v*']
 
 permissions:
   contents: read
@@ -51,3 +56,60 @@ jobs:
           path: |
             dist/*.zip
             dist/*.sha256
+
+  macos-arm64:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bash 5 and GNU userland
+        run: brew install bash coreutils findutils gnu-sed gnu-tar
+      - name: Install rustc 1.99
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.99.0
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup set profile minimal
+          rustup toolchain install 1.99.0
+          rustup default 1.99.0
+      - name: Build pinned tcc
+        run: |
+          export PATH="$(brew --prefix)/opt/coreutils/libexec/gnubin:$(brew --prefix)/opt/findutils/libexec/gnubin:$(brew --prefix)/opt/gnu-sed/libexec/gnubin:$(brew --prefix)/bin:$PATH"
+          "$(brew --prefix)/bin/bash" scripts/build-tcc.sh
+      - name: Pack the macOS tarball
+        env:
+          LUST_TCC_HOME: ${{ github.workspace }}/third_party/tcc
+        run: |
+          export PATH="$(brew --prefix)/opt/coreutils/libexec/gnubin:$(brew --prefix)/bin:$PATH"
+          "$(brew --prefix)/bin/bash" scripts/release.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lust-aarch64-macos
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+
+  # A tag `v<version>` publishes the three packages. The tag must name the
+  # version in Cargo.toml: the packages carry that version in their names.
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux-x86_64, windows-x86_64, macos-arm64]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Check the tag against Cargo.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          [ "v$version" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME does not name Cargo.toml's version $version" >&2; exit 1; }
+          ls -l dist
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "lust ${GITHUB_REF_NAME#v}" --generate-notes

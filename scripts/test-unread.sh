@@ -52,8 +52,9 @@ is "cold build: exit 0" $rc 0
 is "cold build: the marked lines, no others" "$(echo "$out" | listed)" "$want"
 out=$( (cd "$d" && "$lust" check shapes.rs --json) 2>/dev/null )
 is "no flag: no record" "$(echo "$out" | listed)" ""
+# The names sort by bytes here: a locale's order differs between systems.
 out=$( (cd "$d" && "$lust" check shapes.rs --json --mark-unread Session::other --mark-unread helper) 2>/dev/null )
-is "two names: each fn's unread calls" "$(echo "$out" | grep -o '"fn":"[A-Za-z:]*"' | sort | uniq -c | tr -s ' ' | tr '\n' ';')" ' 1 "fn":"Session::other"; 1 "fn":"helper";'
+is "two names: each fn's unread calls" "$(echo "$out" | grep -o '"fn":"[A-Za-z:]*"' | LC_ALL=C sort | uniq -c | tr -s ' ' | tr '\n' ';')" ' 1 "fn":"Session::other"; 1 "fn":"helper";'
 out=$( (cd "$d" && "$lust" check shapes.rs --json --mark-unread Nobody::apply) 2>/dev/null ); rc=$?
 is "a name nothing has: exit 0, no record" "$rc $(echo "$out" | listed)" "0 "
 (cd "$d" && "$lust" check shapes.rs --mark-unread Session::apply) >/dev/null 2>&1; is "usage: needs --json" $? 2

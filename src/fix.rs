@@ -51,7 +51,7 @@ pub fn run(args: &[String]) -> i32 {
         let done = |resp: &protocol::Response| {
             eprint!("{}", resp.stderr);
             if applied > 0 {
-                eprintln!("lust fix: applied {applied} edit(s)");
+                eprintln!("lust fix: fixed {applied} diagnostic(s)");
             }
             resp.code
         };
@@ -61,7 +61,7 @@ pub fn run(args: &[String]) -> i32 {
         match apply(&picked, dry) {
             Ok(0) => return done(&resp),
             Ok(n) if dry => {
-                eprintln!("lust fix: {n} edit(s) to apply (dry run, nothing written)");
+                eprintln!("lust fix: {n} diagnostic(s) to fix (dry run, nothing written)");
                 return 1;
             }
             Ok(n) => applied += n,
@@ -74,37 +74,57 @@ pub fn run(args: &[String]) -> i32 {
     unreachable!()
 }
 
-/// Applies `edits` file by file, from the end of each file to its start so
-/// earlier offsets stay true. An edit that overlaps one already applied
-/// waits for the next round. Returns how many it applied (or would, in a
-/// dry run).
+/// Applies `edits`, one diagnostic's edits together or not at all: a
+/// diagnostic whose edits touch text that an earlier one's already change
+/// waits for the next round (the same edit offered twice counts once).
+/// Each file is rewritten from its end to its start, so earlier offsets
+/// stay true. Returns how many diagnostics it fixed (or would, in a dry
+/// run).
 fn apply(edits: &[FileEdit], dry: bool) -> Result<usize, String> {
+    // Ranges conflict when they share text; so do two insertions at one
+    // offset, whose order nothing says.
+    let clash = |a: &FileEdit, b: &FileEdit| {
+        let (a, b) = (&a.edit, &b.edit);
+        if (a.start, a.end, &a.replacement) == (b.start, b.end, &b.replacement) {
+            return false;
+        }
+        (a.start < b.end && b.start < a.end) || (a.start == a.end && b.start == b.end && a.start == b.start)
+    };
+    let mut groups: Vec<&[FileEdit]> = edits.chunk_by(|a, b| a.group == b.group).collect();
+    let mut taken: Vec<&FileEdit> = Vec::new();
+    let mut fixed = 0;
+    groups.retain(|g| {
+        let free = g.iter().all(|e| e.edit.start <= e.edit.end && !taken.iter().any(|t| t.path == e.path && clash(t, e)));
+        if free {
+            taken.extend(g.iter());
+        }
+        free
+    });
+    for g in &groups {
+        let e = &g[0];
+        eprintln!("{} {}:{}:{}: {}", if dry { "would fix" } else { "fixed" }, e.path, e.line, e.col, e.code);
+        fixed += 1;
+    }
+    if dry {
+        return Ok(fixed);
+    }
     let mut by_file: std::collections::BTreeMap<&str, Vec<&FileEdit>> = Default::default();
-    for e in edits {
+    for e in taken {
         by_file.entry(&e.path).or_default().push(e);
     }
-    let mut n = 0;
     for (path, mut list) in by_file {
         let mut text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
-        list.sort_by(|a, b| (b.edit.start, b.edit.end, &b.edit.replacement).cmp(&(a.edit.start, a.edit.end, &a.edit.replacement)));
-        list.dedup_by(|a, b| (a.edit.start, a.edit.end, &a.edit.replacement) == (b.edit.start, b.edit.end, &b.edit.replacement));
-        // Everything from `floor` on is already rewritten.
-        let mut floor = text.len() + 1;
-        let before = n;
+        let key = |e: &FileEdit| (e.edit.start, e.edit.end, e.edit.replacement.clone());
+        list.sort_by_key(|e| std::cmp::Reverse(key(e)));
+        list.dedup_by_key(|e| key(e));
         for e in list {
             let (start, end) = (e.edit.start as usize, e.edit.end as usize);
-            // `>=`: a second insertion at the same offset has no order.
-            if start > end || end >= floor && !(end == floor && start < end) || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
-                continue;
+            if end > text.len() || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+                return Err(format!("{path}: an edit of {} does not fit the file (did it change during the check?)", e.code));
             }
-            eprintln!("{} {path}:{}:{}: {}", if dry { "would fix" } else { "fixed" }, e.line, e.col, e.code);
             text.replace_range(start..end, &e.edit.replacement);
-            floor = start;
-            n += 1;
         }
-        if !dry && n > before {
-            std::fs::write(path, text).map_err(|e| format!("cannot write {path}: {e}"))?;
-        }
+        std::fs::write(path, text).map_err(|e| format!("cannot write {path}: {e}"))?;
     }
-    Ok(n)
+    Ok(fixed)
 }

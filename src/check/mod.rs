@@ -12104,7 +12104,7 @@ impl<'p> Ctx<'p> {
                     if let ast::GenericArg::Lifetime(lt) = g
                         && p.interner.get(lt.name) != "_"
                     {
-                        self.err("L0731", lt.span, "explicit lifetime arguments on a fn are not supported", "Remove the lifetime argument; Rust infers it.");
+                        self.err("L0731", lt.span, crate::rewrite::LIFETIME_ARG, "Remove the lifetime argument; Rust infers it.");
                     }
                 }
             }

@@ -15,10 +15,11 @@
 // macro, a comment between the arguments, a format string that is not a
 // plain literal.
 //
-// None of these is `auto`. Each changes something a program can observe,
-// which is why lust rejects the original rather than rewrite it silently:
-// the text of a panic message, or how many `write` calls a writer sees.
-// `lust fix --all` applies them.
+// Most of these are not `auto`: they change something a program can
+// observe (the text of a panic message, how many `write` calls a writer
+// sees) or add an item of their own, which is why lust rejects the original
+// rather than rewrite it silently. `lust fix --all` applies them. Taking
+// out a lifetime argument is `auto`: it changes nothing a program does.
 
 use crate::diag::{CtxtId, Diag, Edit, FileId, SourceMap, Span};
 
@@ -34,15 +35,231 @@ pub fn attach(diags: &mut [Diag], map: &SourceMap, root_src: &str) {
         if !d.edits.is_empty() {
             continue;
         }
-        let edit = match (d.code, d.message.as_str()) {
-            // The macro call as written: one inside a user macro's body
-            // or arguments has no text of its own to edit.
-            ("L0809", ASSERT_LONG) if d.span.ctxt == CtxtId::ROOT => site(map, root_src, d.span).and_then(|(text, lo)| assert_message(text, lo)),
-            ("L0641", WRITE_USER) => site(map, root_src, d.span).and_then(|(text, lo)| write_all(text, lo)),
+        // The site as written: one inside a user macro's body or arguments
+        // has no text of its own to edit.
+        let written = d.span.ctxt == CtxtId::ROOT;
+        let hi = d.span.hi as usize;
+        let edits: Option<Vec<Edit>> = match (d.code, d.message.as_str()) {
+            ("L0809", ASSERT_LONG) if written => site(map, root_src, d.span).and_then(|(text, lo)| assert_message(text, lo)).map(|e| vec![e]),
+            ("L0641", WRITE_USER) => site(map, root_src, d.span).and_then(|(text, lo)| write_all(text, lo)).map(|e| vec![e]),
+            ("L0731", LIFETIME_ARG) if written => site(map, root_src, d.span).and_then(|(text, lo)| drop_lifetime_arg(text, lo, hi)).map(|e| vec![e]),
+            ("L0522", NO_PRELUDE) if written => site(map, root_src, d.span).and_then(|(text, lo)| drop_attr(text, lo, hi)).map(|e| vec![e]),
+            ("L0630", CLOSURE_CONST) if written => site(map, root_src, d.span).and_then(|(text, lo)| closure_to_fn(text, lo, hi)),
             _ => None,
         };
-        d.edits.extend(edit);
+        d.edits.extend(edits.into_iter().flatten());
     }
+}
+
+/// The message of the lifetime turbofish reject (check/mod.rs).
+pub const LIFETIME_ARG: &str = "explicit lifetime arguments on a fn are not supported";
+/// The message of the `#[no_implicit_prelude]` reject (resolve/worklist.rs).
+pub const NO_PRELUDE: &str = "`#[no_implicit_prelude]` is not supported yet";
+/// The message of a closure in a const or static initializer (ty/consteval.rs).
+pub const CLOSURE_CONST: &str = "a closure is outside the bounded const evaluator";
+
+/// `f::<'a, T>` loses its lifetime argument, and `f::<'a>` its whole
+/// turbofish: Rust infers the lifetime. This one is `auto`: a lifetime
+/// argument changes nothing a program does.
+fn drop_lifetime_arg(text: &str, lo: usize, hi: usize) -> Option<Edit> {
+    let s = text.as_bytes();
+    if s.get(lo) != Some(&b'\'') || hi > s.len() {
+        return None;
+    }
+    let mut a = lo;
+    while a > 0 && s[a - 1].is_ascii_whitespace() {
+        a -= 1;
+    }
+    let mut b = hi;
+    while s.get(b).is_some_and(u8::is_ascii_whitespace) {
+        b += 1;
+    }
+    let (prev, next) = (*s.get(a.checked_sub(1)?)?, *s.get(b)?);
+    let (start, end) = match (prev, next) {
+        // The only argument: the turbofish goes with it.
+        (b'<', b'>') => (text[..a - 1].strip_suffix("::")?.len(), b + 1),
+        (_, b',') => {
+            let mut e = b + 1;
+            while s.get(e) == Some(&b' ') {
+                e += 1;
+            }
+            (lo, e)
+        }
+        (b',', b'>') => (a - 1, hi),
+        _ => return None,
+    };
+    Some(Edit { start: start as u32, end: end as u32, replacement: String::new(), auto: true })
+}
+
+/// An attribute goes, with its line when it has the line to itself.
+fn drop_attr(text: &str, lo: usize, hi: usize) -> Option<Edit> {
+    let s = text.as_bytes();
+    if s.get(lo) != Some(&b'#') || hi > s.len() {
+        return None;
+    }
+    // The attribute's span can stop before its closing bracket.
+    let hi = if s.get(hi) == Some(&b']') && !text[lo..hi].ends_with(']') { hi + 1 } else { hi };
+    let line_start = text[..lo].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = text[hi..].find('\n').map_or(s.len(), |i| hi + i + 1);
+    let alone = text[line_start..lo].trim().is_empty() && text[hi..line_end].trim().is_empty();
+    let (start, end) = if alone { (line_start, line_end) } else { (lo, hi) };
+    Some(Edit { start: start as u32, end: end as u32, replacement: String::new(), auto: false })
+}
+
+/// The parts of a comma list in type text, at the top level of `()`, `[]`
+/// and `<>` (a `->` is not a `>`).
+fn split_types(list: &str) -> Vec<&str> {
+    let s = list.as_bytes();
+    let (mut depth, mut from, mut out) = (0i32, 0, Vec::new());
+    for i in 0..s.len() {
+        match s[i] {
+            b'(' | b'[' | b'<' => depth += 1,
+            b'>' if i > 0 && s[i - 1] == b'-' => {}
+            b')' | b']' | b'>' => depth -= 1,
+            b',' if depth == 0 => {
+                out.push(list[from..i].trim());
+                from = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(list[from..].trim());
+    out.retain(|p| !p.is_empty());
+    out
+}
+
+/// The one `fn(A, B) -> R` type in type text `ty`: its parameter types and
+/// its return type. None when there is none, more than one, or a form
+/// a plain fn item cannot repeat (`unsafe`, `extern`, `for<..>`, named
+/// parameters).
+fn one_fn_type(ty: &str) -> Option<(Vec<&str>, Option<&str>)> {
+    let s = ty.as_bytes();
+    let starts: Vec<usize> = ty.match_indices("fn(").map(|(i, _)| i).filter(|&i| i == 0 || !ident_byte(s[i - 1])).collect();
+    let [at] = starts[..] else { return None };
+    if ["unsafe", "extern", "for<"].iter().any(|w| ty.contains(w)) {
+        return None;
+    }
+    let open = at + 2;
+    let (mut depth, mut close) = (0i32, None);
+    for i in open..s.len() {
+        match s[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close = close?;
+    let params = split_types(&ty[open + 1..close]);
+    // `x: T` names a parameter; `a::T` is a path.
+    if params.iter().any(|p| p.replace("::", "").contains(':')) {
+        return None;
+    }
+    let after = ty[close + 1..].trim_start();
+    let ret = match after.strip_prefix("->") {
+        None => None,
+        Some(r) => {
+            // The return type ends where the type around the fn type goes on.
+            let b = r.as_bytes();
+            let (mut depth, mut end) = (0i32, b.len());
+            for i in 0..b.len() {
+                match b[i] {
+                    b'(' | b'[' | b'<' => depth += 1,
+                    b'>' if i > 0 && b[i - 1] == b'-' => {}
+                    b')' | b']' | b'>' | b',' | b';' if depth == 0 => {
+                        end = i;
+                        break;
+                    }
+                    b')' | b']' | b'>' => depth -= 1,
+                    _ => {}
+                }
+            }
+            Some(r[..end].trim()).filter(|r| !r.is_empty())
+        }
+    };
+    Some((params, ret))
+}
+
+/// A closure in the initializer of a top-level `const` or `static` becomes
+/// a named fn next to the item, and the closure its name:
+///
+///     static T: &[(&str, fn(u32) -> u32)] = &[("inc", |x| x + 1)];
+///     static T: &[(&str, fn(u32) -> u32)] = &[("inc", t_fn)];
+///
+///     fn t_fn(x: u32) -> u32 { x + 1 }
+///
+/// The fn's parameter and return types are those of the one `fn(..)` type
+/// the item's written type holds. No edit for an item that is not at the
+/// start of a line (one in an `impl` or a fn body), a type with another
+/// number of `fn(..)` types, or a closure with typed parameters.
+fn closure_to_fn(text: &str, lo: usize, hi: usize) -> Option<Vec<Edit>> {
+    let clo = text.get(lo..hi)?;
+    let clo = clo.strip_prefix("move").map_or(clo, str::trim_start);
+    let inner = clo.strip_prefix('|')?;
+    // The parameter list ends at the next `|` outside a group.
+    let (mut depth, mut bar) = (0i32, None);
+    for (i, b) in inner.bytes().enumerate() {
+        match b {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'|' if depth == 0 => {
+                bar = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let bar = bar?;
+    let pats = split_types(&inner[..bar]);
+    let body = inner[bar + 1..].trim();
+    if pats.iter().any(|p| p.contains(':')) || body.starts_with("->") || body.is_empty() {
+        return None;
+    }
+    // The item: the last `const` or `static` that starts a line before the closure.
+    let mut item = None;
+    let mut at = 0;
+    for line in text[..lo].split_inclusive('\n') {
+        let mut rest = line;
+        if let Some(r) = rest.strip_prefix("pub") {
+            let r = if r.starts_with('(') { r.split_once(')')?.1 } else { r };
+            rest = r.trim_start();
+        }
+        if let Some(r) = rest.strip_prefix("static ").or_else(|| rest.strip_prefix("const ")) {
+            let r = r.trim_start();
+            let r = r.strip_prefix("mut ").map_or(r, str::trim_start);
+            let name_len = r.bytes().take_while(|&b| ident_byte(b)).count();
+            if name_len > 0 && r[name_len..].trim_start().starts_with(':') {
+                let colon = at + (line.len() - r.len()) + name_len + r[name_len..].find(':')?;
+                item = Some((&r[..name_len], colon));
+            }
+        }
+        at += line.len();
+    }
+    let (item_name, colon) = item?;
+    // The written type runs to the `=`, the initializer to its `;`.
+    let eq = colon + 1 + text[colon + 1..].find('=')?;
+    let (semi, _) = scan(text, eq + 1, Some(b';'))?;
+    if lo <= eq || hi > semi {
+        return None;
+    }
+    let (params, ret) = one_fn_type(text[colon + 1..eq].trim())?;
+    if params.len() != pats.len() {
+        return None;
+    }
+    let base = format!("{}_fn", item_name.to_lowercase());
+    let name = std::iter::once(base.clone()).chain((2..100).map(|n| format!("{base}{n}"))).find(|n| !text.contains(n.as_str()))?;
+    let sig: Vec<String> = pats.iter().zip(&params).map(|(p, t)| format!("{p}: {t}")).collect();
+    let ret = ret.map_or(String::new(), |r| format!(" -> {r}"));
+    let body = if body.starts_with('{') { body.to_string() } else { format!("{{ {body} }}") };
+    Some(vec![
+        Edit { start: lo as u32, end: hi as u32, replacement: name.clone(), auto: false },
+        Edit { start: semi as u32 + 1, end: semi as u32 + 1, replacement: format!("\n\nfn {name}({}){ret} {body}", sig.join(", ")), auto: false },
+    ])
 }
 
 /// The text of the file `span` reports in and the offset the reported site
@@ -105,8 +322,20 @@ fn scan_call(text: &str, lo: usize, names: &[&str]) -> Option<(usize, Call)> {
         return None;
     }
     let open = i;
+    let (close, commas) = scan(text, open + 1, None)?;
+    Some((which, Call { open, close, commas }))
+}
+
+/// Scans code from `from` to where its group ends: with `stop` None, the
+/// delimiter that closes the group `from` is inside; else the first `stop`
+/// byte outside any nested group. Gives that offset and the commas passed
+/// outside nested groups. String, char and raw string literals are stepped
+/// over. None for text that ends first, or holds a comment (the edits move
+/// text, and a comment may not move with it).
+fn scan(text: &str, from: usize, stop: Option<u8>) -> Option<(usize, Vec<usize>)> {
+    let s = text.as_bytes();
     let (mut depth, mut commas) = (0usize, Vec::new());
-    i += 1;
+    let mut i = from;
     while i < s.len() {
         let b = s[i];
         match b {
@@ -145,10 +374,11 @@ fn scan_call(text: &str, lo: usize, names: &[&str]) -> Option<(usize, Call)> {
                 }
                 continue;
             }
+            _ if depth == 0 && stop == Some(b) => return Some((i, commas)),
             b'(' | b'[' | b'{' => depth += 1,
             b')' | b']' | b'}' => {
                 if depth == 0 {
-                    return Some((which, Call { open, close: i, commas }));
+                    return stop.is_none().then_some((i, commas));
                 }
                 depth -= 1;
             }
@@ -255,6 +485,94 @@ mod tests {
         // A lifetime and a raw string do not end the scan early.
         let t = "assert!(f::<'a>(r#\"),\"#) == 'x')";
         assert_eq!(apply(t, &assert_message(t, 0).unwrap()), "assert!(f::<'a>(r#\"),\"#) == 'x', \"assertion failed: f::<'a>(r#\\\"),\\\"#) == 'x'\")");
+    }
+
+    #[test]
+    fn lifetime_arguments_go() {
+        let cut = |t: &str, lt: &str| {
+            let lo = t.find(lt).unwrap();
+            let e = drop_lifetime_arg(t, lo, lo + lt.len()).unwrap();
+            assert!(e.auto);
+            apply(t, &e)
+        };
+        assert_eq!(cut("pick::<'static>(&5)", "'static"), "pick(&5)");
+        assert_eq!(cut("pick::<'static, i32>(&5)", "'static"), "pick::<i32>(&5)");
+        assert_eq!(cut("pick::< 'static , i32 >(&5)", "'static"), "pick::< i32 >(&5)");
+        assert_eq!(cut("x.get::<T, 'a>()", "'a"), "x.get::<T>()");
+        assert_eq!(cut("two::<'a, 'b>(x)", "'a"), "two::<'b>(x)");
+        // A type position has no `::` to take away.
+        assert!(drop_lifetime_arg("Vec<'a>", 4, 6).is_none());
+    }
+
+    #[test]
+    fn an_attribute_goes_with_its_line() {
+        let t = "#![no_implicit_prelude]
+fn main() {}
+";
+        assert_eq!(apply(t, &drop_attr(t, 0, 23).unwrap()), "fn main() {}
+");
+        let t = "#[a] #[b] fn f() {}";
+        assert_eq!(apply(t, &drop_attr(t, 5, 9).unwrap()), "#[a]  fn f() {}");
+    }
+
+    #[test]
+    fn a_closure_in_a_static_becomes_a_named_fn() {
+        let fix = |t: &str, clo: &str| {
+            let lo = t.find(clo).unwrap();
+            closure_to_fn(t, lo, lo + clo.len()).map(|es| {
+                // Back to front, as `lust fix` applies them.
+                let mut out = t.to_string();
+                for e in es.iter().rev() {
+                    out = apply(&out, e);
+                }
+                out
+            })
+        };
+        let t = "static F: fn(u32) -> u32 = |x| x + 1;
+fn main() {}
+";
+        assert_eq!(fix(t, "|x| x + 1").unwrap(), "static F: fn(u32) -> u32 = f_fn;
+
+fn f_fn(x: u32) -> u32 { x + 1 }
+fn main() {}
+");
+        let t = "pub(crate) static TABLE: &[(&str, fn(&mut Vec<u8>, (u8, u8)))] = &[
+    (\"a\", |v, (a, b)| { v.push(a); v.push(b) }),
+];
+";
+        assert_eq!(
+            fix(t, "|v, (a, b)| { v.push(a); v.push(b) }").unwrap(),
+            "pub(crate) static TABLE: &[(&str, fn(&mut Vec<u8>, (u8, u8)))] = &[
+    (\"a\", table_fn),
+];
+
+fn table_fn(v: &mut Vec<u8>, (a, b): (u8, u8)) { v.push(a); v.push(b) }
+"
+        );
+        // A second closure of the same item gets another name.
+        let t = "const C: [fn() -> u8; 2] = [c_fn, || 2];
+
+fn c_fn() -> u8 { 1 }
+";
+        assert_eq!(fix(t, "|| 2").unwrap(), "const C: [fn() -> u8; 2] = [c_fn2, || 2];
+
+fn c_fn2() -> u8 { 2 }
+
+fn c_fn() -> u8 { 1 }
+".replace("[c_fn2, || 2]", "[c_fn, c_fn2]"));
+        // Not at the start of a line, two fn types, a typed closure, another arity.
+        assert!(fix("impl S {
+    const F: fn(u32) -> u32 = |x| x;
+}
+", "|x| x").is_none());
+        assert!(fix("static F: (fn(u8), fn(u8)) = (|x| (), |x| ());
+", "|x| ()").is_none());
+        assert!(fix("static F: fn(u32) -> u32 = |x: u32| x;
+", "|x: u32| x").is_none());
+        assert!(fix("static F: fn(u32, u32) -> u32 = |x| x;
+", "|x| x").is_none());
+        assert!(fix("static F: unsafe fn(u32) = |x| ();
+", "|x| ()").is_none());
     }
 
     #[test]

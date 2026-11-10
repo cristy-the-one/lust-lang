@@ -5,7 +5,9 @@
 #   edit, `lust fix --all` must turn the file into Rust that lust accepts, and
 #   the fixed program must give the same stdout, stderr and exit code under
 #   rustc and under lust (rule zero). Plain `lust fix` applies only the `auto`
-#   edits, and `--dry-run` writes nothing.
+#   edits, and `--dry-run` writes nothing. Rewrites: a long assert! (L0809),
+#   write! into a user writer (L0641), a lifetime argument on a fn (L0731),
+#   #![no_implicit_prelude] (L0522), a closure in a const or static (L0630).
 # Usage: scripts/test-fix.sh
 set -uo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -59,7 +61,7 @@ case "$err" in *"would fix"*"a.rs:6:5: L0809"*) ok "assert: dry run names the ed
 is "assert: dry run writes nothing" "$(cat "$d/a.rs")" "$before"
 err=$( (cd "$d" && "$lust" fix a.rs --all) 2>&1 ); rc=$?
 is "assert: fix --all exits 0" $rc 0
-case "$err" in *"fixed"*"a.rs:6:5: L0809"*"applied 1 edit"*) ok "assert: fix --all reports the edit";; *) bad "assert: fix --all reports the edit" "$err";; esac
+case "$err" in *"fixed"*"a.rs:6:5: L0809"*"fixed 1 diagnostic"*) ok "assert: fix --all reports the edit";; *) bad "assert: fix --all reports the edit" "$err";; esac
 same "assert: fixed program matches rustc" "$d/a.rs"
 (cd "$d" && "$lust" fix a.rs --all) >/dev/null 2>&1; is "assert: a second fix has nothing to do, exit 0" $? 0
 # The message when the assert fails: the same text under both compilers.
@@ -119,7 +121,7 @@ fn main() {
 RS
 err=$( (cd "$d" && "$lust" fix m.rs --all) 2>&1 ); rc=$?
 is "write: write!, writeln! and an empty writeln!, exit 0" $rc 0
-case "$err" in *"applied 3 edit"*) ok "write: three edits in one round";; *) bad "write: three edits in one round" "$err";; esac
+case "$err" in *"fixed 3 diagnostic"*) ok "write: three calls in one round";; *) bad "write: three calls in one round" "$err";; esac
 same "write: fixed methods match rustc" "$d/m.rs"
 
 # --------------------------------------------- auto edits (numeric casts)
@@ -134,10 +136,78 @@ fn main() {
 RS
 err=$( (cd "$d" && "$lust" fix n.rs) 2>&1 ); rc=$?
 is "auto: plain fix applies auto edits, exit 0" $rc 0
-# A cast is two edits (`(` before and `) as T` after); the `.0` is one.
-case "$err" in *"applied 3 edit"*) ok "auto: the cast and the float literal";; *) bad "auto: the cast and the float literal" "$err";; esac
+# A cast is two edits of one diagnostic (`(` before and `) as T` after).
+case "$err" in *"fixed 2 diagnostic"*) ok "auto: the cast and the float literal";; *) bad "auto: the cast and the float literal" "$err";; esac
 case "$(cat "$d/n.rs")" in *'let wide: i64 = (small) as i64;'*'let ratio: f64 = 2.0;'*) ok "auto: the fixed text";; *) bad "auto: the fixed text" "$(cat "$d/n.rs")";; esac
 same "auto: fixed program matches rustc" "$d/n.rs"
+
+# ------------------------------------- lifetime arguments on a fn (L0731)
+d=$work/lifetime; mkdir -p "$d"
+cp "$root/tests/reject/lifetime_turbofish_early.rs" "$d/a.rs"
+cp "$root/tests/reject/method_turbofish_lifetime.rs" "$d/b.rs"
+for f in a b; do
+  (cd "$d" && "$lust" fix $f.rs) >/dev/null 2>&1; is "lifetime: plain fix applies the auto edit ($f), exit 0" $? 0
+  same "lifetime: fixed program matches rustc ($f)" "$d/$f.rs"
+done
+case "$(cat "$d/a.rs")" in *'pick::<'"'"'_>(&v) + pick(&5)'*) ok "lifetime: the turbofish goes, an inferred one stays";; *) bad "lifetime: the turbofish goes, an inferred one stays" "$(cat "$d/a.rs")";; esac
+cat >"$d/c.rs" <<'RS'
+fn pick<'a: 'a, T>(x: &'a T) -> &'a T {
+    x
+}
+fn two<'a: 'a, 'b: 'b>(x: &'a i32, _y: &'b i32) -> &'a i32 {
+    x
+}
+fn main() {
+    println!("{}", pick::<'static, i32>(&5) + two::<'static, 'static>(&1, &2) + pick::< 'static , i32 >(&3));
+}
+RS
+(cd "$d" && "$lust" fix c.rs) >/dev/null 2>&1; is "lifetime: beside type arguments and two in one list, exit 0" $? 0
+case "$(cat "$d/c.rs")" in *'pick::<i32>(&5) + two(&1, &2) + pick::< i32 >(&3)'*) ok "lifetime: the fixed text";; *) bad "lifetime: the fixed text" "$(cat "$d/c.rs")";; esac
+same "lifetime: fixed list forms match rustc" "$d/c.rs"
+
+# ------------------------------------------ #![no_implicit_prelude] (L0522)
+d=$work/prelude; mkdir -p "$d"
+printf '#![no_implicit_prelude]\nfn main() {\n    ::std::println!("{}", ::std::vec::Vec::<u8>::new().len());\n}\n' >"$d/p.rs"
+(cd "$d" && "$lust" fix p.rs) >/dev/null 2>&1; is "prelude: not an auto edit, exit 1" $? 1
+(cd "$d" && "$lust" fix p.rs --all) >/dev/null 2>&1; is "prelude: fix --all exits 0" $? 0
+is "prelude: the attribute's line is gone" "$(head -1 "$d/p.rs")" "fn main() {"
+same "prelude: fixed program matches rustc" "$d/p.rs"
+
+# ------------------------------ a closure in a const or static (L0630)
+d=$work/closure; mkdir -p "$d"
+cat >"$d/s.rs" <<'RS'
+static INC: fn(u32) -> u32 = |x| x + 1;
+const NAME: fn(&str) -> String = |s| {
+    let mut out = String::from("<");
+    out.push_str(s);
+    out + ">"
+};
+static TABLE: &[(&str, fn(&mut Vec<u32>, (u32, u32)))] = &[
+    ("sum", |v, (a, b)| v.push(a + b)),
+    ("both", move |v, (a, b)| {
+        v.push(a);
+        v.push(b);
+    }),
+];
+fn main() {
+    let mut v = Vec::new();
+    for (name, f) in TABLE {
+        f(&mut v, (INC(1), 5));
+        println!("{} {:?}", NAME(name), v);
+    }
+}
+RS
+err=$( (cd "$d" && "$lust" fix s.rs --all) 2>&1 ); rc=$?
+is "closure: fix --all exits 0" $rc 0
+# The const evaluator stops at the first closure of a check: one per round.
+case "$err" in *"fixed 4 diagnostic"*) ok "closure: four closures, four rounds";; *) bad "closure: four closures, four rounds" "$err";; esac
+src=$(cat "$d/s.rs")
+case "$src" in *'static INC: fn(u32) -> u32 = inc_fn;'*'fn inc_fn(x: u32) -> u32 { x + 1 }'*'("sum", table_fn),'*'("both", table_fn2),'*'fn table_fn(v: &mut Vec<u32>, (a, b): (u32, u32)) { v.push(a + b) }'*) ok "closure: the fixed text";; *) bad "closure: the fixed text" "$src";; esac
+same "closure: fixed program matches rustc" "$d/s.rs"
+printf 'struct S;\nimpl S {\n    const F: fn(u32) -> u32 = |x| x + 1;\n}\nfn main() { println!("{}", (S::F)(1)); }\n' >"$d/i.rs"
+i_before=$(cat "$d/i.rs")
+(cd "$d" && "$lust" fix i.rs --all) >/dev/null 2>&1; is "closure: an associated const gets no edit, exit 1" $? 1
+is "closure: nothing written for it" "$(cat "$d/i.rs")" "$i_before"
 
 # ------------------------------------------------- another file of a crate
 d=$work/mods; mkdir -p "$d"

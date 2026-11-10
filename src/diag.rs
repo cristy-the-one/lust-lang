@@ -135,6 +135,9 @@ impl Diag {
 /// One edit of a rendered diagnostic with where it applies: the path of the
 /// diagnostic's file and its line, column and code (`with_edit_sink`).
 pub struct FileEdit {
+    /// Which diagnostic of the render the edit belongs to. The edits of
+    /// one diagnostic are one change: all of them apply, or none.
+    pub group: usize,
     pub path: String,
     pub line: u32,
     pub col: u32,
@@ -826,10 +829,10 @@ pub fn render(diags: &mut [Diag], map: &SourceMap, src: &str, json: bool, max_er
     let mut out = String::new();
     EDIT_SINK.with(|sink| {
         if let Some(sink) = sink.borrow_mut().as_mut() {
-            for d in uniq.iter().filter(|d| !d.edits.is_empty()) {
+            for (group, d) in uniq.iter().enumerate().filter(|(_, d)| !d.edits.is_empty()) {
                 let span = map.call_site(d.span);
                 let (line, col) = map.line_col(span);
-                sink.extend(d.edits.iter().map(|e| FileEdit { path: map.path(span.file).to_string(), line, col, code: d.code, edit: e.clone() }));
+                sink.extend(d.edits.iter().map(|e| FileEdit { group, path: map.path(span.file).to_string(), line, col, code: d.code, edit: e.clone() }));
             }
         }
     });

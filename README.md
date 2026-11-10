@@ -298,11 +298,14 @@ lust test src/lib.rs --manifest-path Cargo.toml --lib
 lust test tests/api.rs --manifest-path Cargo.toml --test api
 lust check main.rs --rustc                  # ask the real rustc for a second opinion
 lust build main.rs --release                # release build with Cargo (rustc -O for one file)
+lust fix main.rs [--all] [--dry-run]        # apply the edits the diagnostics carry, then check again
 lust explain L0602                          # long help for one error code
 lust capabilities --json                    # what the subset supports and rejects
 ```
 
 `lust watch check` repeats that check when a source file, `Cargo.toml`, or `Cargo.lock` is saved. It keeps the working directory and the check flags (target, features, profile, `--sandbox`) and sends each check through the same client, so an already warm daemon session stays warm. `target/`, `.lust-cache`, and `$CARGO_TARGET_DIR` are not watched. Edits that land together become one check: the quiet period restarts when the saved bytes change, and a notification that does not change those bytes does not start another. An edit that lands while a check is running schedules one more check, and the diagnostics from the check that was in flight are marked `stale` until a later check matches the saved tree (`current`). Ctrl-C stops the watcher, the check it is running, and a daemon that this watch started. `watch` does not run tests or build. The watcher is a separate program (`lust-watch`); `check`, `build`, and `run` do not load it.
+
+`lust fix` applies the concrete edits that diagnostics carry (the `edits` of `lust check --json`) and checks again, until a check has no edit left. It ends like that last check: its diagnostics, and exit code 0 when the crate checks. Plain `lust fix` applies only the edits marked `auto`, which a tool may apply without asking: a lossless numeric cast, `.0` on an integer literal where a float is expected. `--all` also applies the rewrites for rejects, which turn valid Rust that lust refuses into Rust it accepts. They are not `auto` because each changes something a program can observe, which is why lust rejects the original and does not rewrite it silently. `--dry-run` prints what one round would change and writes nothing. Two rejects carry a rewrite today. A long `assert!(cond)` with no message (L0809) gets its condition as the message, on one line where rustc prints its own layout. A `write!` or `writeln!` into a user `io::Write` type (L0641) becomes `dst.write_all(format!(..).as_bytes())`, so the writer sees one call where rustc's `write!` calls it once per piece of the format. The fixed file is plain Rust: rustc builds it too, and both give the same output. A site inside a user macro, or with a comment between the arguments, gets no edit.
 
 A target in a Cargo workspace:
 

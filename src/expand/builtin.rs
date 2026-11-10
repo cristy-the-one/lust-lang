@@ -634,7 +634,7 @@ pub fn assert_text_too_long(span: Span) -> Diag {
     err(
         C_UNSUPPORTED,
         span,
-        "`assert!` with no message on a long or item-holding condition is not supported yet",
+        crate::rewrite::ASSERT_LONG,
         "Add a message: assert!(cond, \"...\"), or split the condition.",
     )
 }

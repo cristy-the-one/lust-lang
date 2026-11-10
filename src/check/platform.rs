@@ -48,7 +48,14 @@ pub fn user_write_fmt_call(p: &Program, tys: &impl TyIntern, f: LocalDefId, writ
     if !is_platform_write_fmt(p, f) {
         return None;
     }
-    user_writer_diag(p, tys, writer, span)
+    // At the call, not at the type: each `write!` is a site to rewrite
+    // (src/rewrite.rs reads the call's text there).
+    let mut d = user_writer_diag(p, tys, writer, span)?;
+    if d.span != span {
+        d.labels.push(crate::diag::Label { span: d.span, text: "the writer type".into() });
+        d.span = span;
+    }
+    Some(d)
 }
 
 /// True for a `write_fmt` fn of the platform crate (the trait default,
@@ -72,7 +79,7 @@ fn user_writer_diag(p: &Program, tys: &impl TyIntern, writer: Ty, fallback: Span
     Some(Diag::new(
         "L0641",
         span,
-        "`write!` into a user-defined `std::io::Write` type is not supported yet",
+        crate::rewrite::WRITE_USER,
         "Format into a `String` with `format!`, then call `write_all` with its bytes.",
     ))
 }

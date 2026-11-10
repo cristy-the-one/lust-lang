@@ -5,7 +5,7 @@
 //
 //   lust check <file.rs> [--json] [--timings]     lust check <file.rs> --rustc (oracle)
 //   lust watch check <file.rs> [check flags]     re-check on save (execs `lust-watch`)
-//   lust build <file.rs> [-o <out>] [-g] [--emit-c <prefix>] [--timings]
+//   lust build <file.rs> [-o <out>] [-g] [--emit-c <prefix>] [--timings] [--opt | --opt=bg]
 //   lust build <file.rs> --release | --profile <name> [-o <out>]  (Cargo or rustc)
 //   lust build <file.rs> --release --target <triple>...            (lust + zig cc, per target)
 //   lust run   <file.rs> [-- <args>...]

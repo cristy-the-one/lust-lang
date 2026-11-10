@@ -2610,6 +2610,10 @@ fn location_path(p: &str, library: &Path, display_root: Option<&Path>, client: &
 }
 
 pub fn compile(req: &Request, session: &mut Session) -> Response {
+    // `--opt` emits release C (direct calls) on this thread. Dropped on every
+    // return, including a panic, so the next tcc request on this thread does not
+    // keep the names.
+    let _opt_names = super::release_c::OptNames::enter(req.session.profile.opt);
     let mut t = Timer::new();
     crate::driver::cache::begin_build(&req.file);
     if req.session != session.key {
@@ -3794,7 +3798,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // build ignores the variable: it would link that C without the C++ unit, and
     // catch_unwind would return Ok after a panic (rel-opt).
     let tables_env = std::env::var("LUST_UNWIND_TABLES").ok();
+    // `--opt` keeps the tcc panic scheme (no C++ unwind tables). Tables would
+    // change the generated C and need a C++ driver; the dev build does not
+    // use them, and the optimised binary has to panic the same way.
     program.unwind_tables = program.unwind
+        && !req.session.profile.opt
         && if req.cc {
             tables_env.as_deref() != Some("0")
         } else {
@@ -5824,9 +5832,13 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         });
         let (all, spec, cache) = match prepared {
             Ok(x) => x,
-            Err(e) => return Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() },
+            Err(e) => {
+                super::optbg::abandoned(req);
+                return Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() };
+            }
         };
         let (out, debug, cc_dir) = (req.out.clone(), req.debug, dir.join("cc"));
+        let opt_build = req.session.profile.opt;
         // B1: a unit with a record goes with its fingerprint, a skipped one without its text.
         let all: Vec<crate::cc::UnitIn> = all
             .into_iter()
@@ -5841,6 +5853,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             let _ = writeln!(resp.stderr, "b1: {l}");
         }
         let job = move || {
+            // Strict floating-point flags for this compile, including a cc step
+            // parked until after this function returns (`DEFER_CC`).
+            let _strict = opt_build.then(crate::cc::StrictFp::enter);
             let built = crate::cc::build_with(&all, &spec, &out, debug, cache.as_ref(), &cc_dir, stream).map_err(|e| e.to_string());
             // A build that leaks at exit leaks the unit texts too (they moved out of `units`).
             if leak_at_exit {
@@ -5865,6 +5880,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         t.lap("cc compile + link");
         match built {
             Ok(summary) => {
+                super::optbg::published(req);
+                if req.session.profile.opt {
+                    let _ = writeln!(resp.stderr, "opt: optimised build");
+                }
                 // The emitted set is this session's base: the next build
                 // keeps these groups and emits only what changed.
                 caches.objects = Some(req.debug);
@@ -5885,7 +5904,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 }
                 return resp;
             }
-            Err(e) => return Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() },
+            Err(e) => {
+                super::optbg::abandoned(req);
+                return Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() };
+            }
         }
     }
     // `lust run` of a small program (one function unit, fresh base): compile in memory and run
@@ -5897,6 +5919,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // on other threads. The daemon wire carries no run arguments (`protocol::read_request`);
     // this check keeps that a pin, not a hope.
     if let Some(run_args) = &req.run_args
+        && !req.opt_bg
         && !caches.persistent
         && fresh_base
         && groups.len() == 1
@@ -6096,6 +6119,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     if let Err(e) = linked {
         caches.objects = None;
         return Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() };
+    }
+    if req.opt_bg {
+        super::optbg::swap_or_spawn(req, &map, &mut resp.stderr, caches.persistent);
     }
     // Reference-counted cleanup: record this build as a user of the current base (in memory
     // and in the base dir manifest, for after this daemon exits), then delete old bases past
@@ -6560,7 +6586,7 @@ fn main() { println!(\"{}\", f0() + 5i64.d()); }
             emit_c: None,
             max_errors: 20,
             run_args: None,
-            harness: false, cc: false, overlay: Default::default(),
+            harness: false, cc: false, opt_bg: false, overlay: Default::default(),
             client: Default::default(),
         }
     }

@@ -7317,6 +7317,10 @@ pub fn build_trait_tables(p: &mut Program, errs: &mut Vec<Diag>) {
             mscope.type_params.extend(own_scope.type_params.iter().copied());
             mscope.const_params.extend(own_scope.const_params.iter().copied());
             mscope.param_tys.extend(own_scope.param_tys.iter().copied());
+            // `S::Ok` for a parameter `S: Serializer` of the method itself:
+            // the method's own bounds name associated types too, as they do
+            // in an impl method and in a free fn.
+            mscope.assoc_srcs.extend(own_scope.assoc_srcs.iter().cloned());
             let (params, ret, ret_borrows_from, combined, mscope, region_sig, _) = {
                 let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
                 resolve_fn_sig(&p.ast, &p.interner, &p.known, &mut p.tys, &cx, fdef, combined, &mscope, scope.self_ty, None, errs)

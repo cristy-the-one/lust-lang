@@ -6588,6 +6588,7 @@ fn main() { println!(\"{}\", f0() + 5i64.d()); }
             harness: false, cc: false, opt_bg: false, overlay: Default::default(),
             client: Default::default(),
             query: None,
+            mark_unread: Vec::new(),
         }
     }
 

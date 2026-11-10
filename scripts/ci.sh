@@ -217,6 +217,7 @@ run_step "ts-rust kernels and compat fixtures" kernel_suite
 if [ -e scripts/test-client.sh ]; then
   run_step "client tests" scripts/test-client.sh
 fi
+run_step "unread results" scripts/test-unread.sh
 # shellcheck source=scripts/gnu-tools.sh
 source "$root/scripts/gnu-tools.sh"
 # Each watch test already bounds its own wait. This bound ends the step

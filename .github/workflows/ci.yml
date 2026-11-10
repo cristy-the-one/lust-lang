@@ -1,7 +1,6 @@
 name: CI
 
-# There is no git remote yet, so this workflow has never run. It is kept
-# valid (actionlint) and runs the same scripts/ci.sh gate as a dev box.
+# Runs the same scripts/ci.sh gate as a dev box, on Linux, Windows and macOS.
 # A feature-branch commit is tested by pull_request only. push on every
 # branch was starting a second full run of the same SHA.
 # Both events include next and main. The macOS job below has no `if:`,

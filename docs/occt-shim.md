@@ -2,7 +2,7 @@
 
 The first slice is implemented. CI does not fetch or compile Open
 CASCADE. `scripts/occt-oracle.sh` skips when the shim cache is absent,
-so Linux and Windows CI stay green without it. macOS CI stays disabled.
+so CI stays green without it on Linux, Windows and macOS.
 
 The first slice is session create/free, last error, box, cylinder,
 shape free, tessellate, mesh counts, mesh copy, and mesh free. Fuse,
@@ -222,7 +222,7 @@ stops.
 **OCCT is not in CI.** A full OCCT source build is too large and too
 slow for the lust gate. Phase 1 does not add it. Later, the oracle
 runs only on a machine that already has a cached shim. Linux and
-Windows CI stay green without it. macOS stays disabled, as now. OCCT's
+Windows CI stay green without it, and so does macOS. OCCT's
 license (LGPL-2.1 with the OCCT exception) is a distribution choice for
 whoever ships the shim, not something this repo vendors.
 

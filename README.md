@@ -151,15 +151,23 @@ Linux x86_64, Windows x86_64 (MSVC, Windows 10 or 11, PowerShell 7), and macOS a
 
 ### From the release
 
-Download `lust-0.2.0-x86_64-linux.tar.gz` from the [releases](https://github.com/t3dotgg/lust-lang/releases) page, then:
+Each version has a [release](https://github.com/cristy-the-one/lust-lang/releases) with one package per platform and its `.sha256`:
+
+| Platform | Package |
+|---|---|
+| Linux x86_64 | `lust-<version>-x86_64-linux.tar.gz` |
+| macOS arm64 | `lust-<version>-aarch64-macos.tar.gz` |
+| Windows x86_64 | `lust-<version>-x86_64-windows.zip` |
 
 ```sh
-tar xzf lust-0.2.0-x86_64-linux.tar.gz
-export PATH="$PWD/lust-0.2.0-x86_64-linux/bin:$PATH"
+tar xzf lust-0.3.0-x86_64-linux.tar.gz
+export PATH="$PWD/lust-0.3.0-x86_64-linux/bin:$PATH"
 lust --version
 ```
 
-The package holds `lust`, `lust-core`, the pinned `tcc`, and the std and adapter sources. You also need glibc 2.38 or later, the C library development files (`libc6-dev` on Debian and Ubuntu), and Cargo to check a Cargo crate (lust reads `cargo metadata` and the registry sources).
+The package holds `lust`, `lust-core`, the pinned `tcc`, and the std and adapter sources, and lust finds them from its own executable, so the unpacked folder can sit anywhere, inside another program's files too. `lust --version` prints the version and the build hash. On Linux you also need glibc 2.38 or later and the C library development files (`libc6-dev` on Debian and Ubuntu). To check a Cargo crate you need Cargo (lust reads `cargo metadata` and the registry sources). `--opt` uses `zig` or `cc` from `PATH`; the package has neither.
+
+A release is made by pushing the tag `v<version>` of the version in `Cargo.toml` (`.github/workflows/release.yml`).
 
 ### From source
 
@@ -218,7 +226,7 @@ A release zip, next to the Linux tarball from `scripts/release.sh`:
 
 ```powershell
 pwsh -File scripts/release.ps1
-Get-FileHash dist\lust-0.2.0-x86_64-windows.zip -Algorithm SHA256
+Get-FileHash dist\lust-0.3.0-x86_64-windows.zip -Algorithm SHA256
 ```
 
 The zip contains `bin\lust.exe`, `bin\lust-core.exe`, the pinned `tcc.exe`, and the std and adapter sources. You do not need Visual Studio to run a packaged build. You do need it, plus rustup, to build from source. Cargo is still required to check a Cargo crate (`lust` runs `cargo metadata`).

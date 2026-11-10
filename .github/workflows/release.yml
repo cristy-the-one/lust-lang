@@ -6,6 +6,9 @@ name: Release packages
 # publishes them as the assets of a GitHub Release of that name (the
 # `publish` job), so a project that bundles lust can download a package by
 # version and check its sha256, and need not build lust from source.
+# Each package job unpacks its package away from the checkout and runs a
+# program with it (scripts/release-smoke.*) before it uploads: a package
+# that cannot run is not published.
 on:
   workflow_dispatch:
   push:
@@ -29,7 +32,9 @@ jobs:
       - name: Pack the Linux tarball
         env:
           LUST_TCC_HOME: ${{ github.workspace }}/third_party/tcc
-        run: scripts/release.sh
+        run: |
+          scripts/release.sh
+          bash scripts/release-smoke.sh dist/*.tar.gz
       - uses: actions/upload-artifact@v4
         with:
           name: lust-x86_64-linux
@@ -50,6 +55,7 @@ jobs:
           Import-Module "$vs\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
           Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64'
           ./scripts/release.ps1
+          ./scripts/release-smoke.ps1 (Get-ChildItem dist\*.zip | Select-Object -First 1).FullName
       - uses: actions/upload-artifact@v4
         with:
           name: lust-x86_64-windows
@@ -83,6 +89,7 @@ jobs:
         run: |
           export PATH="$(brew --prefix)/opt/coreutils/libexec/gnubin:$(brew --prefix)/bin:$PATH"
           "$(brew --prefix)/bin/bash" scripts/release.sh
+          "$(brew --prefix)/bin/bash" scripts/release-smoke.sh dist/*.tar.gz
       - uses: actions/upload-artifact@v4
         with:
           name: lust-aarch64-macos

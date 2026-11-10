@@ -111,7 +111,7 @@ Lust compiles fast. Its programs do not run fast. The backend emits C and compil
 | `cargo build` (debug) | 15.7 s | 1x |
 | `cargo build --release` | 0.93 s | 11x to 32x faster |
 
-The release times are 0.01 to 0.12 s, so their ratios are coarse. In total, the lust bin is about 70x slower than the release bin. That matters when an agent runs the project's tests after each edit. For a fast binary, use `lust build --release`, which hands the build to Cargo (or to `rustc -O` for one file).
+The release times are 0.01 to 0.12 s, so their ratios are coarse. In total, the lust bin is about 70x slower than the release bin. That matters when an agent runs the project's tests after each edit. For a fast binary, use `lust build --release`, which hands the build to Cargo (or to `rustc -O` for one file). `lust build --opt` keeps lust's own codegen and sandbox and compiles that C with an optimising C compiler; see [docs/opt.md](docs/opt.md).
 
 ## Why it is fast
 
@@ -323,6 +323,8 @@ Known limit: one file builds as `rustc --edition 2024 -C panic=abort -C overflow
 `--json` prints one diagnostic per line, each with `code`, `message`, `span`, `fix`, and `edits`. The `fix` text tells the user what to write instead. This format exists for coding agents.
 
 `--sandbox` (on `check`, `build`, `run`) is for code a tool or a model wrote: the program may read stdin and write stdout and stderr, and nothing else. Check refuses std paths to the file system, the network, the environment, processes and threads (L0532), and the built program stops before any other OS call. See [docs/sandbox.md](docs/sandbox.md).
+
+`--opt` (on `build` and `run`, with or without `--sandbox`) compiles that same program with an optimising C compiler instead of tcc. `--opt=bg` still links the fast tcc build for this run and starts the optimised build in the background; a later run of the same source installs the cached binary. The default, with neither flag, is unchanged. See [docs/opt.md](docs/opt.md).
 
 This is a complete lust program. It is also a complete Rust program:
 

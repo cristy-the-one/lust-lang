@@ -499,7 +499,9 @@ fn run() {
                 eprintln!("lust: front state off: {why}");
             }
             let start = std::time::Instant::now();
-            let cache = if req.emit_c.is_none() && req.run_args.is_none() && !req.cc { driver::cache::Cache::open(&req.file) } else { None };
+            // `--opt=bg` must reach compile: a whole-request hit would replay the
+            // fast binary and never install a cached optimised one.
+            let cache = if req.emit_c.is_none() && req.run_args.is_none() && !req.cc && !req.opt_bg { driver::cache::Cache::open(&req.file) } else { None };
             let src = cache.as_ref().and_then(|_| std::fs::read(&req.file).ok());
             if let (Some(cache), Some(src)) = (&cache, &src)
                 && let Some(resp) = cache.lookup(&req, src, start)

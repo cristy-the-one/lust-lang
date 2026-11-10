@@ -21,6 +21,7 @@
 // function of those alone.
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 mod memo;
 pub(crate) mod pgo;
@@ -189,6 +190,65 @@ pub fn spec_for(triple: &str) -> Result<CcSpec, String> {
     ))
 }
 
+/// How many `--opt` compiles on this process are inside `cc::build` right now.
+/// Their C flags add `-flto` and the strict floating-point set. A count, not a
+/// bool: a guard compile on another thread must not clear it.
+static STRICT_FP: AtomicU32 = AtomicU32::new(0);
+
+/// Holds one `--opt` compile's strict floating-point flags (see `strict_fp_flags`).
+pub struct StrictFp;
+
+impl StrictFp {
+    pub fn enter() -> Self {
+        STRICT_FP.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for StrictFp {
+    fn drop(&mut self) {
+        STRICT_FP.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn strict_fp() -> bool {
+    STRICT_FP.load(Ordering::Relaxed) > 0
+}
+
+/// Takes `-flto` out of an `--opt` command for zig cc on Darwin. zig links Mach-O with its
+/// own linker, which has no LTO, and it refuses the flag on the compile and on the link
+/// (`error: LTO requires using LLD`; it has no LLD for Mach-O, so `-fuse-ld=lld` does not
+/// help). The units are still `-O2` with the strict floating-point set; only inlining across
+/// units is lost there. Every other compiler and target keeps the flag.
+fn drop_zig_darwin_lto(spec: &CcSpec, flags: &mut Vec<String>) {
+    if strict_fp() && spec.cmd.first().is_some_and(|c| is_zig(c)) && spec.triple.contains("darwin") {
+        flags.retain(|f| f != "-flto");
+    }
+}
+
+/// Flags that keep IEEE results next to a tcc build of the same C: no
+/// contraction to a fused multiply-add, no reassociation, no reciprocal
+/// rewrite, and libm calls left as calls (`-fmath-errno`). `-flto` is what
+/// lets the optimiser inline across lust's units. Passed again at link time
+/// (`ldflags`): an LTO link re-optimises and must not drop these.
+///
+/// `-fno-builtin-<math>` stops gcc and clang from constant-folding `sin`,
+/// `cos`, `pow` and the rest with their own correctly-rounded maths. tcc
+/// calls libm at run time, and those folds differ in the last bit. On
+/// Windows the runtime defines the same names and forwards them to ucrt
+/// (`float.c`); a builtin would skip that and link zig's or mingw's libm
+/// instead. Not a blanket `-fno-builtin`: on the 80-hex bench that was
+/// within about a millisecond of this list, and `memcpy` stays available.
+pub fn strict_fp_flags() -> String {
+    let mut s = String::from("-flto -fno-fast-math -ffp-contract=off -fno-unsafe-math-optimizations -fno-associative-math -fno-reciprocal-math -fno-finite-math-only -fmath-errno");
+    for name in [
+        "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "sinh", "cosh", "tanh", "exp", "exp2", "expm1", "log", "log2", "log10", "log1p", "pow", "hypot", "sqrt", "floor", "ceil", "round", "trunc", "fma", "fabs", "copysign", "fmod",
+    ] {
+        s.push_str(&format!(" -fno-builtin-{name} -fno-builtin-{name}f"));
+    }
+    s
+}
+
 /// The C flags of every unit, one string so the cache key and the command
 /// line can never disagree.
 pub fn cflags(debug: bool) -> String {
@@ -204,7 +264,28 @@ pub fn cflags(debug: bool) -> String {
     // -g0: zig cc emits DWARF by default, which the release link strips
     // (`ldflags`); on a fn of 400 KB of C it was 7/8 of the compile.
     let base = "-O2 -std=gnu11 -w -fsigned-char -fno-strict-aliasing -fwrapv -fexceptions -fno-asynchronous-unwind-tables -fomit-frame-pointer";
+    let base = if strict_fp() { format!("{base} {}", strict_fp_flags()) } else { base.to_string() };
     if debug { format!("{base} -g") } else { format!("{base} -g0") }
+}
+
+/// `cc --version` (or zig's) for the compiler `spec_for` would run on `triple`,
+/// or the `spec_for` error when this host has none. The `--opt=bg` cache key
+/// holds it, so a toolchain change does not reuse a binary.
+pub fn compiler_stamp(triple: &str) -> String {
+    match spec_for(triple) {
+        Ok(spec) => {
+            let line = Command::new(&spec.cmd[0])
+                .args(&spec.cmd[1..])
+                .arg("--version")
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .and_then(|s| s.lines().next().map(str::to_string))
+                .unwrap_or_default();
+            format!("{} | {line}", spec.cmd.join(" "))
+        }
+        Err(e) => e,
+    }
 }
 
 /// mimalloc as one C unit that replaces malloc and free (`MI_MALLOC_OVERRIDE`): the
@@ -247,6 +328,16 @@ fn ldflags(spec: &CcSpec, debug: bool) -> Vec<String> {
     }
     if spec.cmd.first().is_some_and(|c| is_zig(c)) {
         v.push("-lunwind".into());
+    }
+    // `--opt`: the link re-runs the optimiser under LTO, so it needs the same
+    // floating-point rules as the compile. Windows sockets live in ws2_32;
+    // tcc links that library itself, and a mingw/clang link does not.
+    if strict_fp() {
+        v.extend(strict_fp_flags().split_whitespace().map(str::to_string));
+        drop_zig_darwin_lto(spec, &mut v);
+        if spec.triple.contains("windows") {
+            v.push("-lws2_32".into());
+        }
     }
     // Windows has no libm and no libpthread. The CRT already exports the
     // math functions the float methods call; the rest are in float.c.
@@ -762,7 +853,8 @@ pub fn build_with(
         s.go();
     }
     std::fs::create_dir_all(work).map_err(|e| format!("cannot create {}: {e}", work.display()))?;
-    let flags: Vec<String> = cflags(debug).split_whitespace().map(str::to_string).collect();
+    let mut flags: Vec<String> = cflags(debug).split_whitespace().map(str::to_string).collect();
+    drop_zig_darwin_lto(spec, &mut flags);
     let cxx_flags: Vec<String> = cxxflags(debug).split_whitespace().map(str::to_string).collect();
     let is_cxx = |name: &str| name.ends_with(".cc");
     let rt_max: usize = std::env::var("LUST_LL_RTINL").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -1130,7 +1222,15 @@ pub fn build_with(
         // A build with a C++ unit links with the C++ driver (its runtime and personality).
         let link = if units.iter().any(|u| is_cxx(&u.name)) { &spec.cxx } else { &spec.cmd };
         let mut cmd = cc_command(&link[0]);
-        cmd.args(&link[1..]).args(ldflags(spec, debug)).args(pgo.as_ref().map(pgo::Mode::link_flags).unwrap_or_default()).args(&objs).arg("-o").arg(out);
+        cmd.args(&link[1..]).args(ldflags(spec, debug)).args(pgo.as_ref().map(pgo::Mode::link_flags).unwrap_or_default()).args(&objs);
+        // `-lm` in `ldflags` is before the objects. gcc links with
+        // `--as-needed`, so that scan finds nothing to pull in, and `-flto`
+        // only emits `hypot` (and the other `-fno-builtin-*` libm calls)
+        // afterwards. Search libm again once the objects are on the line.
+        if strict_fp() && !spec.triple.contains("windows") {
+            cmd.arg("-lm");
+        }
+        cmd.arg("-o").arg(out);
         match cmd.output() {
             Ok(o) if o.status.success() => Ok(format!(
                 "{} units ({} from cache, clang {:.2}s, {}link {:.2}s{}), linked {}",

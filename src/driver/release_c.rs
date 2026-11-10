@@ -18,10 +18,42 @@ use crate::cgen::{self, FnOut};
 use crate::check::collect::{LocalDefId, Program};
 use std::sync::Arc;
 
+thread_local! {
+    /// Set for the compile of an `--opt` request: that build wants release C
+    /// (direct calls) even when `LUST_RELEASE_C` is unset, including in the daemon.
+    static OPT_NAMES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Turns release-C names on for this thread while the guard lives. Worker
+/// threads take their names from `cgen::names::with`, not from this flag.
+pub struct OptNames(bool);
+
+impl OptNames {
+    pub fn enter(on: bool) -> Self {
+        let prev = OPT_NAMES.with(|c| c.replace(on));
+        Self(prev)
+    }
+}
+
+impl Drop for OptNames {
+    fn drop(&mut self) {
+        let prev = self.0;
+        OPT_NAMES.with(|c| c.set(prev));
+    }
+}
+
+fn opt_names() -> bool {
+    OPT_NAMES.with(|c| c.get())
+}
+
 /// True when a build writes release C: `LUST_RELEASE_C` set, for a one-shot build or
-/// a release driver build (`cc`) of a persistent session.
+/// a release driver build (`cc`) of a persistent session. An `--opt` build
+/// (`OptNames`) also writes it, daemon included: the optimising compiler has
+/// to see direct calls.
 pub fn on(persistent: bool, cc: bool) -> bool {
-    (!persistent || cc) && std::env::var_os("LUST_RELEASE_C").is_some_and(|v| !v.is_empty() && v != "0")
+    let env = std::env::var_os("LUST_RELEASE_C").is_some_and(|v| !v.is_empty() && v != "0");
+    let opt = opt_names();
+    (!persistent || cc || opt) && (env || opt)
 }
 
 /// What decides a slot's C besides its program: release C or not, debug info, unwind

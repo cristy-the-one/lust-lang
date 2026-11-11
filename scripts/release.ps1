@@ -62,7 +62,8 @@ if ($LASTEXITCODE -ne 0) { throw "tar failed with exit $LASTEXITCODE" }
 Remove-Item -Recurse -Force $stage
 $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
 $leaf = Split-Path $zip -Leaf
-Set-Content -Path "$zip.sha256" -Value "$hash  $leaf" -Encoding ascii -NoNewline
-Add-Content -Path "$zip.sha256" -Value "" -Encoding ascii
+# One line that ends in LF, as sha256sum writes it: with CRLF, `sha256sum -c` takes the
+# carriage return as part of the file name and cannot find the zip.
+[System.IO.File]::WriteAllText("$zip.sha256", "$hash  $leaf`n", [System.Text.Encoding]::ASCII)
 Write-Host "$hash  $leaf"
 Write-Host "wrote $zip"

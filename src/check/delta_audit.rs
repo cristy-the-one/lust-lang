@@ -89,6 +89,7 @@ pub fn digest(p: &Program) -> Vec<(&'static str, u64)> {
         debug_assertions: _, // same
         sandbox: _,          // same
         max_memory: _,       // same
+        time_limit_ms: _,    // same
         unwind_tables: _,   // same
         regions,         // replace (`fns`, `opaque_sigs`); rerun (outlives)
         fp_memo: _,      // the driver clears it

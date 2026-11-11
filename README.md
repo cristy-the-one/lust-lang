@@ -336,7 +336,7 @@ Known limit: one file builds as `rustc --edition 2024 -C panic=abort -C overflow
 
 `--json` prints one diagnostic per line, each with `code`, `message`, `span`, `fix`, and `edits`. The `fix` text tells the user what to write instead. This format exists for coding agents.
 
-`--sandbox` (on `check`, `build`, `run`) is for code a tool or a model wrote: the program may read stdin and write stdout and stderr, and nothing else. Check refuses std paths to the file system, the network, the environment, processes and threads (L0532), and the built program stops before any other OS call. See [docs/sandbox.md](docs/sandbox.md).
+`--sandbox` (on `check`, `build`, `run`) is for code a tool or a model wrote: the program may read stdin and write stdout and stderr, and nothing else. Check refuses std paths to the file system, the network, the environment, processes and threads (L0532), and the built program stops before any other OS call. `build` and `run` also take `--time-limit` (seconds, or `Nms` / `Ns` / `Nm`): the program stops with L0533 when it runs longer. See [docs/sandbox.md](docs/sandbox.md).
 
 `--opt` (on `build` and `run`, with or without `--sandbox`) compiles that same program with an optimising C compiler instead of tcc. `--opt=bg` still links the fast tcc build for this run and starts the optimised build in the background; a later run of the same source installs the cached binary. The default, with neither flag, is unchanged. See [docs/opt.md](docs/opt.md).
 

@@ -450,6 +450,10 @@ pub struct Program {
     /// `--max-memory` (0: none): `main` sets the runtime's limit
     /// (cgen `main_unit`). Set by the driver from the session's profile.
     pub max_memory: u64,
+    /// `--time-limit` in milliseconds (0: none): `main` sets the runtime's
+    /// deadline, and codegen probes loop back-edges and function entries.
+    /// Set by the driver from the session's profile.
+    pub time_limit_ms: u64,
     /// panic=unwind with unwind tables (`lust_unwind_mode` 2, runtime/panic.c): codegen gives
     /// each frame with drops one cleanup variable and stores its ladder entry before calls
     /// that can unwind, instead of a flag check after each call. Needs a C compiler with
@@ -3506,6 +3510,7 @@ pub fn collect_reuse(
         debug_assertions: true,
         sandbox: false,
         max_memory: 0,
+        time_limit_ms: 0,
         unwind_tables: false,
         regions: Default::default(),
         fp_memo: Default::default(),

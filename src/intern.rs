@@ -396,6 +396,7 @@ known_syms!(
     to_bits,
     from_bits,
     copysign,
+    clamp,
     sin,
     cos,
     tan,

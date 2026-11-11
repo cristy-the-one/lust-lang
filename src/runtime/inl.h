@@ -542,6 +542,12 @@ static inline float lust_inl_f32_max_(float a, float b) { return a > b ? a : b >
 #define lust_f64_max(a, b) lust_inl_f64_max_((a), (b))
 #define lust_f32_min(a, b) lust_inl_f32_min_((a), (b))
 #define lust_f32_max(a, b) lust_inl_f32_max_((a), (b))
+/* f64::clamp / f32::clamp, as float.c. The checker only emits the call
+   when lo and hi are literals with lo <= hi. */
+static inline double lust_inl_f64_clamp_(double a, double lo, double hi) { return a < lo ? lo : (a > hi ? hi : a); }
+static inline float lust_inl_f32_clamp_(float a, float lo, float hi) { return a < lo ? lo : (a > hi ? hi : a); }
+#define lust_f64_clamp(a, lo, hi) lust_inl_f64_clamp_((a), (lo), (hi))
+#define lust_f32_clamp(a, lo, hi) lust_inl_f32_clamp_((a), (lo), (hi))
 #define lust_u64_to_f64(v) ((double)(uint64_t)(v))
 #define lust_i64_to_f64(v) ((double)(int64_t)(v))
 #endif

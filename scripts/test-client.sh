@@ -55,6 +55,8 @@ daemon_dirs=()
 # byte, and a slow retry must not fail them. The lines print at the end.
 case_timeout=${CASE_TIMEOUT:-60}
 retry_timeout=${RETRY_CASE_TIMEOUT:-$((case_timeout * 6))}
+# The binary itself, for a case that must start it without the shim.
+lust_bin=$lust
 cat >"$work/lust" <<EOF
 #!/bin/sh
 timeout "$case_timeout" "$lust" "\$@"; st=\$?
@@ -161,6 +163,26 @@ else
 fi
 check "autostart: second build runs" test "$(runb "$d/h2")" = "hello 42"
 check "autostart: log file in cache dir" test -s "$d/.lust-cache/daemon.log"
+stop_daemon "$d"; sleep 0.3
+
+# A caller that reads the client's stdout and stderr through pipes must see
+# end-of-file when the client exits, although the daemon the client started
+# lives on. A daemon that kept a copy of those pipes (Windows copies every
+# inheritable handle into a child) would hold the caller forever. The reads
+# are bounded here, so a failure is a FAIL line and not a hung suite.
+d=$(fresh piped); daemon_dirs+=("$d")
+if (cd "$d" && python3 -c 'import os, subprocess, sys, threading
+p = subprocess.Popen([sys.argv[1], "check", "hello.rs"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+readers = [threading.Thread(target=f.read, daemon=True) for f in (p.stdout, p.stderr)]
+for t in readers: t.start()
+code = p.wait(timeout=120)
+for t in readers: t.join(timeout=10)
+os._exit(0 if code == 0 and not any(t.is_alive() for t in readers) else 1)' "$lust_bin"); then
+  ok "piped caller: stdout and stderr reach end-of-file"
+else
+  bad "piped caller: stdout and stderr reach end-of-file" "the client failed, or a pipe stayed open after it exited"
+fi
+check "piped caller: the daemon started" wait_socket "$d"
 stop_daemon "$d"; sleep 0.3
 
 d=$(fresh nodaemon)

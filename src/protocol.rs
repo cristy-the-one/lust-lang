@@ -1200,6 +1200,55 @@ pub fn clear_inherit_raw(handle: *mut std::ffi::c_void) {
     unsafe { SetHandleInformation(handle, 1, 0) };
 }
 
+/// Turns handle inheritance off on this process's stdin, stdout and stderr,
+/// and returns each handle with the flag it had, for `restore_std_inherit`.
+/// A child started with `CreateProcess(bInheritHandles = TRUE)` gets a copy of
+/// every inheritable handle of its parent, not only the three it is given as
+/// its own standard handles. The client's standard handles are inheritable
+/// (its own parent passed them that way), so without this the detached daemon
+/// keeps the write end of a caller's stdout and stderr pipes for as long as it
+/// lives, and a caller that reads those pipes to end-of-file never sees it.
+#[cfg(windows)]
+pub fn hold_std_inherit() -> [(*mut std::ffi::c_void, u32); 3] {
+    unsafe extern "system" {
+        fn GetStdHandle(id: u32) -> *mut std::ffi::c_void;
+        fn GetHandleInformation(handle: *mut std::ffi::c_void, flags: *mut u32) -> i32;
+        fn SetHandleInformation(handle: *mut std::ffi::c_void, mask: u32, flags: u32) -> i32;
+    }
+    // STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE.
+    [-10i32, -11, -12].map(|id| {
+        // SAFETY: plain Win32 calls on this process's own handles. A null or
+        // invalid handle (no console, a closed stream) fails the query and is
+        // returned with flag 0, which `restore_std_inherit` leaves alone.
+        unsafe {
+            let handle = GetStdHandle(id as u32);
+            let mut flags = 0u32;
+            if handle.is_null() || handle as isize == -1 || GetHandleInformation(handle, &mut flags) == 0 {
+                return (handle, 0);
+            }
+            if flags & 1 != 0 {
+                SetHandleInformation(handle, 1, 0);
+            }
+            (handle, flags & 1)
+        }
+    })
+}
+
+/// Puts back the inheritance flags `hold_std_inherit` cleared, so a later
+/// child of this process (the compiler, a built program) inherits as before.
+#[cfg(windows)]
+pub fn restore_std_inherit(held: [(*mut std::ffi::c_void, u32); 3]) {
+    unsafe extern "system" {
+        fn SetHandleInformation(handle: *mut std::ffi::c_void, mask: u32, flags: u32) -> i32;
+    }
+    for (handle, flag) in held {
+        if flag != 0 {
+            // SAFETY: the handle was valid and inheritable a moment ago, in this process.
+            unsafe { SetHandleInformation(handle, 1, 1) };
+        }
+    }
+}
+
 /// Appends one length-prefixed field: "<byte len>\n<bytes>".
 fn put_field(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes.len().to_string().as_bytes());

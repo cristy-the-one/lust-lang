@@ -28,7 +28,12 @@ use std::path::{Path, PathBuf};
 unsafe extern "C" {
     fn setsid() -> i32;
     fn flock(fd: i32, operation: i32) -> i32;
-    fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
+    // Variadic, as in C: on arm64 macOS a variadic argument is passed on the
+    // stack, so a fixed three-argument declaration would hand `fcntl` garbage.
+    fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    fn getdtablesize() -> i32;
+    #[cfg(target_os = "linux")]
+    fn syscall(number: i64, ...) -> i64;
 }
 #[cfg(unix)]
 const LOCK_EX: i32 = 2;
@@ -36,6 +41,39 @@ const LOCK_EX: i32 = 2;
 const LOCK_NB: i32 = 4;
 #[cfg(unix)]
 const F_SETFD: i32 = 2;
+#[cfg(unix)]
+const FD_CLOEXEC: i32 = 1;
+
+/// Marks every descriptor from 3 up, except `keep`, close-on-exec. Called in
+/// the forked child before it becomes the daemon, so the daemon gets its
+/// stdin, stdout, stderr and the lock, and no other descriptor of this
+/// client. A descriptor the client's caller left inheritable (a pipe the
+/// caller reads to end-of-file, for one) would otherwise stay open in the
+/// daemon for as long as it lives. Only async-signal-safe calls.
+#[cfg(unix)]
+unsafe fn close_others_on_exec(keep: i32) {
+    unsafe {
+        // Linux 5.11 and later: one call per range.
+        #[cfg(target_os = "linux")]
+        {
+            const SYS_CLOSE_RANGE: i64 = 436;
+            const CLOSE_RANGE_CLOEXEC: u32 = 4;
+            let below = keep <= 3 || syscall(SYS_CLOSE_RANGE, 3u32, (keep - 1) as u32, CLOSE_RANGE_CLOEXEC) == 0;
+            let above = syscall(SYS_CLOSE_RANGE, (keep.max(2) + 1) as u32, u32::MAX, CLOSE_RANGE_CLOEXEC) == 0;
+            if below && above {
+                return;
+            }
+        }
+        // Elsewhere, and on an older kernel: one call per possible descriptor.
+        // A call on a number that is not open fails and changes nothing.
+        let end = getdtablesize().clamp(0, 65_536);
+        for fd in 3..end {
+            if fd != keep {
+                fcntl(fd, F_SETFD, FD_CLOEXEC);
+            }
+        }
+    }
+}
 
 /// True when an env flag is set to a value other than "" or "0".
 fn env_on(name: &str) -> bool {
@@ -118,12 +156,14 @@ fn maybe_autostart(sock: &Path, file: &Path, core: &Path, prewarm: bool) {
         }
         // SAFETY: pre_exec runs after fork, before exec. setsid gives the daemon its own
         // session, so it outlives this client and its terminal. Clearing close-on-exec on
-        // the lock fd (in the child only) passes the held flock to the daemon. Both are
-        // plain syscalls; no Rust code runs. This process's copy of the lock fd closes on
-        // its own exec; the daemon's copy stays.
+        // the lock fd (in the child only) passes the held flock to the daemon, and every
+        // other descriptor from 3 up is marked close-on-exec, so the daemon inherits none
+        // of them (`close_others_on_exec`). All plain syscalls; no Rust code runs. This
+        // process's copy of the lock fd closes on its own exec; the daemon's copy stays.
         unsafe {
             cmd.pre_exec(move || {
                 setsid();
+                close_others_on_exec(lock_fd);
                 fcntl(lock_fd, F_SETFD, 0);
                 Ok(())
             });

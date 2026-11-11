@@ -7653,6 +7653,7 @@ fn occt_extern(symbol: &str) -> &'static str {
             | B::FloatIsSignNegative
             | B::FloatToBits
             | B::FloatCopysign
+            | B::FloatClamp
             | B::FloatSin
             | B::FloatCos
             | B::FloatTan
@@ -10020,6 +10021,7 @@ fn occt_extern(symbol: &str) -> &'static str {
             B::FloatMin => format!("lust_{w}_min({a}, {})", vals[1]),
             B::FloatMax => format!("lust_{w}_max({a}, {})", vals[1]),
             B::FloatCopysign => format!("copysign{suf}({a}, {})", vals[1]),
+            B::FloatClamp => format!("lust_{w}_clamp({a}, {}, {})", vals[1], vals[2]),
             B::FloatSin => format!("sin{suf}({a})"),
             B::FloatCos => format!("cos{suf}({a})"),
             B::FloatTan => format!("tan{suf}({a})"),

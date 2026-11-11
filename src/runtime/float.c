@@ -1560,6 +1560,13 @@ float lust_f32_max(float a, float b) {
     return a == a ? a : b;
 }
 
+/* f64::clamp and f32::clamp. The checker only emits these when lo and hi
+   are literals with lo <= hi, so the rustc panic (min > max, or a NaN
+   bound) cannot happen. NaN input stays NaN. -0.0 stays -0.0 inside the
+   range, because -0.0 < 0.0 is false. */
+double lust_f64_clamp(double a, double lo, double hi) { return a < lo ? lo : (a > hi ? hi : a); }
+float lust_f32_clamp(float a, float lo, float hi) { return a < lo ? lo : (a > hi ? hi : a); }
+
 double lust_f64_signum(double a) {
     if (a > 0) return 1.0;
     if (a < 0) return -1.0;

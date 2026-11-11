@@ -110,9 +110,15 @@ fn maybe_autostart(sock: &Path, file: &Path, core: &Path, prewarm: bool) {
         cmd.env("LUST_DAEMON_LOCK_HANDLE", (lock.as_raw_handle() as usize).to_string());
         cmd.creation_flags(protocol::DETACH_FLAGS);
     }
-    if let Ok(f) = log {
-        if let Ok(f2) = f.try_clone() {
+    // The daemon writes to its log, never to this client's stdout or stderr:
+    // those may be a caller's pipes, and a daemon that held them would keep
+    // the caller from ever reading end-of-file. With no log, it writes nowhere.
+    match log.and_then(|f| f.try_clone().map(|f2| (f, f2))) {
+        Ok((f, f2)) => {
             cmd.stdout(f).stderr(f2);
+        }
+        Err(_) => {
+            cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
         }
     }
     // SAFETY: pre_exec runs after fork, before exec. setsid gives the daemon its own
@@ -130,7 +136,15 @@ fn maybe_autostart(sock: &Path, file: &Path, core: &Path, prewarm: bool) {
     }
     // Not waited on: the daemon is reparented and serves in the background. This
     // process's copy of the lock fd closes on its own exec; the daemon's copy stays.
-    if let Err(e) = cmd.spawn() {
+    // Windows: the spawn copies every inheritable handle into the daemon, so
+    // this client's own standard handles are made non-inheritable around it
+    // (`protocol::hold_std_inherit`). The lock handle stays inheritable.
+    #[cfg(windows)]
+    let held = protocol::hold_std_inherit();
+    let spawned = cmd.spawn();
+    #[cfg(windows)]
+    protocol::restore_std_inherit(held);
+    if let Err(e) = spawned {
         eprintln!("note: could not start a background daemon: {e}");
     }
 }

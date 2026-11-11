@@ -1200,53 +1200,193 @@ pub fn clear_inherit_raw(handle: *mut std::ffi::c_void) {
     unsafe { SetHandleInformation(handle, 1, 0) };
 }
 
-/// Turns handle inheritance off on this process's stdin, stdout and stderr,
-/// and returns each handle with the flag it had, for `restore_std_inherit`.
-/// A child started with `CreateProcess(bInheritHandles = TRUE)` gets a copy of
-/// every inheritable handle of its parent, not only the three it is given as
-/// its own standard handles. The client's standard handles are inheritable
-/// (its own parent passed them that way), so without this the detached daemon
-/// keeps the write end of a caller's stdout and stderr pipes for as long as it
-/// lives, and a caller that reads those pipes to end-of-file never sees it.
+/// Starts `<exe> daemon` detached, and lets it inherit exactly four handles:
+/// NUL as stdin, `log` (or NUL) as stdout and stderr, and `lock`.
+///
+/// `CreateProcess(bInheritHandles = TRUE)` gives a child a copy of every
+/// inheritable handle of its parent. This client's own stdin, stdout and
+/// stderr are inheritable, and so is anything else its parent passed down
+/// (a host's own output pipe, for one). A daemon that kept those would hold a
+/// caller's pipes open for as long as it lives, and a caller that reads them
+/// to end-of-file would never see it. `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`
+/// names the handles the child gets, and it gets no others. std has this only
+/// behind an unstable feature, so the call is made here.
+///
+/// `env` is added to this process's environment for the daemon; a name
+/// already set is replaced.
 #[cfg(windows)]
-pub fn hold_std_inherit() -> [(*mut std::ffi::c_void, u32); 3] {
-    unsafe extern "system" {
-        fn GetStdHandle(id: u32) -> *mut std::ffi::c_void;
-        fn GetHandleInformation(handle: *mut std::ffi::c_void, flags: *mut u32) -> i32;
-        fn SetHandleInformation(handle: *mut std::ffi::c_void, mask: u32, flags: u32) -> i32;
-    }
-    // STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE.
-    [-10i32, -11, -12].map(|id| {
-        // SAFETY: plain Win32 calls on this process's own handles. A null or
-        // invalid handle (no console, a closed stream) fails the query and is
-        // returned with flag 0, which `restore_std_inherit` leaves alone.
-        unsafe {
-            let handle = GetStdHandle(id as u32);
-            let mut flags = 0u32;
-            if handle.is_null() || handle as isize == -1 || GetHandleInformation(handle, &mut flags) == 0 {
-                return (handle, 0);
-            }
-            if flags & 1 != 0 {
-                SetHandleInformation(handle, 1, 0);
-            }
-            (handle, flags & 1)
-        }
-    })
-}
+pub fn spawn_daemon(
+    exe: &Path,
+    env: &[(std::ffi::OsString, std::ffi::OsString)],
+    log: Option<(std::fs::File, std::fs::File)>,
+    lock: &std::fs::File,
+) -> std::io::Result<()> {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
 
-/// Puts back the inheritance flags `hold_std_inherit` cleared, so a later
-/// child of this process (the compiler, a built program) inherits as before.
-#[cfg(windows)]
-pub fn restore_std_inherit(held: [(*mut std::ffi::c_void, u32); 3]) {
+    #[repr(C)]
+    struct StartupInfo {
+        cb: u32,
+        reserved: *mut u16,
+        desktop: *mut u16,
+        title: *mut u16,
+        x: u32,
+        y: u32,
+        x_size: u32,
+        y_size: u32,
+        x_count_chars: u32,
+        y_count_chars: u32,
+        fill_attribute: u32,
+        flags: u32,
+        show_window: u16,
+        cb_reserved2: u16,
+        reserved2: *mut u8,
+        std_input: *mut c_void,
+        std_output: *mut c_void,
+        std_error: *mut c_void,
+    }
+    #[repr(C)]
+    struct StartupInfoEx {
+        startup: StartupInfo,
+        attribute_list: *mut c_void,
+    }
+    #[repr(C)]
+    struct ProcessInformation {
+        process: *mut c_void,
+        thread: *mut c_void,
+        process_id: u32,
+        thread_id: u32,
+    }
     unsafe extern "system" {
-        fn SetHandleInformation(handle: *mut std::ffi::c_void, mask: u32, flags: u32) -> i32;
+        fn InitializeProcThreadAttributeList(list: *mut c_void, count: u32, flags: u32, size: *mut usize) -> i32;
+        fn UpdateProcThreadAttribute(
+            list: *mut c_void,
+            flags: u32,
+            attribute: usize,
+            value: *const c_void,
+            size: usize,
+            previous: *mut c_void,
+            return_size: *mut usize,
+        ) -> i32;
+        fn DeleteProcThreadAttributeList(list: *mut c_void);
+        fn CreateProcessW(
+            application: *const u16,
+            command_line: *mut u16,
+            process_attributes: *const c_void,
+            thread_attributes: *const c_void,
+            inherit_handles: i32,
+            creation_flags: u32,
+            environment: *const c_void,
+            current_directory: *const u16,
+            startup_info: *const StartupInfo,
+            process_information: *mut ProcessInformation,
+        ) -> i32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
     }
-    for (handle, flag) in held {
-        if flag != 0 {
-            // SAFETY: the handle was valid and inheritable a moment ago, in this process.
-            unsafe { SetHandleInformation(handle, 1, 1) };
+    const PROC_THREAD_ATTRIBUTE_HANDLE_LIST: usize = 0x0002_0002;
+    const STARTF_USESTDHANDLES: u32 = 0x0000_0100;
+    const CREATE_UNICODE_ENVIRONMENT: u32 = 0x0000_0400;
+    const EXTENDED_STARTUPINFO_PRESENT: u32 = 0x0008_0000;
+
+    // Four distinct handles: a handle list must not name one twice.
+    let nul = std::fs::OpenOptions::new().read(true).write(true).open("NUL")?;
+    let (out, err) = match log {
+        Some(pair) => pair,
+        None => (nul.try_clone()?, nul.try_clone()?),
+    };
+    for file in [&nul, &out, &err, lock] {
+        set_inherit(file, true);
+    }
+    let handles: [*mut c_void; 4] =
+        [nul.as_raw_handle() as *mut c_void, out.as_raw_handle() as *mut c_void, err.as_raw_handle() as *mut c_void, lock.as_raw_handle() as *mut c_void];
+
+    // `"<exe>" daemon`. CreateProcessW may write into the command line.
+    let application: Vec<u16> = exe.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut command_line: Vec<u16> = std::iter::once(u16::from(b'"'))
+        .chain(exe.as_os_str().encode_wide())
+        .chain("\" daemon".encode_utf16())
+        .chain(std::iter::once(0))
+        .collect();
+
+    // The environment block: this process's variables, with `env` on top.
+    // Names compare without case on Windows.
+    let same_name = |a: &std::ffi::OsStr, b: &std::ffi::OsStr| a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy());
+    let mut vars: Vec<(std::ffi::OsString, std::ffi::OsString)> =
+        std::env::vars_os().filter(|(name, _)| !env.iter().any(|(added, _)| same_name(name, added))).collect();
+    vars.extend(env.iter().cloned());
+    let mut block: Vec<u16> = Vec::new();
+    for (name, value) in &vars {
+        block.extend(name.encode_wide());
+        block.push(u16::from(b'='));
+        block.extend(value.encode_wide());
+        block.push(0);
+    }
+    block.push(0);
+    if vars.is_empty() {
+        block.push(0);
+    }
+
+    // SAFETY: plain Win32 calls. Every pointer is to a live local: the
+    // attribute list buffer and `handles` outlive CreateProcessW, the strings
+    // are NUL-terminated, and the structs are zeroed where Windows wants zero.
+    let result = unsafe {
+        let mut size = 0usize;
+        InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut size);
+        let mut list = vec![0u8; size.max(1)];
+        let list_ptr = list.as_mut_ptr() as *mut c_void;
+        if InitializeProcThreadAttributeList(list_ptr, 1, 0, &mut size) == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            let updated = UpdateProcThreadAttribute(
+                list_ptr,
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                handles.as_ptr() as *const c_void,
+                std::mem::size_of_val(&handles),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            let spawned = if updated == 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                let mut info: StartupInfoEx = std::mem::zeroed();
+                info.startup.cb = std::mem::size_of::<StartupInfoEx>() as u32;
+                info.startup.flags = STARTF_USESTDHANDLES;
+                info.startup.std_input = handles[0];
+                info.startup.std_output = handles[1];
+                info.startup.std_error = handles[2];
+                info.attribute_list = list_ptr;
+                let mut process: ProcessInformation = std::mem::zeroed();
+                let created = CreateProcessW(
+                    application.as_ptr(),
+                    command_line.as_mut_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    1,
+                    DETACH_FLAGS | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
+                    block.as_ptr() as *const c_void,
+                    std::ptr::null(),
+                    &info.startup,
+                    &mut process,
+                );
+                if created == 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    // Not waited on: the daemon serves in the background.
+                    CloseHandle(process.thread);
+                    CloseHandle(process.process);
+                    Ok(())
+                }
+            };
+            DeleteProcThreadAttributeList(list_ptr);
+            spawned
         }
-    }
+    };
+    // The daemon has its own copy of the lock now. This client's copy goes
+    // back to private, so the compiler it starts next does not get one too.
+    set_inherit(lock, false);
+    result
 }
 
 /// Appends one length-prefixed field: "<byte len>\n<bytes>".

@@ -28,7 +28,12 @@ use std::path::{Path, PathBuf};
 unsafe extern "C" {
     fn setsid() -> i32;
     fn flock(fd: i32, operation: i32) -> i32;
-    fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
+    // Variadic, as in C: on arm64 macOS a variadic argument is passed on the
+    // stack, so a fixed three-argument declaration would hand `fcntl` garbage.
+    fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    fn getdtablesize() -> i32;
+    #[cfg(target_os = "linux")]
+    fn syscall(number: i64, ...) -> i64;
 }
 #[cfg(unix)]
 const LOCK_EX: i32 = 2;
@@ -36,6 +41,39 @@ const LOCK_EX: i32 = 2;
 const LOCK_NB: i32 = 4;
 #[cfg(unix)]
 const F_SETFD: i32 = 2;
+#[cfg(unix)]
+const FD_CLOEXEC: i32 = 1;
+
+/// Marks every descriptor from 3 up, except `keep`, close-on-exec. Called in
+/// the forked child before it becomes the daemon, so the daemon gets its
+/// stdin, stdout, stderr and the lock, and no other descriptor of this
+/// client. A descriptor the client's caller left inheritable (a pipe the
+/// caller reads to end-of-file, for one) would otherwise stay open in the
+/// daemon for as long as it lives. Only async-signal-safe calls.
+#[cfg(unix)]
+unsafe fn close_others_on_exec(keep: i32) {
+    unsafe {
+        // Linux 5.11 and later: one call per range.
+        #[cfg(target_os = "linux")]
+        {
+            const SYS_CLOSE_RANGE: i64 = 436;
+            const CLOSE_RANGE_CLOEXEC: u32 = 4;
+            let below = keep <= 3 || syscall(SYS_CLOSE_RANGE, 3u32, (keep - 1) as u32, CLOSE_RANGE_CLOEXEC) == 0;
+            let above = syscall(SYS_CLOSE_RANGE, (keep.max(2) + 1) as u32, u32::MAX, CLOSE_RANGE_CLOEXEC) == 0;
+            if below && above {
+                return;
+            }
+        }
+        // Elsewhere, and on an older kernel: one call per possible descriptor.
+        // A call on a number that is not open fails and changes nothing.
+        let end = getdtablesize().clamp(0, 65_536);
+        for fd in 3..end {
+            if fd != keep {
+                fcntl(fd, F_SETFD, FD_CLOEXEC);
+            }
+        }
+    }
+}
 
 /// True when an env flag is set to a value other than "" or "0".
 fn env_on(name: &str) -> bool {
@@ -90,60 +128,57 @@ fn maybe_autostart(sock: &Path, file: &Path, core: &Path, prewarm: bool) {
     let dir = log_dir(file);
     let _ = std::fs::create_dir_all(&dir);
     let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("daemon.log"));
-    let mut cmd = std::process::Command::new(core);
-    // The daemon pre-warms a session for this file, so the next command is warm. It
-    // waits for this process to exit first (exec keeps the pid, so that is the cold
-    // compile), so the pre-warm never competes with the command in front of it.
-    cmd.arg("daemon").envs(daemon_alloc_env()).stdin(std::process::Stdio::null());
-    if prewarm {
-        cmd.env("LUST_DAEMON_PREWARM", file).env("LUST_DAEMON_PREWARM_AFTER", std::process::id().to_string());
-    }
-    #[cfg(unix)]
-    {
-        cmd.env("LUST_DAEMON_LOCK_FD", lock_fd.to_string());
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::io::AsRawHandle;
-        use std::os::windows::process::CommandExt;
-        protocol::set_inherit(&lock, true);
-        cmd.env("LUST_DAEMON_LOCK_HANDLE", (lock.as_raw_handle() as usize).to_string());
-        cmd.creation_flags(protocol::DETACH_FLAGS);
-    }
     // The daemon writes to its log, never to this client's stdout or stderr:
     // those may be a caller's pipes, and a daemon that held them would keep
     // the caller from ever reading end-of-file. With no log, it writes nowhere.
-    match log.and_then(|f| f.try_clone().map(|f2| (f, f2))) {
-        Ok((f, f2)) => {
-            cmd.stdout(f).stderr(f2);
-        }
-        Err(_) => {
-            cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
-        }
+    let log = log.and_then(|f| f.try_clone().map(|f2| (f, f2))).ok();
+    // The daemon pre-warms a session for this file, so the next command is warm. It
+    // waits for this process to exit first (exec keeps the pid, so that is the cold
+    // compile), so the pre-warm never competes with the command in front of it.
+    let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> = daemon_alloc_env().into_iter().map(|(k, v)| (k.into(), v.into())).collect();
+    if prewarm {
+        env.push(("LUST_DAEMON_PREWARM".into(), file.as_os_str().to_os_string()));
+        env.push(("LUST_DAEMON_PREWARM_AFTER".into(), std::process::id().to_string().into()));
     }
-    // SAFETY: pre_exec runs after fork, before exec. setsid gives the daemon its own
-    // session, so it outlives this client and its terminal. Clearing close-on-exec on
-    // the lock fd (in the child only) passes the held flock to the daemon. Both are
-    // plain syscalls; no Rust code runs. Windows passes the lock handle instead
-    // (`LUST_DAEMON_LOCK_HANDLE`) and detaches with creation flags above.
+    // Not waited on: the daemon is reparented and serves in the background.
     #[cfg(unix)]
-    unsafe {
-        cmd.pre_exec(move || {
-            setsid();
-            fcntl(lock_fd, F_SETFD, 0);
-            Ok(())
-        });
-    }
-    // Not waited on: the daemon is reparented and serves in the background. This
-    // process's copy of the lock fd closes on its own exec; the daemon's copy stays.
-    // Windows: the spawn copies every inheritable handle into the daemon, so
-    // this client's own standard handles are made non-inheritable around it
-    // (`protocol::hold_std_inherit`). The lock handle stays inheritable.
+    let spawned = {
+        let mut cmd = std::process::Command::new(core);
+        cmd.arg("daemon").envs(env).stdin(std::process::Stdio::null());
+        cmd.env("LUST_DAEMON_LOCK_FD", lock_fd.to_string());
+        match log {
+            Some((f, f2)) => {
+                cmd.stdout(f).stderr(f2);
+            }
+            None => {
+                cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+            }
+        }
+        // SAFETY: pre_exec runs after fork, before exec. setsid gives the daemon its own
+        // session, so it outlives this client and its terminal. Clearing close-on-exec on
+        // the lock fd (in the child only) passes the held flock to the daemon, and every
+        // other descriptor from 3 up is marked close-on-exec, so the daemon inherits none
+        // of them (`close_others_on_exec`). All plain syscalls; no Rust code runs. This
+        // process's copy of the lock fd closes on its own exec; the daemon's copy stays.
+        unsafe {
+            cmd.pre_exec(move || {
+                setsid();
+                close_others_on_exec(lock_fd);
+                fcntl(lock_fd, F_SETFD, 0);
+                Ok(())
+            });
+        }
+        cmd.spawn().map(|_| ())
+    };
+    // Windows passes the lock as a handle (`LUST_DAEMON_LOCK_HANDLE`), detaches with
+    // creation flags, and names the only handles the daemon may inherit
+    // (`protocol::spawn_daemon`).
     #[cfg(windows)]
-    let held = protocol::hold_std_inherit();
-    let spawned = cmd.spawn();
-    #[cfg(windows)]
-    protocol::restore_std_inherit(held);
+    let spawned = {
+        use std::os::windows::io::AsRawHandle;
+        env.push(("LUST_DAEMON_LOCK_HANDLE".into(), (lock.as_raw_handle() as usize).to_string().into()));
+        protocol::spawn_daemon(core, &env, log, &lock)
+    };
     if let Err(e) = spawned {
         eprintln!("note: could not start a background daemon: {e}");
     }

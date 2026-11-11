@@ -17749,6 +17749,7 @@ impl<'p> Ctx<'p> {
                 // The str search methods take std's `Pattern`: a char
                 // in the pattern position becomes its encoding as a
                 // &str (`Coerce::CharPat`), which searches the same.
+                let err_mark = self.errs.len();
                 if matches!(b, B::StrContains | B::StrFind | B::StrRfind | B::StrStartsWith | B::StrEndsWith | B::StrStripPrefix | B::StrStripSuffix | B::StrReplace | B::StrReplacen)
                     && args.len() == params.len()
                     && !args.is_empty()
@@ -17757,7 +17758,10 @@ impl<'p> Ctx<'p> {
                 } else {
                     self.check_args(&params, args, name_span);
                 }
-                if b == B::FloatClamp {
+                // A type error (an integer bound, a wrong suffix) is the
+                // one to show. L9001 is for bounds that type-check and
+                // still are not literals with min <= max.
+                if b == B::FloatClamp && self.errs.len() == err_mark {
                     let ft = match self.kind(base) {
                         TyKind::Float(f) => f,
                         _ => FloatTy::F64,

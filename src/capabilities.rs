@@ -1670,6 +1670,7 @@ const REJECTED: &[(&str, &str)] = &[
     ("std and sysroot crate items lust does not have yet, by module path (named in the message)", "L0505"),
     ("refutable patterns here (a const pattern in a closure parameter; rustc rejects it too, E0005)", "L9001"),
     ("`mem::take` on this type (a generic `T: Default`)", "L9001"),
+    ("`clamp` on `f64` or `f32` unless both bounds are float literals with min <= max", "L9001"),
     ("`cmp::max`/`cmp::min` on this type (one that a later use fixes)", "L9001"),
     ("`cmp::max`/`cmp::min` on tuples (`Ord::max` as a function)", "L0641"),
     ("this std function used as a value", "L9001"),

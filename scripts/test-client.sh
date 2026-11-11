@@ -185,6 +185,32 @@ fi
 check "piped caller: the daemon started" wait_socket "$d"
 stop_daemon "$d"; sleep 0.3
 
+# The daemon gets the handles the client names for it and no others. A caller
+# that holds some other inheritable pipe and starts the client with handle
+# inheritance on must still see that pipe close: the client exits, the caller
+# closes its own write end, and a read then reaches end-of-file. A daemon that
+# inherited a copy of the write end would hold it open. The read is bounded.
+d=$(fresh extrahandle); daemon_dirs+=("$d")
+if (cd "$d" && python3 -c 'import os, subprocess, sys, threading
+r, w = os.pipe()
+os.set_inheritable(w, True)
+p = subprocess.Popen([sys.argv[1], "check", "hello.rs"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=False)
+readers = [threading.Thread(target=f.read, daemon=True) for f in (p.stdout, p.stderr)]
+for t in readers: t.start()
+code = p.wait(timeout=120)
+os.close(w)
+done = threading.Event()
+threading.Thread(target=lambda: (os.read(r, 1), done.set()), daemon=True).start()
+closed = done.wait(10)
+for t in readers: t.join(timeout=10)
+os._exit(0 if code == 0 and closed and not any(t.is_alive() for t in readers) else 1)' "$lust_bin"); then
+  ok "extra handle: the daemon does not keep a caller's other pipe"
+else
+  bad "extra handle: the daemon does not keep a caller's other pipe" "the client failed, or the pipe stayed open after it exited"
+fi
+check "extra handle: the daemon started" wait_socket "$d"
+stop_daemon "$d"; sleep 0.3
+
 d=$(fresh nodaemon)
 (cd "$d" && LUST_NO_DAEMON=1 "$lust" check hello.rs) >/dev/null 2>&1
 sleep 0.5

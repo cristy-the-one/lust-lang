@@ -90,60 +90,55 @@ fn maybe_autostart(sock: &Path, file: &Path, core: &Path, prewarm: bool) {
     let dir = log_dir(file);
     let _ = std::fs::create_dir_all(&dir);
     let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("daemon.log"));
-    let mut cmd = std::process::Command::new(core);
-    // The daemon pre-warms a session for this file, so the next command is warm. It
-    // waits for this process to exit first (exec keeps the pid, so that is the cold
-    // compile), so the pre-warm never competes with the command in front of it.
-    cmd.arg("daemon").envs(daemon_alloc_env()).stdin(std::process::Stdio::null());
-    if prewarm {
-        cmd.env("LUST_DAEMON_PREWARM", file).env("LUST_DAEMON_PREWARM_AFTER", std::process::id().to_string());
-    }
-    #[cfg(unix)]
-    {
-        cmd.env("LUST_DAEMON_LOCK_FD", lock_fd.to_string());
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::io::AsRawHandle;
-        use std::os::windows::process::CommandExt;
-        protocol::set_inherit(&lock, true);
-        cmd.env("LUST_DAEMON_LOCK_HANDLE", (lock.as_raw_handle() as usize).to_string());
-        cmd.creation_flags(protocol::DETACH_FLAGS);
-    }
     // The daemon writes to its log, never to this client's stdout or stderr:
     // those may be a caller's pipes, and a daemon that held them would keep
     // the caller from ever reading end-of-file. With no log, it writes nowhere.
-    match log.and_then(|f| f.try_clone().map(|f2| (f, f2))) {
-        Ok((f, f2)) => {
-            cmd.stdout(f).stderr(f2);
-        }
-        Err(_) => {
-            cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
-        }
+    let log = log.and_then(|f| f.try_clone().map(|f2| (f, f2))).ok();
+    // The daemon pre-warms a session for this file, so the next command is warm. It
+    // waits for this process to exit first (exec keeps the pid, so that is the cold
+    // compile), so the pre-warm never competes with the command in front of it.
+    let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> = daemon_alloc_env().into_iter().map(|(k, v)| (k.into(), v.into())).collect();
+    if prewarm {
+        env.push(("LUST_DAEMON_PREWARM".into(), file.as_os_str().to_os_string()));
+        env.push(("LUST_DAEMON_PREWARM_AFTER".into(), std::process::id().to_string().into()));
     }
-    // SAFETY: pre_exec runs after fork, before exec. setsid gives the daemon its own
-    // session, so it outlives this client and its terminal. Clearing close-on-exec on
-    // the lock fd (in the child only) passes the held flock to the daemon. Both are
-    // plain syscalls; no Rust code runs. Windows passes the lock handle instead
-    // (`LUST_DAEMON_LOCK_HANDLE`) and detaches with creation flags above.
+    // Not waited on: the daemon is reparented and serves in the background.
     #[cfg(unix)]
-    unsafe {
-        cmd.pre_exec(move || {
-            setsid();
-            fcntl(lock_fd, F_SETFD, 0);
-            Ok(())
-        });
-    }
-    // Not waited on: the daemon is reparented and serves in the background. This
-    // process's copy of the lock fd closes on its own exec; the daemon's copy stays.
-    // Windows: the spawn copies every inheritable handle into the daemon, so
-    // this client's own standard handles are made non-inheritable around it
-    // (`protocol::hold_std_inherit`). The lock handle stays inheritable.
+    let spawned = {
+        let mut cmd = std::process::Command::new(core);
+        cmd.arg("daemon").envs(env).stdin(std::process::Stdio::null());
+        cmd.env("LUST_DAEMON_LOCK_FD", lock_fd.to_string());
+        match log {
+            Some((f, f2)) => {
+                cmd.stdout(f).stderr(f2);
+            }
+            None => {
+                cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+            }
+        }
+        // SAFETY: pre_exec runs after fork, before exec. setsid gives the daemon its own
+        // session, so it outlives this client and its terminal. Clearing close-on-exec on
+        // the lock fd (in the child only) passes the held flock to the daemon. Both are
+        // plain syscalls; no Rust code runs. This process's copy of the lock fd closes on
+        // its own exec; the daemon's copy stays.
+        unsafe {
+            cmd.pre_exec(move || {
+                setsid();
+                fcntl(lock_fd, F_SETFD, 0);
+                Ok(())
+            });
+        }
+        cmd.spawn().map(|_| ())
+    };
+    // Windows passes the lock as a handle (`LUST_DAEMON_LOCK_HANDLE`), detaches with
+    // creation flags, and names the only handles the daemon may inherit
+    // (`protocol::spawn_daemon`).
     #[cfg(windows)]
-    let held = protocol::hold_std_inherit();
-    let spawned = cmd.spawn();
-    #[cfg(windows)]
-    protocol::restore_std_inherit(held);
+    let spawned = {
+        use std::os::windows::io::AsRawHandle;
+        env.push(("LUST_DAEMON_LOCK_HANDLE".into(), (lock.as_raw_handle() as usize).to_string().into()));
+        protocol::spawn_daemon(core, &env, log, &lock)
+    };
     if let Err(e) = spawned {
         eprintln!("note: could not start a background daemon: {e}");
     }

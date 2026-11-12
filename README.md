@@ -310,7 +310,8 @@ lust check main.rs --rustc                  # ask the real rustc for a second op
 lust build main.rs --release                # release build with Cargo (rustc -O for one file)
 lust fix main.rs [--all] [--dry-run]        # apply the edits the diagnostics carry, then check again
 lust explain L0602                          # long help for one error code
-lust capabilities --json                    # what the subset supports and rejects
+lust capabilities --json                    # what the subset supports and rejects, and the command line
+lust capabilities --summary [--sandbox]     # the short form, for a prompt
 ```
 
 `lust watch check` repeats that check when a source file, `Cargo.toml`, or `Cargo.lock` is saved. It keeps the working directory and the check flags (target, features, profile, `--sandbox`) and sends each check through the same client, so an already warm daemon session stays warm. `target/`, `.lust-cache`, and `$CARGO_TARGET_DIR` are not watched. Edits that land together become one check: the quiet period restarts when the saved bytes change, and a notification that does not change those bytes does not start another. An edit that lands while a check is running schedules one more check, and the diagnostics from the check that was in flight are marked `stale` until a later check matches the saved tree (`current`). Ctrl-C stops the watcher, the check it is running, and a daemon that this watch started. `watch` does not run tests or build. The watcher is a separate program (`lust-watch`); `check`, `build`, and `run` do not load it.
@@ -358,7 +359,7 @@ fn main() {
 
 ## Supported subset
 
-`lust capabilities` prints the long lists: every std method lust knows, and the messages of its rejects. Each of its item, type, attribute, syntax, and reject lines has a probe in [tests/capabilities](tests/capabilities) that the gate runs (`scripts/test-capabilities.py`), so a stale line fails the gate. The lists below come from probes run against rustc on 2026-10-17.
+`lust capabilities` prints the long lists: every std method lust knows, and the messages of its rejects. Each of its item, type, attribute, syntax, and reject lines has a probe in [tests/capabilities](tests/capabilities) that the gate runs (`scripts/test-capabilities.py`), so a stale line fails the gate. `--summary` is a short form for a model's prompt; `--sandbox --summary` is the same for a `--sandbox` build, with the sandbox's refusals in the list of refusals. The `interface` object of `--json` states the command line for a host that should not read the usage text: `version` and `build` (as `lust --version` prints them), `commands`, and `flags`, each command's flags as the usage text spells them (`{"check":["--json",...,"--sandbox",...],...}`). It comes from one table in `src/capabilities.rs`, and unit tests there fail when the usage text or a parser names a flag that table does not, or the other way round. The lists below come from probes run against rustc on 2026-10-17.
 
 Supported today:
 

@@ -14,6 +14,10 @@ code; for a rejected line it must be the line's own code. The test fails when:
   - a supported probe does not run or a rejected probe is not rejected with its code,
   - a line in a checked section has no probe and is not in UNPROBED.
 
+It also checks the `"interface"` object of `lust capabilities --json` (the version,
+the build hash, the commands and each command's flags) against `lust --version` and
+the usage text, and `lust capabilities --sandbox --summary`.
+
 Usage: scripts/test-capabilities.py [lust binary]   (default target/release/lust)
 """
 import json
@@ -91,11 +95,69 @@ def first_error(text):
     return text.strip().splitlines()[0] if text.strip() else "(no output)"
 
 
+def check_interface(lust, cap):
+    """The `interface` object and `--sandbox --summary`. Returns failure lines."""
+    fails = []
+    run = lambda *args: subprocess.run([lust, *args], capture_output=True, text=True, timeout=60)
+    iface = cap.get("interface")
+    if not isinstance(iface, dict):
+        return ["interface: `lust capabilities --json` has no `interface` object"]
+    if set(iface) != {"version", "build", "commands", "flags"}:
+        fails.append(f"interface: keys are {sorted(iface)}")
+    version = run("--version").stdout.strip()
+    if version != f"lust {iface.get('version')} (build {iface.get('build')})":
+        fails.append(f"interface: version {iface.get('version')!r} and build {iface.get('build')!r} do not match `lust --version`: {version!r}")
+    commands, flags = iface.get("commands", []), iface.get("flags", {})
+    if sorted(flags) != sorted(commands):
+        fails.append(f"interface: flags has commands {sorted(flags)}, commands is {sorted(commands)}")
+    # The existing top-level `commands` list keeps its meaning; every name in it is a command.
+    if not set(cap["commands"]) <= set(commands):
+        fails.append(f"interface: the top-level commands {cap['commands']} are not all in {commands}")
+    want = {
+        "check": {"--json", "--sandbox", "--manifest-path", "--features", "--rustc"},
+        "build": {"--json", "--sandbox", "--max-memory", "--time-limit", "--opt", "-o", "--release"},
+        "run": {"--sandbox", "--max-memory", "--time-limit", "--"},
+        "test": {"--json", "--timeout", "--manifest-path"},
+        "fix": {"--all", "--dry-run", "--sandbox", "--manifest-path"},
+        "capabilities": {"--json", "--summary", "--sandbox"},
+    }
+    for cmd, names in want.items():
+        got = flags.get(cmd, [])
+        if len(got) != len(set(got)):
+            fails.append(f"interface: `{cmd}` lists a flag twice: {got}")
+        if not names <= set(got):
+            fails.append(f"interface: `{cmd}` misses {sorted(names - set(got))}")
+    for cmd, never in {"check": {"--max-memory", "--time-limit", "--opt", "-o"}, "explain": {"--json"}}.items():
+        if never & set(flags.get(cmd, [])):
+            fails.append(f"interface: `{cmd}` lists {sorted(never & set(flags.get(cmd, [])))}, which it does not take")
+    # Every flag is in the usage text, which `lust` with no arguments prints.
+    usage = run()
+    text = usage.stderr + usage.stdout
+    words = set(re.findall(r"(?<![\w-])(--?[A-Za-z][\w=-]*|--)(?![\w-])", text))
+    for cmd, names in flags.items():
+        missing = [n for n in names if n not in words]
+        if missing:
+            fails.append(f"interface: `{cmd}` flags not in the usage text: {missing}")
+    # `--sandbox --summary`: the sandbox refusals are in the main list.
+    plain, sandboxed = run("capabilities", "--summary"), run("capabilities", "--sandbox", "--summary")
+    if sandboxed.returncode != 0 or run("capabilities", "--summary", "--sandbox").stdout != sandboxed.stdout:
+        fails.append(f"--sandbox --summary: exit {sandboxed.returncode}, or the flag order changes the text: {sandboxed.stderr.strip()}")
+    refused = sandboxed.stdout.split("Refused:\n", 1)[-1]
+    for line in ["- `std::fs`", "- `std::net`", "- `std::env`", "- `std::process` other than `exit`", "- spawning a thread", "`include_str!`", "(L0533)"]:
+        if line not in refused:
+            fails.append(f"--sandbox --summary: no `{line}` in the Refused list")
+    if "With --sandbox" in sandboxed.stdout or "With --sandbox" not in plain.stdout:
+        fails.append("--sandbox --summary: the trailing `With --sandbox` line belongs to the plain summary only")
+    if run("capabilities", "--sandbox").returncode != 2:
+        fails.append("capabilities: `--sandbox` alone must be a usage error (exit 2)")
+    return fails
+
+
 def main():
     lust = sys.argv[1] if len(sys.argv) > 1 else str(ROOT / "target" / "release" / "lust")
     cap = json.loads(subprocess.run([lust, "capabilities", "--json"], capture_output=True, text=True, check=True).stdout)
     lines = lines_of(cap)
-    fails = []
+    fails = check_interface(lust, cap)
     covered = set()
     jobs = []
     for path in sorted(PROBES.glob("*.rs")):

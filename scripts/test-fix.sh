@@ -8,6 +8,8 @@
 #   edits, and `--dry-run` writes nothing. Rewrites: a long assert! (L0809),
 #   write! into a user writer (L0641), a lifetime argument on a fn (L0731),
 #   #![no_implicit_prelude] (L0522), a closure in a const or static (L0630).
+#   `fix --sandbox` re-checks under the sandbox rules, so a fixed file that
+#   reaches a refused service still fails with L0532.
 # Usage: scripts/test-fix.sh
 set -uo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -217,6 +219,36 @@ main_before=$(cat "$d/main.rs")
 (cd "$d" && "$lust" fix main.rs --all) >/dev/null 2>&1; is "mods: fix --all exits 0" $? 0
 is "mods: the root file is untouched" "$(cat "$d/main.rs")" "$main_before"
 case "$(cat "$d/util.rs")" in *', "assertion failed: first_value == 1 && '*) ok "mods: the edit lands in the module file";; *) bad "mods: the edit lands in the module file" "$(cat "$d/util.rs")";; esac
+
+# ---------------------------------------------- the sandbox rules (--sandbox)
+# Each round of `fix --sandbox` is a sandboxed check: a file whose edit is
+# fine under a plain check still fails on what the sandbox refuses (L0532).
+d=$work/sandbox; mkdir -p "$d"
+cat >"$d/s.rs" <<'RS'
+fn main() {
+    let small: i32 = 7;
+    let wide: i64 = small;
+    let text = std::fs::read_to_string("in.txt").unwrap_or_default();
+    println!("{wide} {}", text.len());
+}
+RS
+cp "$d/s.rs" "$d/plain.rs"
+s_before=$(cat "$d/s.rs")
+(cd "$d" && "$lust" fix plain.rs) >/dev/null 2>&1; is "sandbox: plain fix of the same file exits 0" $? 0
+err=$( (cd "$d" && "$lust" fix s.rs --sandbox --dry-run) 2>&1 ); rc=$?
+is "sandbox: dry run exits 1" $rc 1
+is "sandbox: dry run writes nothing" "$(cat "$d/s.rs")" "$s_before"
+err=$( (cd "$d" && "$lust" fix s.rs --sandbox) 2>&1 ); rc=$?
+is "sandbox: fix --sandbox exits 1 on the sandbox refusal" $rc 1
+case "$err" in *"fixed"*"s.rs:3:21: L0110"*"error[L0532]"*"std::fs::read_to_string"*"fixed 1 diagnostic"*) ok "sandbox: the edit is applied, then the re-check reports L0532";; *) bad "sandbox: the edit is applied, then the re-check reports L0532" "$err";; esac
+case "$(cat "$d/s.rs")" in *'let wide: i64 = (small) as i64;'*) ok "sandbox: the fixed text";; *) bad "sandbox: the fixed text" "$(cat "$d/s.rs")";; esac
+(cd "$d" && "$lust" check s.rs --sandbox) >/dev/null 2>&1; is "sandbox: lust check --sandbox agrees, exit 1" $? 1
+printf 'use std::io::Read;\nfn main() {\n    let mut s = String::new();\n    std::io::stdin().read_to_string(&mut s).unwrap();\n    println!("{}", s.len());\n}\n' >"$d/ok.rs"
+ok_before=$(cat "$d/ok.rs")
+(cd "$d" && "$lust" fix ok.rs --sandbox) >/dev/null 2>&1; is "sandbox: fix --sandbox of a clean sandbox-legal file exits 0" $? 0
+is "sandbox: nothing written for it" "$(cat "$d/ok.rs")" "$ok_before"
+# The limits are for a program lust runs; a check takes none.
+(cd "$d" && "$lust" fix ok.rs --sandbox --max-memory 64M) >/dev/null 2>&1; is "sandbox: --max-memory is a usage error, exit 2" $? 2
 
 # ------------------------------------------------------- nothing to offer
 d=$work/none; mkdir -p "$d"

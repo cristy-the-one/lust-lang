@@ -1,6 +1,11 @@
-// `lust fix <file.rs> [check flags] [--all] [--dry-run]`: applies the edits
-// the diagnostics of a check carry (`Diag::edits`), then checks again,
-// until a check has no edit left to apply.
+// `lust fix <file.rs> [--all] [--dry-run] [crate flags] [--sandbox]`: applies
+// the edits the diagnostics of a check carry (`Diag::edits`), then checks
+// again, until a check has no edit left to apply.
+//
+// Every flag other than `--all` and `--dry-run` goes to that check, as
+// `lust check` takes it. With `--sandbox` each round is a sandboxed check, so
+// a rewrite that is valid Rust but reaches a refused service (L0532) still
+// fails the command, as `lust check --sandbox` would.
 //
 // It applies the `auto` edits: the ones a tool may apply without asking
 // (a lossless numeric cast, a `.0` on an integer literal). `--all` also
@@ -34,7 +39,7 @@ pub fn run(args: &[String]) -> i32 {
         }
     }
     let Some(Invocation::Compile { mut req, .. }) = protocol::parse_args(&check) else {
-        eprintln!("usage: lust fix <file.rs> [--all] [--dry-run] [crate flags]");
+        eprintln!("usage: lust fix <file.rs> [--all] [--dry-run] [crate flags] [--sandbox]");
         return 2;
     };
     // Every diagnostic, as text: the last round's answer is this command's.

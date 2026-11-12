@@ -30,7 +30,19 @@ use crate::check::{Builtin, Checked, Res};
 use crate::def::LocalDefId;
 use crate::diag::{Diag, Span};
 
-const CODE: &str = "L0532";
+pub const CODE: &str = "L0532";
+
+/// The std modules a sandboxed body may not name, and what each reaches.
+/// `lust capabilities --sandbox --summary` lists them from here.
+pub const REFUSED_MODULES: &[(&str, &str)] =
+    &[("fs", "the file system"), ("net", "the network"), ("env", "the environment"), ("os", "OS extensions"), ("process", "processes")];
+
+/// The items of `std::process` a sandboxed body keeps: they end the
+/// program or name it. The rest of the module starts or controls
+/// processes. A `use std::process;` would let a body reach
+/// `process::Command` by a path this check does not see as std, so the
+/// module itself is refused too.
+pub const PROCESS_KEPT: &[&str] = &["exit", "abort", "ExitCode", "Termination", "id"];
 
 /// What a std path reaches, when the sandbox refuses it. `segs` is the
 /// path as written, from its first segment.
@@ -38,21 +50,12 @@ fn refused(segs: &[&str]) -> Option<&'static str> {
     if segs.first() != Some(&"std") {
         return None;
     }
-    match segs.get(1).copied()? {
-        "fs" => Some("the file system"),
-        "net" => Some("the network"),
-        "env" => Some("the environment"),
-        "os" => Some("OS extensions"),
-        // `std::process::exit` and friends end the program; the rest
-        // starts or controls processes. A `use std::process;` would let
-        // a body reach `process::Command` by a path this check does not
-        // see as std, so the module itself is refused too.
-        "process" => match segs.get(2).copied() {
-            Some("exit" | "abort" | "ExitCode" | "Termination" | "id") => None,
-            _ => Some("processes"),
-        },
-        _ => None,
+    let module = segs.get(1).copied()?;
+    let &(_, what) = REFUSED_MODULES.iter().find(|(m, _)| *m == module)?;
+    if module == "process" && segs.get(2).is_some_and(|item| PROCESS_KEPT.contains(item)) {
+        return None;
     }
+    Some(what)
 }
 
 fn path_text(segs: &[&str]) -> String {

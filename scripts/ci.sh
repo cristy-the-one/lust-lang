@@ -244,6 +244,8 @@ run_step "daemon edit scenarios (warm vs cold vs rustc)" python3 scripts/test-da
 if [ -e scripts/test-slots.py ]; then
   run_step "slot identity tests" python3 scripts/test-slots.py
 fi
+run_step "capabilities probes and the interface object" python3 scripts/test-capabilities.py
+run_step "crab intake script" python3 scripts/test-crab-intake.py
 if [ "${CI_SANITIZE:-1}" = 1 ]; then
   run_step "difftest (sanitize)" env SANITIZE=1 scripts/difftest.sh ${gate_filter:+"$gate_filter"}
 else

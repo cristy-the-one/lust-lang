@@ -1871,17 +1871,156 @@ fn json_groups(groups: &[(String, Vec<String>)]) -> String {
     format!("{{{}}}", parts.join(","))
 }
 
+/// The commands `lust` takes, in the order `protocol::USAGE` names them.
+/// `lust capabilities --json` prints them, with `interface_flags` of each, as
+/// `"interface"`, so a host need not read the usage text.
+pub const COMMANDS: &[&str] = &["check", "build", "run", "test", "query", "fix", "explain", "expand", "capabilities", "daemon"];
+
+/// The crate and profile flags `check`, `build`, `run`, `query` and `fix`
+/// share: the `crate flags:` line of `protocol::USAGE`.
+pub const CRATE_FLAGS: &[&str] = &[
+    "--manifest-path",
+    "--package",
+    "--bin",
+    "--lib",
+    "--features",
+    "--no-default-features",
+    "--all-features",
+    "--target",
+    "-C",
+    "--offline",
+    "--locked",
+    "--frozen",
+];
+
+/// Each command's own flags, and whether it also takes `CRATE_FLAGS`. A flag
+/// is spelled as `USAGE` spells it: the parsers also take `--name=value` for
+/// a flag with a value, and `-p` for `--package`. The tests at the end of
+/// this file fail when `USAGE` or a parser (`protocol::parse_command`,
+/// `fix::run`, `lust test`'s, `run` below) names a flag this table does not,
+/// or the other way round.
+const OWN_FLAGS: &[(&str, &[&str], bool)] = &[
+    ("check", &["--json", "--max-errors", "--timings", "--mark-unread", "--sandbox", "--rustc"], true),
+    (
+        "build",
+        &[
+            "--json",
+            "--max-errors",
+            "--timings",
+            "-o",
+            "-g",
+            "--emit-c",
+            "--mark-unread",
+            "--sandbox",
+            "--max-memory",
+            "--time-limit",
+            "--opt",
+            "--opt=bg",
+            "--release",
+            "--profile",
+        ],
+        true,
+    ),
+    (
+        "run",
+        &[
+            "--json",
+            "--max-errors",
+            "--timings",
+            "-o",
+            "-g",
+            "--emit-c",
+            "--mark-unread",
+            "--sandbox",
+            "--max-memory",
+            "--time-limit",
+            "--opt",
+            "--opt=bg",
+            "--",
+        ],
+        true,
+    ),
+    // `lust test`'s crate flags are its own list (testrun/krate.rs `split_args`): no `--bin`, no `-C`.
+    (
+        "test",
+        &[
+            "--json",
+            "--list",
+            "--timeout",
+            "--max-errors",
+            "--exact",
+            "--skip",
+            "--ignored",
+            "--include-ignored",
+            "--test-threads",
+            "--manifest-path",
+            "--package",
+            "--lib",
+            "--test",
+            "--features",
+            "--target",
+            "--no-default-features",
+            "--all-features",
+            "--offline",
+            "--locked",
+            "--frozen",
+        ],
+        false,
+    ),
+    ("query", &["--in", "--json"], true),
+    // `fix` hands every other flag to the check it runs each round (src/fix.rs).
+    ("fix", &["--all", "--dry-run", "--sandbox"], true),
+    ("capabilities", &["--json", "--summary", "--sandbox"], false),
+];
+
+/// The flags `cmd` takes: its own, then the crate flags when it takes them.
+pub fn interface_flags(cmd: &str) -> Vec<&'static str> {
+    let Some(&(_, own, krate)) = OWN_FLAGS.iter().find(|(c, _, _)| *c == cmd) else { return Vec::new() };
+    let mut out = own.to_vec();
+    if krate {
+        out.extend_from_slice(CRATE_FLAGS);
+    }
+    out
+}
+
+/// The `"interface"` object of `lust capabilities --json`: the package
+/// version and the build hash (as `lust --version` prints them), the
+/// commands, and each command's flags.
+fn interface_json() -> String {
+    let flags: Vec<String> = COMMANDS.iter().map(|c| format!("{}:{}", diag::json_str(c), json_str_arr(&interface_flags(c)))).collect();
+    format!(
+        "{{\"version\":{},\"build\":{},\"commands\":{},\"flags\":{{{}}}}}",
+        diag::json_str(env!("CARGO_PKG_VERSION")),
+        diag::json_str(&env!("LUST_BUILD_HASH")[..8]),
+        json_str_arr(COMMANDS),
+        flags.join(",")
+    )
+}
+
 /// Entry point for `lust capabilities`. Returns the process exit code.
 /// `lust capabilities --summary`: what a model writing code for lust most
 /// needs to know, short enough to put in a prompt (under 1,500 tokens).
 /// The refusals come from `REJECTED`, so the summary cannot drift from the
 /// probes; fallbacks no known program reaches and `lust test` details are
 /// left out.
-pub fn summary() -> String {
+///
+/// `sandbox` (`--sandbox --summary`): the same summary for a `--sandbox`
+/// build. The sandbox's refusals join the main list, the std modules from
+/// the check's own table (`check::sandbox::REFUSED_MODULES`), and the
+/// limits follow.
+pub fn summary(sandbox: bool) -> String {
     let mut out = String::from(
         "lust checks and builds a subset of Rust 2024. A program lust accepts behaves exactly as under rustc; \
-         a program outside the subset is refused with an L-code, never compiled differently.\n\
-         Write plain safe Rust: structs, enums, traits, generics, closures, iterators, Vec, String, HashMap, \
+         a program outside the subset is refused with an L-code, never compiled differently.\n",
+    );
+    if sandbox {
+        out.push_str(
+            "This program is built with --sandbox: it reads stdin and writes stdout and stderr only, and uses no other \
+             OS service. Take input on stdin and answer on stdout.\n",
+        );
+    }
+    out.push_str(
+        "Write plain safe Rust: structs, enums, traits, generics, closures, iterators, Vec, String, HashMap, \
          BTreeMap, VecDeque, BinaryHeap, Option, Result and `?`, f64 math. Errors come as JSON with `--json`; \
          apply the edits marked `auto` before rewriting by hand. `lust explain L####` explains a code.\n\
          Refused:\n",
@@ -1892,24 +2031,50 @@ pub fn summary() -> String {
         }
         out.push_str(&format!("- {what} ({code})\n"));
     }
-    out.push_str(
-        "With --sandbox: the program reads stdin and writes stdout and stderr only; std::fs, std::net, std::env, \
-         std::os, std::process other than exit, thread spawning and include_str! are refused (L0532). \
-         `--time-limit` (with `--sandbox`, on build and run) stops the program when it runs longer (L0533).\n",
-    );
+    if !sandbox {
+        out.push_str(
+            "With --sandbox: the program reads stdin and writes stdout and stderr only; std::fs, std::net, std::env, \
+             std::os, std::process other than exit, thread spawning and include_str! are refused (L0532). \
+             `--time-limit` (with `--sandbox`, on build and run) stops the program when it runs longer (L0533).\n",
+        );
+        return out;
+    }
+    use crate::check::sandbox::{CODE, PROCESS_KEPT, REFUSED_MODULES};
+    for (module, what) in REFUSED_MODULES {
+        let except = if *module == "process" {
+            format!(" other than {}", PROCESS_KEPT.iter().map(|i| format!("`{i}`")).collect::<Vec<_>>().join(", "))
+        } else if *module == "env" {
+            " (`std::env::args` too)".to_string()
+        } else {
+            String::new()
+        };
+        out.push_str(&format!("- `std::{module}`{except}: it reaches {what} ({CODE})\n"));
+    }
+    out.push_str(&format!(
+        "- spawning a thread: `thread::spawn`, `thread::scope`, `Builder::spawn`, a scope's `spawn` ({CODE})\n\
+         - `include!`, `include_str!`, `include_bytes!` ({CODE}); `env!` and `option_env!` see no variable\n\
+         A std call that reaches a refused service another way (`Path::exists` reaching the file system) stops the \
+         program at run time: exit status 101, `error[{CODE}]` on stderr. On build and run, `--max-memory <size>` \
+         stops a program that holds more memory ({CODE}) and `--time-limit <duration>` one that runs longer (L0533).\n"
+    ));
     out
 }
 
 pub fn run(args: &[String]) -> i32 {
-    let json = match args {
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let json = match args.as_slice() {
         [] => false,
-        [a] if a == "--json" => true,
-        [a] if a == "--summary" => {
-            print!("{}", summary());
+        ["--json"] => true,
+        ["--summary"] => {
+            print!("{}", summary(false));
+            return 0;
+        }
+        ["--sandbox", "--summary"] | ["--summary", "--sandbox"] => {
+            print!("{}", summary(true));
             return 0;
         }
         _ => {
-            eprintln!("usage: lust capabilities [--json | --summary]");
+            eprintln!("usage: lust capabilities [--json | --summary [--sandbox]]");
             return 2;
         }
     };
@@ -1974,7 +2139,7 @@ pub fn run(args: &[String]) -> i32 {
             REJECTED.iter().map(|(f, c)| format!("{{\"feature\":{},\"code\":\"{}\"}}", diag::json_str(f), c)).collect();
         let code_objs: Vec<String> = codes.iter().map(|(c, t)| format!("{{\"code\":\"{}\",\"title\":{}}}", c, diag::json_str(t))).collect();
         println!(
-            "{{\"schema\":1,\"kind\":\"capabilities\",\"commands\":{},\"items\":{},\"types\":{},\"integer_types\":{},\"methods\":{},\"associated_functions\":{},\"functions\":{},\"macros\":{},\"attributes\":{},\"derives\":{},\"operators\":{{\"binary\":{},\"unary\":{}}},\"control_flow\":{},\"patterns\":{},\"expressions\":{},\"rejected\":[{}],\"diagnostics\":{{\"schema\":{},\"codes\":[{}]}}}}",
+            "{{\"schema\":1,\"kind\":\"capabilities\",\"commands\":{},\"items\":{},\"types\":{},\"integer_types\":{},\"methods\":{},\"associated_functions\":{},\"functions\":{},\"macros\":{},\"attributes\":{},\"derives\":{},\"operators\":{{\"binary\":{},\"unary\":{}}},\"control_flow\":{},\"patterns\":{},\"expressions\":{},\"rejected\":[{}],\"diagnostics\":{{\"schema\":{},\"codes\":[{}]}},\"interface\":{}}}",
             json_str_arr(&["check", "build", "run", "test", "explain", "capabilities", "daemon"]),
             json_str_arr(ITEMS),
             json_str_arr(TYPES),
@@ -1992,7 +2157,8 @@ pub fn run(args: &[String]) -> i32 {
             json_str_arr(EXPRESSIONS),
             rejected.join(","),
             diag::SCHEMA,
-            code_objs.join(",")
+            code_objs.join(","),
+            interface_json()
         );
     } else {
         let list = |name: &str, items: &[String]| println!("{name}: {}", items.join(", "));
@@ -2035,8 +2201,185 @@ mod summary_tests {
     /// The summary stays prompt-sized: about 4 characters a token.
     #[test]
     fn summary_is_short() {
-        let s = super::summary();
+        let s = super::summary(false);
         assert!(s.len() < 6_000, "capabilities --summary is {} bytes", s.len());
         assert!(s.contains("(L0404)") && s.contains("(L0532)"));
+    }
+
+    /// `--sandbox --summary` lists the sandbox's refusals in the main list,
+    /// one per refused std module, and has no trailing "With --sandbox" line.
+    #[test]
+    fn sandbox_summary_lists_the_refusals() {
+        let s = super::summary(true);
+        assert!(s.len() < 6_000, "capabilities --sandbox --summary is {} bytes", s.len());
+        assert!(!s.contains("With --sandbox"), "{s}");
+        let refused = &s[s.find("Refused:\n").expect("a Refused list")..];
+        for (module, _) in crate::check::sandbox::REFUSED_MODULES {
+            assert!(refused.contains(&format!("- `std::{module}`")), "no line for std::{module}: {s}");
+        }
+        for word in ["spawning a thread", "`include_str!`", "`exit`", "(L0533)", "(L0404)"] {
+            assert!(refused.contains(word), "{word}: {s}");
+        }
+    }
+}
+
+/// `INTERFACE` (`OWN_FLAGS`, `CRATE_FLAGS`, `COMMANDS`) against the usage
+/// text and the parsers, so `"interface"` in `lust capabilities --json`
+/// cannot drift from what the command line takes.
+#[cfg(test)]
+mod interface_tests {
+    use super::{COMMANDS, CRATE_FLAGS, OWN_FLAGS, interface_flags};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// Spellings a parser takes that the table leaves out: aliases of a
+    /// listed flag, and libtest flags `lust test` accepts and ignores.
+    const ALIASES: &[&str] = &["-p", "--opt=now", "--opt=background", "--nocapture", "--show-output"];
+
+    fn set(v: &[&str]) -> BTreeSet<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A flag a usage token names: `[--sandbox` and `--opt=bg]` are flags;
+    /// `<bytes|N[K|M|G]>]]`, `panic=unwind|abort` and `|` are not.
+    fn usage_flag(token: &str) -> Option<String> {
+        let t = token.trim_matches(|c: char| "[]()|.,:".contains(c));
+        let rest = t.strip_prefix("--").or_else(|| t.strip_prefix('-'))?;
+        (t == "--" || rest.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())).then(|| t.to_string())
+    }
+
+    /// Each command `USAGE` names, with every flag its lines name.
+    /// `[crate flags]` stands for the `crate flags:` line.
+    fn usage_table() -> BTreeMap<String, BTreeSet<String>> {
+        let lines: Vec<&str> = crate::protocol::USAGE.lines().map(|l| l.trim().trim_start_matches("usage:").trim()).collect();
+        let krate: BTreeSet<String> = lines
+            .iter()
+            .find_map(|l| l.strip_prefix("crate flags:"))
+            .expect("a crate flags line")
+            .split_whitespace()
+            .filter_map(usage_flag)
+            .collect();
+        let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for line in &lines {
+            let mut words = line.split_whitespace();
+            if words.next() != Some("lust") {
+                continue;
+            }
+            let Some(cmds) = words.next().filter(|w| !w.starts_with('-')) else { continue };
+            let mut flags: BTreeSet<String> = words.filter_map(usage_flag).collect();
+            if line.contains("[crate flags]") {
+                flags.extend(krate.iter().cloned());
+            }
+            for cmd in cmds.trim_matches(|c| c == '<' || c == '>').split('|') {
+                out.entry(cmd.to_string()).or_default().extend(flags.iter().cloned());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn usage_names_every_flag_of_the_table() {
+        let usage = usage_table();
+        assert_eq!(usage.keys().cloned().collect::<BTreeSet<_>>(), set(COMMANDS), "the commands USAGE names");
+        for cmd in COMMANDS {
+            assert_eq!(usage[*cmd], set(&interface_flags(cmd)), "`lust {cmd}`: USAGE (left) and the table (right)");
+        }
+        assert!(OWN_FLAGS.iter().all(|(c, _, _)| COMMANDS.contains(c)));
+        let krate = crate::protocol::USAGE.lines().find_map(|l| l.trim().strip_prefix("crate flags:")).unwrap();
+        assert_eq!(krate.split_whitespace().filter_map(usage_flag).collect::<BTreeSet<_>>(), set(CRATE_FLAGS));
+    }
+
+    /// The string literals in `src` between `from` and `to` that a parser
+    /// matches as a flag: `"--json"`, `"--max-errors="` (as `--max-errors`).
+    fn literals(src: &str, from: &str, to: &str) -> BTreeSet<String> {
+        let start = src.find(from).unwrap_or_else(|| panic!("no `{from}`"));
+        let end = start + src[start..].find(to).unwrap_or_else(|| panic!("no `{to}` after `{from}`"));
+        let body = &src[start..end];
+        let mut out = BTreeSet::new();
+        let mut at = 0;
+        while let Some(k) = body[at..].find("\"-") {
+            let open = at + k + 1;
+            let Some(len) = body[open..].find('"') else { break };
+            let lit = &body[open..open + len];
+            if lit.len() > 1 && !lit.contains(' ') {
+                out.insert(lit.trim_end_matches('=').to_string());
+            }
+            at = open + len + 1;
+        }
+        out.retain(|l| !ALIASES.contains(&l.as_str()));
+        out
+    }
+
+    fn union(cmds: &[&str]) -> BTreeSet<String> {
+        cmds.iter().flat_map(|c| interface_flags(c)).map(str::to_string).collect()
+    }
+
+    /// `protocol::parse_command` serves check, build, run, query, and the
+    /// crate build of `lust test`.
+    #[test]
+    fn parse_command_takes_the_table() {
+        let src = include_str!("protocol.rs");
+        let parsed = literals(src, "while let Some(a) = it.next() {", "if [crate_flags.lib");
+        let served = union(&["check", "build", "run", "query", "test"]);
+        assert!(parsed.is_subset(&served), "parsed, not in the table: {:?}", parsed.difference(&served).collect::<Vec<_>>());
+        let listed = union(&["check", "build", "run", "query"]);
+        assert!(listed.is_subset(&parsed), "in the table, not parsed: {:?}", listed.difference(&parsed).collect::<Vec<_>>());
+    }
+
+    /// Every flag the table gives check, build or run makes a command line
+    /// `protocol::parse_args` accepts for that command.
+    #[test]
+    fn each_command_accepts_its_flags() {
+        for cmd in ["check", "build", "run"] {
+            for flag in interface_flags(cmd) {
+                let with: &[&str] = match flag {
+                    // Needs a Cargo.toml on disk; protocol.rs's own tests cover it.
+                    "--manifest-path" => continue,
+                    "--max-errors" => &["--max-errors", "3"],
+                    "-o" => &["-o", "out"],
+                    "--emit-c" => &["--emit-c", "pre"],
+                    "--mark-unread" => &["--json", "--mark-unread", "f"],
+                    "--max-memory" => &["--sandbox", "--max-memory", "64M"],
+                    "--time-limit" => &["--sandbox", "--time-limit", "1s"],
+                    "--profile" => &["--profile", "release"],
+                    "--package" => &["--package", "p"],
+                    "--bin" => &["--bin", "b"],
+                    "--features" => &["--features", "a"],
+                    "--target" => &["--target", "x86_64-unknown-linux-gnu"],
+                    "-C" => &["-C", "panic=abort"],
+                    "--" => &["--", "arg"],
+                    f => &[f][..],
+                };
+                let mut args = vec![cmd.to_string(), "/tmp/x/main.rs".to_string()];
+                args.extend(with.iter().map(|s| s.to_string()));
+                assert!(crate::protocol::parse_args(&args).is_some(), "`lust {}` is refused", args.join(" "));
+            }
+        }
+    }
+
+    /// `lust fix` takes `--all` and `--dry-run` and hands the rest to its check.
+    #[test]
+    fn fix_takes_the_table() {
+        let src = include_str!("fix.rs");
+        assert_eq!(literals(src, "for a in args {", "protocol::parse_args(&check)"), set(&["--all", "--dry-run"]));
+        let check = union(&["check"]);
+        for flag in interface_flags("fix") {
+            assert!(matches!(flag, "--all" | "--dry-run") || check.contains(flag), "`lust fix {flag}`: check does not take it");
+        }
+    }
+
+    /// `lust test`'s own parser and its crate flags (testrun/krate.rs).
+    #[test]
+    fn test_takes_the_table() {
+        let mut parsed = literals(include_str!("testrun.rs"), "fn parse_opts(", "fn parse_secs(");
+        parsed.extend(literals(include_str!("testrun/krate.rs"), "fn split_args(", "let (mut rest"));
+        // `--` ends libtest's flags; it names no flag of its own.
+        parsed.remove("--");
+        assert_eq!(parsed, set(&interface_flags("test")));
+    }
+
+    #[test]
+    fn capabilities_takes_the_table() {
+        let parsed = literals(include_str!("capabilities.rs"), "pub fn run(args: &[String]) -> i32 {", "_ => {");
+        assert_eq!(parsed, set(&interface_flags("capabilities")));
     }
 }

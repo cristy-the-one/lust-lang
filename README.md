@@ -160,8 +160,8 @@ Each version has a [release](https://github.com/cristy-the-one/lust-lang/release
 | Windows x86_64 | `lust-<version>-x86_64-windows.zip` |
 
 ```sh
-tar xzf lust-0.3.0-x86_64-linux.tar.gz
-export PATH="$PWD/lust-0.3.0-x86_64-linux/bin:$PATH"
+tar xzf lust-0.3.1-x86_64-linux.tar.gz
+export PATH="$PWD/lust-0.3.1-x86_64-linux/bin:$PATH"
 lust --version
 ```
 
@@ -226,7 +226,7 @@ A release zip, next to the Linux tarball from `scripts/release.sh`:
 
 ```powershell
 pwsh -File scripts/release.ps1
-Get-FileHash dist\lust-0.3.0-x86_64-windows.zip -Algorithm SHA256
+Get-FileHash dist\lust-0.3.1-x86_64-windows.zip -Algorithm SHA256
 ```
 
 The zip contains `bin\lust.exe`, `bin\lust-core.exe`, the pinned `tcc.exe`, and the std and adapter sources. You do not need Visual Studio to run a packaged build. You do need it, plus rustup, to build from source. Cargo is still required to check a Cargo crate (`lust` runs `cargo metadata`).

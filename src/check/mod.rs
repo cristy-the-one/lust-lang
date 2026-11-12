@@ -9766,7 +9766,17 @@ impl<'p> Ctx<'p> {
                     let tref = self.tys.mk_ref(false, target);
                     (derefs, inner) = self.autoderef_smart(tref);
                 }
-                if !matches!(self.kind(inner), TyKind::Error) && !self.tainted_lookup(bt) {
+                if let TyKind::Infer(v) = self.kind(inner)
+                    && !v.is_int()
+                    && !v.is_float()
+                {
+                    self.err(
+                        "L0610",
+                        span,
+                        "type annotations needed: the type of this value must be known to read its field",
+                        "Annotate the binding it comes from, for example `let mut v: Vec<(usize, usize)> = Vec::new();`.",
+                    );
+                } else if !matches!(self.kind(inner), TyKind::Error) && !self.tainted_lookup(bt) {
                     let tn = self.tn(bt);
                     self.err("L0103", span, format!("no field `{}` on type `{tn}`", self.name(*name)), "Check the field name.");
                 }
@@ -10624,7 +10634,17 @@ impl<'p> Ctx<'p> {
                         t
                     }
                     None => {
-                        if !matches!(self.kind(inner), TyKind::Error) {
+                        if let TyKind::Infer(v) = self.kind(inner)
+                            && !v.is_int()
+                            && !v.is_float()
+                        {
+                            self.err(
+                                "L0610",
+                                span,
+                                "type annotations needed: the type of this value must be known to read its field",
+                                "Annotate the binding it comes from, for example `let mut v: Vec<(usize, usize)> = Vec::new();`.",
+                            );
+                        } else if !matches!(self.kind(inner), TyKind::Error) {
                             let tn = self.tn(bt);
                             self.err("L0103", span, format!("no field `{index}` on type `{tn}`"), "Check the field index.");
                         }

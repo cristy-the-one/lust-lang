@@ -1560,12 +1560,44 @@ float lust_f32_max(float a, float b) {
     return a == a ? a : b;
 }
 
-/* f64::clamp and f32::clamp. The checker only emits these when lo and hi
-   are literals with lo <= hi, so the rustc panic (min > max, or a NaN
-   bound) cannot happen. NaN input stays NaN. -0.0 stays -0.0 inside the
-   range, because -0.0 < 0.0 is false. */
-double lust_f64_clamp(double a, double lo, double hi) { return a < lo ? lo : (a > hi ? hi : a); }
-float lust_f32_clamp(float a, float lo, float hi) { return a < lo ? lo : (a > hi ? hi : a); }
+/* f64::clamp and f32::clamp, as core 1.99: panic when `!(min <= max)`
+   (min > max, or either bound is NaN) at the `const_assert!` in
+   f64.rs:1585:9 / f32.rs:1605:9, with the runtime message
+   "min > max, or either was NaN. min = {min:?}, max = {max:?}".
+   The value is `min` when below, `max` when above, otherwise `self`
+   (a NaN input stays NaN; -0.0 stays -0.0 inside the range, because
+   -0.0 < 0.0 is false). +0.0 and -0.0 compare equal, so a range of
+   those two does not panic. */
+static void lust_clamp_panic(lust_String *s, int is_f32) {
+    uint8_t z = 0;
+    lust_string_push_bytes(s, &z, 1);
+    lust_panic_std((const char *)s->ptr, is_f32 ? "core/src/num/f32.rs:1605:9" : "core/src/num/f64.rs:1585:9");
+    lust_string_drop(s);
+}
+void lust_f64_clamp_panic(double lo, double hi) {
+    lust_String s = lust_string_new();
+    lust_string_push_cstr(&s, "min > max, or either was NaN. min = ");
+    lust_fmt_f64_debug(&s, lo);
+    lust_string_push_cstr(&s, ", max = ");
+    lust_fmt_f64_debug(&s, hi);
+    lust_clamp_panic(&s, 0);
+}
+void lust_f32_clamp_panic(float lo, float hi) {
+    lust_String s = lust_string_new();
+    lust_string_push_cstr(&s, "min > max, or either was NaN. min = ");
+    lust_fmt_f32_debug(&s, lo);
+    lust_string_push_cstr(&s, ", max = ");
+    lust_fmt_f32_debug(&s, hi);
+    lust_clamp_panic(&s, 1);
+}
+double lust_f64_clamp(double a, double lo, double hi) {
+    if (!(lo <= hi)) { lust_f64_clamp_panic(lo, hi); return 0; }
+    return a < lo ? lo : (a > hi ? hi : a);
+}
+float lust_f32_clamp(float a, float lo, float hi) {
+    if (!(lo <= hi)) { lust_f32_clamp_panic(lo, hi); return 0; }
+    return a < lo ? lo : (a > hi ? hi : a);
+}
 
 double lust_f64_signum(double a) {
     if (a > 0) return 1.0;

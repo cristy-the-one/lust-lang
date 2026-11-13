@@ -210,6 +210,10 @@ fn builtin_is_const(b: Builtin) -> bool {
             | FloatRecip
             | FloatMin
             | FloatMax
+            // `f32::clamp` and `f64::clamp` are const. A bound that is
+            // NaN or above the other panics; the evaluator reports that
+            // (ty/consteval.rs) instead of returning a value.
+            | FloatClamp
             | FloatIsNan
             | FloatIsInfinite
             | FloatIsFinite

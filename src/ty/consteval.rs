@@ -4396,6 +4396,44 @@ impl Evaluator {
                         };
                         Ok((ConstValue::Float(r, f), rt))
                     }
+                    // core's `clamp`: panic when `!(min <= max)` (NaN
+                    // fails that too), else `min` if below, `max` if
+                    // above, otherwise `self` (a NaN input stays NaN).
+                    // The const message has no formatted bounds; the
+                    // runtime message is built in float.c.
+                    "clamp" if args.len() == 2 => {
+                        let (av, _) = self.value(cx, env, args[0], Some(rt))?;
+                        let (bv, _) = self.value(cx, env, args[1], Some(rt))?;
+                        let ConstValue::Float(ab, _) = av else { return Err(outside_err()) };
+                        let ConstValue::Float(bb, _) = bv else { return Err(outside_err()) };
+                        let bad = || {
+                            Diag::new(
+                                C_OUTSIDE,
+                                span,
+                                "const panic: min > max, or either was NaN".to_string(),
+                                "Give `clamp` bounds with min <= max, and neither bound NaN.",
+                            )
+                        };
+                        let r = match f {
+                            FloatTy::F64 => {
+                                let (x, lo, hi) = (f64::from_bits(bits), f64::from_bits(ab), f64::from_bits(bb));
+                                if !(lo <= hi) {
+                                    return Err(bad());
+                                }
+                                let x = if x < lo { lo } else { x };
+                                (if x > hi { hi } else { x }).to_bits()
+                            }
+                            FloatTy::F32 => {
+                                let (x, lo, hi) = (f32::from_bits(bits as u32), f32::from_bits(ab as u32), f32::from_bits(bb as u32));
+                                if !(lo <= hi) {
+                                    return Err(bad());
+                                }
+                                let x = if x < lo { lo } else { x };
+                                (if x > hi { hi } else { x }).to_bits() as u64
+                            }
+                        };
+                        Ok((ConstValue::Float(r, f), rt))
+                    }
                     _ => Err(outside_err()),
                 }
             }

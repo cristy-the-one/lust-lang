@@ -4414,17 +4414,7 @@ impl<'p> Ctx<'p> {
         }
         let (b, autoref, params, ret) = match self.kind(self_ty) {
             TyKind::Int(i) => self.int_method(name, self_ty, i)?,
-            TyKind::Float(f) => {
-                let sig = self.float_method(name, self_ty, f)?;
-                // `f64::clamp(x, lo, hi)`: the call arguments are not in
-                // scope here. This signature is also how the path is
-                // resolved, before any call is checked, so the literal
-                // bounds cannot be verified. Keep the path form rejected.
-                if sig.0 == B::FloatClamp {
-                    return None;
-                }
-                sig
-            }
+            TyKind::Float(f) => self.float_method(name, self_ty, f)?,
             TyKind::Char => self.char_method(name)?,
             TyKind::Bool if name == k.then_some => {
                 let t = match extra.first() {
@@ -17769,7 +17759,6 @@ impl<'p> Ctx<'p> {
                 // The str search methods take std's `Pattern`: a char
                 // in the pattern position becomes its encoding as a
                 // &str (`Coerce::CharPat`), which searches the same.
-                let err_mark = self.errs.len();
                 if matches!(b, B::StrContains | B::StrFind | B::StrRfind | B::StrStartsWith | B::StrEndsWith | B::StrStripPrefix | B::StrStripSuffix | B::StrReplace | B::StrReplacen)
                     && args.len() == params.len()
                     && !args.is_empty()
@@ -17777,18 +17766,6 @@ impl<'p> Ctx<'p> {
                     self.check_str_pattern_args(&params, args, name_span);
                 } else {
                     self.check_args(&params, args, name_span);
-                }
-                // A type error (an integer bound, a wrong suffix) is the
-                // one to show. L9001 is for bounds that type-check and
-                // still are not literals with min <= max.
-                if b == B::FloatClamp && self.errs.len() == err_mark {
-                    let ft = match self.kind(base) {
-                        TyKind::Float(f) => f,
-                        _ => FloatTy::F64,
-                    };
-                    if !self.float_clamp_literal_bounds(args, name_span, ft) {
-                        return ERROR;
-                    }
                 }
                 if matches!(b, B::VecRetain | B::VecRetainMut | B::BoolThen) && self.adapter_callable_gap(args, &params, b == B::BoolThen) {
                     return ERROR;
@@ -18398,53 +18375,6 @@ impl<'p> Ctx<'p> {
             return Some((B::CarryingMulAdd, Autoref::None, vec![t, t, t], tt));
         }
         None
-    }
-
-    /// The value of a float literal, or of a unary minus applied to one,
-    /// parsed at width `ft`. Anything else (a name, a call, an integer
-    /// literal) is `None`.
-    fn float_lit_bound(&self, e: ExprId, ft: FloatTy) -> Option<f64> {
-        let (neg, lit) = match self.p.ast.expr(e) {
-            Expr::Float(i) => (false, i),
-            Expr::Unary { op: UnOp::Neg, expr } => match self.p.ast.expr(*expr) {
-                Expr::Float(i) => (true, i),
-                _ => return None,
-            },
-            _ => return None,
-        };
-        let text = self.p.ast.strings[*lit as usize].as_str();
-        let bits = parse_float_literal_as(text, ft)?;
-        let v = k_float(bits, ft);
-        Some(if neg { -v } else { v })
-    }
-
-    /// `x.clamp(lo, hi)` on a float is accepted only when both bounds are
-    /// float literals (optionally negated) and `lo <= hi`. `lo <= hi` is
-    /// false for NaN, which a literal cannot be. A failure is L9001.
-    fn float_clamp_literal_bounds(&mut self, args: &[ExprId], name_span: Span, ft: FloatTy) -> bool {
-        let lo = (args.len() == 2).then(|| self.float_lit_bound(args[0], ft)).flatten();
-        let hi = (args.len() == 2).then(|| self.float_lit_bound(args[1], ft)).flatten();
-        match (lo, hi) {
-            (Some(lo), Some(hi)) if lo <= hi => true,
-            (Some(_), Some(_)) => {
-                self.err(
-                    "L9001",
-                    name_span,
-                    "`clamp` on a float with min > max (rustc panics here)".to_string(),
-                    "Write the bounds as literals with min <= max, such as `x.clamp(0.0, 1.0)`, or use `x.max(lo).min(hi)`.",
-                );
-                false
-            }
-            _ => {
-                self.err(
-                    "L9001",
-                    name_span,
-                    "`clamp` on a float with bounds that are not float literals".to_string(),
-                    "Write the bounds as literals with min <= max, such as `x.clamp(0.0, 1.0)`, or use `x.max(lo).min(hi)`.",
-                );
-                false
-            }
-        }
     }
 
     /// Inherent float methods (`sqrt`, `powi`, `to_bits`, and kin).

@@ -174,6 +174,9 @@ float lust_f32_min(float a, float b);
 float lust_f32_max(float a, float b);
 double lust_f64_clamp(double a, double lo, double hi);
 float lust_f32_clamp(float a, float lo, float hi);
+/* Panics with rustc 1.99's clamp message when `!(lo <= hi)`. */
+void lust_f64_clamp_panic(double lo, double hi);
+void lust_f32_clamp_panic(float lo, float hi);
 double lust_f64_signum(double a);
 float lust_f32_signum(float a);
 uint64_t lust_f64_to_bits(double v);

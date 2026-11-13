@@ -28,9 +28,37 @@ concurrency:
 permissions:
   contents: read
   pull-requests: write
+  actions: read
 
 jobs:
+  # Decides in a few seconds whether this run needs the gate at all
+  # (scripts/ci-scope.sh). The gate jobs below are skipped when it says no:
+  # for the merge of a pull request that already passed with the same
+  # files, and for a change of documents or of the version only.
+  # A skipped job counts as passed for a required check. The gate jobs run
+  # unless the answer is exactly `false`, so a broken script runs the gate.
+  scope:
+    runs-on: ubuntu-24.04
+    outputs:
+      heavy: ${{ steps.scope.outputs.heavy }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Decide whether the gate runs
+        id: scope
+        env:
+          CI_EVENT: ${{ github.event_name }}
+          CI_BEFORE: ${{ github.event.before }}
+          CI_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash scripts/ci-scope.sh | tee -a "$GITHUB_OUTPUT"
+          bash scripts/ci-scope.sh | sed -n 's/^reason=/Gate: /p' >> "$GITHUB_STEP_SUMMARY"
+
   linux-x86_64:
+    needs: scope
+    if: needs.scope.outputs.heavy != 'false'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -77,6 +105,8 @@ jobs:
           if-no-files-found: ignore
 
   windows-x86_64:
+    needs: scope
+    if: needs.scope.outputs.heavy != 'false'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -155,10 +185,13 @@ jobs:
   # A queued arm64 job that never gets a runner is cancelled after about
   # 15 minutes ("not acquired by Runner of type hosted"). That is runner
   # capacity, not a build failure; re-run the job.
-  # This job is part of every push and pull_request to next and main.
+  # This job is part of every push and pull_request to next and main
+  # that runs the gate (see the `scope` job).
   # Do not add `if: false`: that condition skipped the job on every PR
   # whose branch did not change this file.
   macos-arm64:
+    needs: scope
+    if: needs.scope.outputs.heavy != 'false'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -226,7 +259,8 @@ jobs:
   # it skips pull requests: it runs on pushes to next and main and by hand,
   # and its failure list is the artifact `ci-failures-macos-x86_64`.
   macos-x86_64:
-    if: github.event_name != 'pull_request'
+    needs: scope
+    if: github.event_name != 'pull_request' && needs.scope.outputs.heavy != 'false'
     continue-on-error: true
     runs-on: macos-15-intel
     steps:

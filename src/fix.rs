@@ -122,14 +122,52 @@ fn apply(edits: &[FileEdit], dry: bool) -> Result<usize, String> {
         let key = |e: &FileEdit| (e.edit.start, e.edit.end, e.edit.replacement.clone());
         list.sort_by_key(|e| std::cmp::Reverse(key(e)));
         list.dedup_by_key(|e| key(e));
+        let map = raw_offsets(&text);
+        let crlf = map.is_some() && text.contains("\r\n");
         for e in list {
-            let (start, end) = (e.edit.start as usize, e.edit.end as usize);
+            let map_pos = |p: u32| -> Option<usize> {
+                match &map {
+                    Some(m) => m.get(p as usize).copied(),
+                    None => Some(p as usize),
+                }
+            };
+            let (Some(start), Some(end)) = (map_pos(e.edit.start), map_pos(e.edit.end)) else {
+                return Err(format!("{path}: an edit of {} does not fit the file (did it change during the check?)", e.code));
+            };
             if end > text.len() || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
                 return Err(format!("{path}: an edit of {} does not fit the file (did it change during the check?)", e.code));
             }
-            text.replace_range(start..end, &e.edit.replacement);
+            if crlf && e.edit.replacement.contains('\n') && !e.edit.replacement.contains("\r\n") {
+                let repl = e.edit.replacement.replace('\n', "\r\n");
+                text.replace_range(start..end, &repl);
+            } else {
+                text.replace_range(start..end, &e.edit.replacement);
+            }
         }
         std::fs::write(path, text).map_err(|e| format!("cannot write {path}: {e}"))?;
     }
     Ok(fixed)
+}
+
+/// Maps byte offsets in `srctext::normalize(raw)` back to byte offsets in `raw`.
+/// Returns `None` when `raw` has neither a leading UTF-8 BOM nor CR bytes, so
+/// normalized and raw offsets are already identical.
+fn raw_offsets(raw: &str) -> Option<Vec<usize>> {
+    let has_bom = raw.starts_with('\u{feff}');
+    if !has_bom && !raw.as_bytes().contains(&b'\r') {
+        return None;
+    }
+    let b = raw.as_bytes();
+    let mut map = Vec::with_capacity(b.len() + 1);
+    let mut r = if has_bom { '\u{feff}'.len_utf8() } else { 0 };
+    while r < b.len() {
+        map.push(r);
+        if b[r] == b'\r' && b.get(r + 1) == Some(&b'\n') {
+            r += 2;
+        } else {
+            r += 1;
+        }
+    }
+    map.push(b.len());
+    Some(map)
 }

@@ -3258,6 +3258,110 @@ impl<'p> Ctx<'p> {
         }
         self.err_cast(code, span, msg, fix, at, from, to);
     }
+
+    /// True when `ref_ty` is `&T` or `&mut T` (for a sized `T`) and `T` matches
+    /// `other` (either identical or a numeric type matching an open literal).
+    fn one_ref_deeper(&self, ref_ty: Ty, other: Ty) -> bool {
+        let TyKind::Ref(_, _, inner) = self.kind(ref_ty) else {
+            return false;
+        };
+        if self.kind(other) == TyKind::Error || self.unbound_general(other) {
+            return false;
+        }
+        if matches!(
+            self.kind(inner),
+            TyKind::Error | TyKind::Str | TyKind::Slice(_) | TyKind::Dyn(..)
+        ) {
+            return false;
+        }
+        let (in_name, other_name) = (self.tn(inner), self.tn(other));
+        in_name == other_name
+            || (int_shape(&in_name).is_some() && other_name == "{integer}")
+            || (float_width(&in_name).is_some() && other_name == "{float}")
+    }
+
+    /// Short display text for a simple operand in a dereference fix hint.
+    fn short_expr_text(&self, expr: ExprId) -> Option<String> {
+        match self.p.ast.expr(expr) {
+            Expr::Path(segs) if segs.len() == 1 && matches!(segs[0].args, crate::ast::GenericArgs::None) => {
+                Some(self.p.interner.get(segs[0].name).to_string())
+            }
+            Expr::SelfValue => Some("self".to_string()),
+            Expr::Int(v, None) => Some(v.to_string()),
+            Expr::Bool(b) => Some(b.to_string()),
+            Expr::Char(ch) => Some(format!("{ch:?}")),
+            Expr::Str(i) => self
+                .p
+                .ast
+                .strings
+                .get(*i as usize)
+                .filter(|s| s.len() <= 32)
+                .map(|s| format!("{s:?}")),
+            _ => None,
+        }
+    }
+
+    /// Emit `L0113` for a comparison where one side has one extra `&` relative
+    /// to the other (e.g. `c != "."` with `c: &&str`), naming the side to
+    /// dereference and attaching an `auto: true` edit for `lust fix`.
+    fn err_cmp_deref(
+        &mut self,
+        span: Span,
+        msg: String,
+        op: BinOp,
+        left_side: bool,
+        target: ExprId,
+        other: ExprId,
+    ) {
+        let side = if left_side { "left" } else { "right" };
+        let fix = match (self.short_expr_text(target), self.short_expr_text(other)) {
+            (Some(t), Some(o)) if left_side => {
+                format!("Dereference the left side: `*{t} {} {o}`.", op.symbol())
+            }
+            (Some(t), Some(o)) => {
+                format!("Dereference the right side: `{o} {} *{t}`.", op.symbol())
+            }
+            (Some(t), None) => format!("Dereference the {side} side: `*{t}`."),
+            (None, _) => format!("Dereference the {side} side with `*`."),
+        };
+        let at = self.span(target);
+        let mut d = Diag::new("L0113", span, msg, fix);
+        if at.lo < at.hi && at.file == span.file {
+            let simple = matches!(
+                self.p.ast.expr(target),
+                Expr::Path(_)
+                    | Expr::SelfValue
+                    | Expr::Field { .. }
+                    | Expr::Index { .. }
+                    | Expr::Call { .. }
+                    | Expr::MethodCall { .. }
+                    | Expr::Unary { .. }
+            );
+            if simple {
+                d = d.with_edit(crate::diag::Edit {
+                    start: at.lo,
+                    end: at.lo,
+                    replacement: "*".to_string(),
+                    auto: true,
+                });
+            } else {
+                d = d
+                    .with_edit(crate::diag::Edit {
+                        start: at.lo,
+                        end: at.lo,
+                        replacement: "(*".to_string(),
+                        auto: true,
+                    })
+                    .with_edit(crate::diag::Edit {
+                        start: at.hi,
+                        end: at.hi,
+                        replacement: ")".to_string(),
+                        auto: true,
+                    });
+            }
+        }
+        self.errs.push(d);
+    }
     /// True when this body already has an error and `t` still holds an
     /// unresolved inference variable: as rustc's "tainted by errors"
     /// inference, a field or method lookup (or a format trait check) on
@@ -19528,6 +19632,16 @@ impl<'p> Ctx<'p> {
             };
             if matches!(op, Shl | Shr) {
                 cx.err("L0113", span, msg, fix);
+            } else if op.is_cmp()
+                && cx.one_ref_deeper(lt, rt)
+                && let Some(lhs) = lhs
+            {
+                cx.err_cmp_deref(span, msg, op, true, lhs, rhs);
+            } else if op.is_cmp()
+                && cx.one_ref_deeper(rt, lt)
+                && let Some(lhs) = lhs
+            {
+                cx.err_cmp_deref(span, msg, op, false, rhs, lhs);
             } else if a == "{integer}" && float_width(&b).is_some() && let Some(lhs) = lhs.filter(|&l| cx.decimal_int_lit_at(cx.span(l))) {
                 // `2 * x` with `x: f64`: the literal on the left becomes `2.0`.
                 let at = cx.span(lhs);
@@ -19536,7 +19650,7 @@ impl<'p> Ctx<'p> {
                 let at = cx.span(rhs);
                 cx.err_numeric("L0113", span, msg, at, &b, &a);
             } else {
-                cx.err("L0113", span, format!("cannot apply `{}` to `{a}` and `{b}`", op.symbol()), fix);
+                cx.err("L0113", span, msg, fix);
             }
             if op.is_cmp() { BOOL } else { ERROR }
         };

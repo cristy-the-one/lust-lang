@@ -250,6 +250,55 @@ is "sandbox: nothing written for it" "$(cat "$d/ok.rs")" "$ok_before"
 # The limits are for a program lust runs; a check takes none.
 (cd "$d" && "$lust" fix ok.rs --sandbox --max-memory 64M) >/dev/null 2>&1; is "sandbox: --max-memory is a usage error, exit 2" $? 2
 
+# -------------------------------------- comparison differing by one & (L0113)
+d=$work/deref; mkdir -p "$d"
+cat >"$d/left.rs" <<'RS'
+fn main() {
+    let parts: Vec<&str> = "a/./b".split('/').filter(|c| !c.is_empty() && c != ".").collect();
+    println!("{}", parts.join("/"));
+}
+RS
+out=$( (cd "$d" && "$lust" check left.rs --json --sandbox) 2>/dev/null )
+case "$out" in *'"code":"L0113"'*'Dereference the left side: `*c != \".\"`.'*'"replacement":"*","auto":true'*) ok "deref left: fix text and auto edit";; *) bad "deref left: fix text and auto edit" "$out";; esac
+(cd "$d" && "$lust" fix left.rs --sandbox) >/dev/null 2>&1; is "deref left: plain fix --sandbox exits 0" $? 0
+case "$(cat "$d/left.rs")" in *'*c != "."'*) ok "deref left: inserted * on left side";; *) bad "deref left: inserted * on left side" "$(cat "$d/left.rs")";; esac
+same "deref left: fixed program matches rustc" "$d/left.rs"
+
+cat >"$d/right.rs" <<'RS'
+fn main() {
+    let parts: Vec<&str> = "a/./b".split('/').filter(|c| !c.is_empty() && "." != c).collect();
+    println!("{}", parts.join("/"));
+}
+RS
+out=$( (cd "$d" && "$lust" check right.rs --json --sandbox) 2>/dev/null )
+case "$out" in *'"code":"L0113"'*'Dereference the right side: `\".\" != *c`.'*'"replacement":"*","auto":true'*) ok "deref right: fix text and auto edit";; *) bad "deref right: fix text and auto edit" "$out";; esac
+(cd "$d" && "$lust" fix right.rs --sandbox) >/dev/null 2>&1; is "deref right: plain fix --sandbox exits 0" $? 0
+case "$(cat "$d/right.rs")" in *'"." != *c'*) ok "deref right: inserted * on right side";; *) bad "deref right: inserted * on right side" "$(cat "$d/right.rs")";; esac
+same "deref right: fixed program matches rustc" "$d/right.rs"
+
+cat >"$d/int.rs" <<'RS'
+fn main() {
+    let v = vec![1, 2, 3];
+    let mut hits = 0;
+    for x in &v {
+        if x == 2 {
+            hits += 1;
+        }
+    }
+    println!("{hits}");
+}
+RS
+out=$( (cd "$d" && "$lust" check int.rs --json) 2>/dev/null )
+case "$out" in *'"code":"L0113"'*'Dereference the left side: `*x == 2`.'*'"replacement":"*","auto":true'*) ok "deref int: fix text and auto edit";; *) bad "deref int: fix text and auto edit" "$out";; esac
+(cd "$d" && "$lust" fix int.rs) >/dev/null 2>&1; is "deref int: plain fix exits 0" $? 0
+same "deref int: fixed program matches rustc" "$d/int.rs"
+
+# CRLF file: normalized span offsets must map back to raw file bytes.
+printf 'fn main() {\r\n    let parts: Vec<&str> = "a/./b".split(\x27/\x27).filter(|c| !c.is_empty() && c != ".").collect();\r\n    println!("{}", parts.join("/"));\r\n}\r\n' >"$d/crlf.rs"
+(cd "$d" && "$lust" fix crlf.rs --sandbox) >/dev/null 2>&1; is "deref crlf: plain fix --sandbox exits 0" $? 0
+case "$(cat "$d/crlf.rs")" in *'*c != "."'*) ok "deref crlf: inserted * at right byte offset";; *) bad "deref crlf: inserted * at right byte offset" "$(cat "$d/crlf.rs")";; esac
+same "deref crlf: fixed program matches rustc" "$d/crlf.rs"
+
 # ------------------------------------------------------- nothing to offer
 d=$work/none; mkdir -p "$d"
 printf 'fn main() { let x: u32 = "s"; }\n' >"$d/e.rs"

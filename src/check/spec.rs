@@ -80,6 +80,8 @@ pub mod tab {
     pub const OPAQUE_HIDDEN: u8 = 46;
     pub const TEMPLATE_CHECKS: u8 = 47;
     pub const WRITTEN_PROJECTIONS: u8 = 48;
+    /// `Program::fp_memo` (driver/graph.rs): invalidated whenever `deep_stamp` moves.
+    pub const FP_MEMO: u8 = 49;
     /// No table: an arena of a body overlay (`ty::Tys`).
     pub const NONE: u8 = u8::MAX;
 }

@@ -165,33 +165,62 @@ impl StdPlan {
     /// guess only costs one more resolve pass.
     /// `root_asks` is `StdPlan::asks(root_text)`, which the caller knows.
     pub fn guess_crate(root_path: &std::path::Path, root_text: &str, root_asks: StdPlan) -> StdPlan {
+        Self::guess_crate_with_texts(root_path, root_text, root_asks, None)
+    }
+
+    /// `guess_crate` in parallel waves, optionally recording the read file
+    /// texts into `prefetched` so discovery does not read the same files
+    /// from disk a second time in the same request.
+    pub fn guess_crate_with_texts(
+        root_path: &std::path::Path,
+        root_text: &str,
+        root_asks: StdPlan,
+        mut prefetched: Option<&mut crate::intern::FxMap<std::path::PathBuf, String>>,
+    ) -> StdPlan {
         let dir = root_path.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
-        let plan = root_asks;
-        let mut seen: Vec<std::path::PathBuf> = vec![root_path.to_path_buf()];
-        // (file, its children's directory, its text)
-        let mut queue: Vec<(std::path::PathBuf, std::path::PathBuf, String)> = Vec::new();
-        let mut push_children = |text: &str, file_dir: &std::path::Path, dir: &std::path::Path, queue: &mut Vec<_>| {
-            for (path, by_attr) in mod_files(text, file_dir, dir) {
-                // A cap for a root in a huge tree; a short guess is still checked.
-                if seen.len() < 20_000 && !seen.contains(&path) {
-                    seen.push(path.clone());
-                    if let Ok(t) = crate::srctext::read(&path) {
-                        // A `#[path]` file's children load as a mod.rs file's do.
-                        let dir =
-                            if by_attr { path.parent().map(std::path::Path::to_path_buf).unwrap_or_default() } else { child_dir(&path) };
-                        queue.push((path, dir, t));
+        let mut plan = root_asks;
+        let mut seen: crate::intern::FxMap<std::path::PathBuf, ()> = crate::intern::FxMap::default();
+        seen.insert(root_path.to_path_buf(), ());
+        let mut wave: Vec<(std::path::PathBuf, bool)> = Vec::new();
+        for (path, by_attr) in mod_files(root_text, &dir, &dir) {
+            if seen.len() < 20_000 && seen.insert(path.clone(), ()).is_none() {
+                wave.push((path, by_attr));
+            }
+        }
+        let has_overlay = crate::driver::has_source_overlay();
+        while !wave.is_empty() {
+            let loaded: Vec<Option<(std::path::PathBuf, String, StdPlan, Vec<(std::path::PathBuf, bool)>)>> =
+                crate::pool::par_map(&wave, |(path, by_attr)| {
+                    let text = if has_overlay {
+                        crate::driver::read_source(path).ok()?
+                    } else {
+                        crate::srctext::read(path).ok()?
+                    };
+                    let asks = StdPlan::asks(&text);
+                    let file_dir = path.parent().unwrap_or(std::path::Path::new(""));
+                    // A `#[path]` file's children load as a mod.rs file's do.
+                    let cdir = if *by_attr { file_dir.to_path_buf() } else { child_dir(path) };
+                    let kids = mod_files(&text, file_dir, &cdir);
+                    Some((path.clone(), text, asks, kids))
+                });
+            let mut next_wave: Vec<(std::path::PathBuf, bool)> = Vec::new();
+            for item in loaded.into_iter().flatten() {
+                let (path, text, asks, kids) = item;
+                plan = plan.or(asks);
+                if let Some(map) = prefetched.as_deref_mut()
+                    && !has_overlay
+                {
+                    map.insert(path, text);
+                }
+                for (kpath, by_attr) in kids {
+                    if seen.len() < 20_000 && seen.insert(kpath.clone(), ()).is_none() {
+                        next_wave.push((kpath, by_attr));
                     }
                 }
             }
-        };
-        push_children(root_text, &dir, &dir, &mut queue);
-        let mut texts = Vec::new();
-        while let Some((path, dir, text)) = queue.pop() {
-            let file_dir = path.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
-            push_children(&text, &file_dir, &dir, &mut queue);
-            texts.push(text);
+            wave = next_wave;
         }
-        texts.iter().fold(plan, |p, t| p.or(StdPlan::asks(t)))
+        plan
     }
 }
 
@@ -468,14 +497,28 @@ impl StdLoad {
     /// files ask (`platform`, the OR of their asks; `None` when the pass
     /// that saw `user` ran without the platform crate, so the next pass
     /// adds them).
+    #[allow(dead_code)]
     pub fn close(&self, user: StdPlan, platform: Option<StdPlan>) -> Result<StdPlan, String> {
+        self.close_with(user, platform, || None)
+    }
+
+    /// `close`, lazily calling `fallback_platform` when the closure itself
+    /// turns `platform` on (for example a spliced std module whose source
+    /// names a platform module, so the first resolve does not need a retry).
+    pub fn close_with(&self, user: StdPlan, mut platform: Option<StdPlan>, fallback_platform: impl FnOnce() -> Option<StdPlan>) -> Result<StdPlan, String> {
+        let mut fallback = Some(fallback_platform);
         let mut plan = user;
         loop {
             let mut next = user.or(self.splice_asks(plan.needs)?);
-            if next.platform
-                && let Some(p) = platform
-            {
-                next = next.or(p);
+            if next.platform {
+                if platform.is_none()
+                    && let Some(f) = fallback.take()
+                {
+                    platform = f();
+                }
+                if let Some(p) = platform {
+                    next = next.or(p);
+                }
             }
             // Each step only adds asks, so this ends within a few steps.
             if next == plan {

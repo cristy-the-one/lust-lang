@@ -85,6 +85,91 @@ use crate::ty::lang::{ShippedCrate, StdFnDef, StdNeeds};
 use std::sync::Arc;
 use std::time::SystemTime;
 
+/// Directory-grouped index of `front.map` files (`1..n`) and `tables.module_alts`
+/// so `PatchBase::new` and `find_edits` batch filesystem checks with one
+/// `read_dir` per unique parent directory instead of one `stat` per file.
+#[derive(Default)]
+struct DirWatch {
+    dirs: Vec<WatchedDir>,
+    loose_files: Vec<usize>,
+    loose_alts: Vec<std::path::PathBuf>,
+}
+
+struct WatchedDir {
+    path: std::path::PathBuf,
+    files: Vec<(usize, std::ffi::OsString)>,
+    direct_alts: Vec<(Option<AltKey>, std::path::PathBuf)>,
+    subdir_alts: Vec<(Option<AltKey>, std::path::PathBuf)>,
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+type AltKey = String;
+#[cfg(not(any(windows, target_os = "macos")))]
+type AltKey = std::ffi::OsString;
+
+fn alt_key(name: &std::ffi::OsStr) -> Option<AltKey> {
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        name.to_str().map(str::to_lowercase)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        Some(name.to_os_string())
+    }
+}
+
+impl DirWatch {
+    fn build(map: &SourceMap, module_alts: &[std::path::PathBuf]) -> DirWatch {
+        let mut dir_idx: FxMap<std::path::PathBuf, usize> = FxMap::default();
+        let mut dirs: Vec<WatchedDir> = Vec::new();
+        let mut loose_files: Vec<usize> = Vec::new();
+        let mut loose_alts: Vec<std::path::PathBuf> = Vec::new();
+        fn slot(dir_idx: &mut FxMap<std::path::PathBuf, usize>, dirs: &mut Vec<WatchedDir>, dir: &std::path::Path) -> usize {
+            if let Some(&i) = dir_idx.get(dir) {
+                return i;
+            }
+            let i = dirs.len();
+            let pb = dir.to_path_buf();
+            dir_idx.insert(pb.clone(), i);
+            dirs.push(WatchedDir { path: pb, files: Vec::new(), direct_alts: Vec::new(), subdir_alts: Vec::new() });
+            i
+        }
+        for k in 1..map.file_count() {
+            let p = std::path::Path::new(map.path(FileId(k as u32)));
+            if p.as_os_str().is_empty() {
+                continue;
+            }
+            if let (Some(parent), Some(fname)) = (p.parent(), p.file_name())
+                && !parent.as_os_str().is_empty()
+            {
+                let i = slot(&mut dir_idx, &mut dirs, parent);
+                dirs[i].files.push((k, fname.to_os_string()));
+            } else {
+                loose_files.push(k);
+            }
+        }
+        let mod_rs = std::ffi::OsStr::new("mod.rs");
+        for alt in module_alts {
+            if alt.file_name() == Some(mod_rs)
+                && let Some(sub) = alt.parent()
+                && let (Some(gp), Some(sub_name)) = (sub.parent(), sub.file_name())
+                && !gp.as_os_str().is_empty()
+            {
+                let i = slot(&mut dir_idx, &mut dirs, gp);
+                dirs[i].subdir_alts.push((alt_key(sub_name), alt.clone()));
+            } else if let (Some(parent), Some(fname)) = (alt.parent(), alt.file_name())
+                && !parent.as_os_str().is_empty()
+            {
+                let i = slot(&mut dir_idx, &mut dirs, parent);
+                dirs[i].direct_alts.push((alt_key(fname), alt.clone()));
+            } else {
+                loose_alts.push(alt.clone());
+            }
+        }
+        DirWatch { dirs, loose_files, loose_alts }
+    }
+}
+
 /// A file's stat when its text entered the map: modification time and
 /// size. Trusted only when the file was already older than the request
 /// that read it, so a write in the same clock tick is never missed.
@@ -118,6 +203,7 @@ impl PatchBase {
                 drop(take(&mut self.fn_lines));
                 drop(take(&mut self.live_slots));
                 drop(take(&mut self.root_unspliced));
+                drop(take(&mut self.dir_watch));
                 drop(self.local_names.take());
             }
             _ => {}
@@ -143,6 +229,8 @@ pub(crate) struct PatchBase {
     needs: Vec<(StdNeeds, bool)>,
     /// Per map file: the stat that proves its text unchanged, if any.
     stamps: Vec<Option<Stamp>>,
+    /// Parent-directory index for batched `read_dir` checks in `find_edits`.
+    dir_watch: DirWatch,
     /// Some file of the session defines a macro (`macro_rules`): tokens
     /// of one file can then sit in another file's nodes (no `ranges`).
     user_macros: bool,
@@ -288,11 +376,19 @@ fn file_needs(text: &str) -> (StdNeeds, bool) {
 
 fn stamp_of(path: &str, request_start: SystemTime) -> Option<Stamp> {
     let md = std::fs::metadata(path).ok()?;
+    stamp_from_md(&md, request_start)
+}
+
+fn stamp_from_md(md: &std::fs::Metadata, request_start: SystemTime) -> Option<Stamp> {
     let mtime = md.modified().ok()?;
+    stamp_from_parts(mtime, md.len(), request_start)
+}
+
+fn stamp_from_parts(mtime: SystemTime, len: u64, request_start: SystemTime) -> Option<Stamp> {
     // A file modified within two seconds of the request that read it may
     // change again without its stat moving: never trust that stat.
     let old = request_start.duration_since(mtime).is_ok_and(|age| age.as_secs() >= 2);
-    old.then_some(Stamp { mtime, len: md.len() })
+    old.then_some(Stamp { mtime, len })
 }
 
 impl PatchBase {
@@ -309,6 +405,7 @@ impl PatchBase {
         body_hashes: Vec<u64>,
         request_start: SystemTime,
         expand: FxMap<crate::ty::defs::ModuleId, (crate::resolve::cfg::CfgEnv, String)>,
+        no_builtin_shadow: bool,
     ) -> PatchBase {
         let map = &front.map;
         let n = map.file_count();
@@ -319,13 +416,71 @@ impl PatchBase {
         let needs = super::compile::par_map(&texts, |&(k, t)| {
             if k > 0 && std::path::Path::new(map.path(FileId(k as u32))).starts_with(platform) { Default::default() } else { file_needs(t) }
         });
-        // The stamps (a stat per file) and the shadow scan (every file's text) on the pool.
+        let dir_watch = DirWatch::build(map, &tables.module_alts);
+        // The stamps (on Windows, batched via `read_dir` which returns `WIN32_FIND_DATAW`
+        // without per-file syscalls; on Unix, per-file `stat` on the pool).
+        #[cfg(windows)]
+        let stamps = {
+            let mut stamps = vec![None; n];
+            if n > 0 {
+                let p0 = map.path(FileId(0));
+                if !p0.is_empty() {
+                    stamps[0] = stamp_of(p0, request_start);
+                }
+            }
+            let scan_stamps = |d: &WatchedDir| -> Vec<(usize, Option<Stamp>)> {
+                if d.files.is_empty() {
+                    return Vec::new();
+                }
+                let mut exact: FxMap<std::ffi::OsString, Option<Stamp>> = FxMap::default();
+                if let Ok(rd) = std::fs::read_dir(&d.path) {
+                    for ent in rd.flatten() {
+                        if ent.file_type().ok().is_some_and(|ft| ft.is_file())
+                            && let Ok(md) = ent.metadata()
+                        {
+                            exact.insert(ent.file_name(), stamp_from_md(&md, request_start));
+                        }
+                    }
+                }
+                d.files
+                    .iter()
+                    .map(|(k, fname)| {
+                        if let Some(&st) = exact.get(fname) {
+                            (*k, st)
+                        } else {
+                            let path = map.path(FileId(*k as u32));
+                            (*k, if path.is_empty() { None } else { stamp_of(path, request_start) })
+                        }
+                    })
+                    .collect()
+            };
+            let parts: Vec<Vec<(usize, Option<Stamp>)>> = if dir_watch.dirs.len() >= 4 && crate::pool::threads() > 1 {
+                super::compile::par_map(&dir_watch.dirs, scan_stamps)
+            } else {
+                dir_watch.dirs.iter().map(scan_stamps).collect()
+            };
+            for part in parts {
+                for (k, st) in part {
+                    stamps[k] = st;
+                }
+            }
+            for &k in &dir_watch.loose_files {
+                let path = map.path(FileId(k as u32));
+                if !path.is_empty() {
+                    stamps[k] = stamp_of(path, request_start);
+                }
+            }
+            stamps
+        };
+        #[cfg(not(windows))]
         let stamps = super::compile::par_map(&texts, |&(k, _)| {
             let path = map.path(FileId(k as u32));
             if path.is_empty() { None } else { stamp_of(path, request_start) }
         });
         let user_macros = texts.iter().any(|(_, t)| t.contains("macro_rules"));
-        let shadowed = user_macros && super::compile::par_map(&texts, |(_, t)| shadows_parser_macro(t)).into_iter().any(|s| s);
+        // Every parser macro is a builtin macro (`is_passthrough`), so when the caller
+        // already proved no file shadows any builtin, no parser macro is shadowed either.
+        let shadowed = user_macros && !no_builtin_shadow && super::compile::par_map(&texts, |(_, t)| shadows_parser_macro(t)).into_iter().any(|s| s);
         let includes = front.chunks.iter().any(|c| c.expand_deps.iter().any(|d| matches!(d, crate::expand::Dep::File { .. })));
         let ranges = (!user_macros && !includes).then(|| span_shift::ranges_by_file(&front.ast, n));
         let mut fns_by_file: Vec<Vec<u32>> = vec![Vec::new(); n];
@@ -363,6 +518,7 @@ impl PatchBase {
             spliced,
             needs,
             stamps,
+            dir_watch,
             user_macros,
             shadowed,
             expand,
@@ -815,38 +971,192 @@ fn find_edits(front: &mut Front, inputs: u64, root: &str, request_start: SystemT
     }
     let mut fresh_stamps: Vec<(usize, Option<Stamp>)> = Vec::new();
     let mut reads = 0usize;
-    for k in 1..front.map.file_count() {
+    enum FileCheck {
+        Unchanged,
+        Refreshed(Option<Stamp>),
+        Changed(String),
+        Gone,
+    }
+    let has_overlay = crate::driver::has_source_overlay();
+    let check_one = |k: usize| -> FileCheck {
         let file = FileId(k as u32);
         let path = front.map.path(file);
         if path.is_empty() {
-            continue;
+            return FileCheck::Unchanged;
         }
         // An overlay text (`lust test`'s harness shims) can change while its file's stamp
         // stands: the shims of a module name the tests of the modules below it. Compare it.
-        if let Some(text) = crate::driver::overlay_text(std::path::Path::new(path)) {
-            if front.map.text(file) != Some(text.as_str()) {
-                changed.push((file, text));
-            }
-            continue;
+        if has_overlay
+            && let Some(text) = crate::driver::overlay_text(std::path::Path::new(path))
+        {
+            return if front.map.text(file) != Some(text.as_str()) { FileCheck::Changed(text) } else { FileCheck::Unchanged };
         }
-        let md = std::fs::metadata(path).map_err(|_| "file gone")?;
+        let Ok(md) = std::fs::metadata(path) else { return FileCheck::Gone };
         if let (Some(st), Ok(mtime)) = (base.stamps.get(k).copied().flatten(), md.modified())
             && st == (Stamp { mtime, len: md.len() })
         {
-            continue;
+            return FileCheck::Unchanged;
         }
-        let text = crate::srctext::read(std::path::Path::new(path)).map_err(|_| "file gone")?;
+        let Ok(text) = crate::srctext::read(std::path::Path::new(path)) else { return FileCheck::Gone };
         if front.map.text(file) == Some(text.as_str()) {
-            reads += 1;
-            fresh_stamps.push((k, stamp_of(path, request_start)));
-            continue;
+            FileCheck::Refreshed(stamp_from_md(&md, request_start))
+        } else {
+            FileCheck::Changed(text)
         }
-        changed.push((file, text));
+    };
+    let check_dir = |d: &WatchedDir| -> (Vec<(usize, FileCheck)>, bool) {
+        let mut out: Vec<(usize, FileCheck)> = Vec::new();
+        let need_alts = !d.direct_alts.is_empty() || !d.subdir_alts.is_empty();
+        #[cfg(windows)]
+        let need_rd = !d.files.is_empty() || need_alts;
+        #[cfg(not(windows))]
+        let need_rd = need_alts;
+        if need_rd && let Ok(rd) = std::fs::read_dir(&d.path) {
+            #[cfg(windows)]
+            let mut exact: FxMap<std::ffi::OsString, (SystemTime, u64)> = FxMap::default();
+            // For each entry when `need_alts`: (is_regular_file, is_dir_or_symlink_or_unknown).
+            let mut alt_map: FxMap<AltKey, (bool, bool)> = FxMap::default();
+            for ent in rd.flatten() {
+                let ft = ent.file_type().ok();
+                let is_file = ft.is_some_and(|t| t.is_file());
+                let is_dir_or_link = ft.is_none_or(|t| t.is_dir() || t.is_symlink());
+                let fname = ent.file_name();
+                if need_alts
+                    && let Some(key) = alt_key(&fname)
+                {
+                    let e = alt_map.entry(key).or_insert((false, false));
+                    e.0 |= is_file;
+                    e.1 |= is_dir_or_link;
+                }
+                #[cfg(windows)]
+                if is_file
+                    && !d.files.is_empty()
+                    && let Ok(md) = ent.metadata()
+                    && let Ok(mtime) = md.modified()
+                {
+                    exact.insert(fname, (mtime, md.len()));
+                }
+            }
+            // Check `module_alts` inside this directory without touching absent paths.
+            let mut alt_added = false;
+            for (key, alt_path) in &d.direct_alts {
+                let hit = match key.as_ref().and_then(|k| alt_map.get(k)) {
+                    None => false,
+                    Some(&(is_file, is_dir_or_link)) => {
+                        if is_file && !is_dir_or_link {
+                            true
+                        } else if is_dir_or_link {
+                            alt_path.is_file()
+                        } else {
+                            false
+                        }
+                    }
+                };
+                if hit {
+                    alt_added = true;
+                    break;
+                }
+            }
+            if !alt_added {
+                for (key, alt_path) in &d.subdir_alts {
+                    let check = match key.as_ref().and_then(|k| alt_map.get(k)) {
+                        None => false,
+                        Some(&(_, is_dir_or_link)) => is_dir_or_link,
+                    };
+                    if check && alt_path.is_file() {
+                        alt_added = true;
+                        break;
+                    }
+                }
+            }
+            if alt_added {
+                return (out, true);
+            }
+            #[cfg(windows)]
+            for &(k, ref fname) in &d.files {
+                let res = if has_overlay {
+                    check_one(k)
+                } else if let Some(&(mtime, len)) = exact.get(fname) {
+                    if base.stamps.get(k).copied().flatten() == Some(Stamp { mtime, len }) {
+                        FileCheck::Unchanged
+                    } else {
+                        let file = FileId(k as u32);
+                        let path = front.map.path(file);
+                        let Ok(text) = crate::srctext::read(std::path::Path::new(path)) else {
+                            out.push((k, FileCheck::Gone));
+                            continue;
+                        };
+                        if front.map.text(file) == Some(text.as_str()) {
+                            FileCheck::Refreshed(stamp_from_parts(mtime, len, request_start))
+                        } else {
+                            FileCheck::Changed(text)
+                        }
+                    }
+                } else {
+                    check_one(k)
+                };
+                if !matches!(res, FileCheck::Unchanged) {
+                    out.push((k, res));
+                }
+            }
+            #[cfg(not(windows))]
+            for &(k, _) in &d.files {
+                let res = check_one(k);
+                if !matches!(res, FileCheck::Unchanged) {
+                    out.push((k, res));
+                }
+            }
+            return (out, false);
+        }
+        // Fallback when `read_dir` was skipped or failed.
+        let alt_added = d.direct_alts.iter().any(|(_, p)| p.is_file()) || d.subdir_alts.iter().any(|(_, p)| p.is_file());
+        if alt_added {
+            return (out, true);
+        }
+        for &(k, _) in &d.files {
+            let res = check_one(k);
+            if !matches!(res, FileCheck::Unchanged) {
+                out.push((k, res));
+            }
+        }
+        (out, false)
+    };
+    let dir_results: Vec<(Vec<(usize, FileCheck)>, bool)> = if base.dir_watch.dirs.len() >= 4 && crate::pool::threads() > 1 {
+        super::compile::par_map(&base.dir_watch.dirs, check_dir)
+    } else {
+        base.dir_watch.dirs.iter().map(check_dir).collect()
+    };
+    let mut alt_added = false;
+    for (part, added) in dir_results {
+        if added {
+            alt_added = true;
+            break;
+        }
+        for (k, res) in part {
+            match res {
+                FileCheck::Unchanged => {}
+                FileCheck::Refreshed(st) => {
+                    reads += 1;
+                    fresh_stamps.push((k, st));
+                }
+                FileCheck::Changed(text) => changed.push((FileId(k as u32), text)),
+                FileCheck::Gone => return Err("file gone"),
+            }
+        }
     }
-    // Each `mod name;` stands while the file it did not take stays absent
-    // (`ResolvedTables::module_alts`): with both, a cold resolve rejects it.
-    if base.tables.module_alts.iter().any(|p| p.is_file()) {
+    if alt_added || base.dir_watch.loose_alts.iter().any(|p| p.is_file()) {
         return Err("module file added");
+    }
+    for &k in &base.dir_watch.loose_files {
+        match check_one(k) {
+            FileCheck::Unchanged => {}
+            FileCheck::Refreshed(st) => {
+                reads += 1;
+                fresh_stamps.push((k, st));
+            }
+            FileCheck::Changed(text) => changed.push((FileId(k as u32), text)),
+            FileCheck::Gone => return Err("file gone"),
+        }
     }
     if !changed.is_empty() {
         let base = front.patch.as_mut().ok_or("no base")?;
@@ -926,20 +1236,36 @@ fn find_body_edit(front: &Front, text: &str, edit: Edit) -> Result<NewBody, &'st
     let old = front.map.text(file).ok_or("no text")?;
     let (a, b, d) = (edit.a as usize, edit.b as usize, edit.d);
     let ast = &front.ast;
-    let (fn_index, &(item, sub)) = front
-        .fn_loc
-        .iter()
-        .enumerate()
-        .find(|&(_, &(item, sub))| {
-            item != usize::MAX && {
-                let def = fn_def_at(ast, item, sub);
-                def.body.is_some_and(|bl| {
-                    let sp = ast.blocks[bl.0 as usize].span;
-                    sp.file == file && (sp.lo as usize) < a && b < sp.hi as usize
-                })
-            }
-        })
-        .ok_or_else(|| outside_fn_reason(ast, file, a, b))?;
+    let body_holds = |(item, sub): (usize, Option<usize>)| {
+        item != usize::MAX && {
+            let def = fn_def_at(ast, item, sub);
+            def.body.is_some_and(|bl| {
+                let sp = ast.blocks[bl.0 as usize].span;
+                sp.file == file && (sp.lo as usize) < a && b < sp.hi as usize
+            })
+        }
+    };
+    let found_in_file = base
+        .fns_by_file
+        .get(file.0 as usize)
+        .and_then(|fns| {
+            fns.iter().find_map(|&idx| {
+                let i = idx as usize;
+                let loc = *front.fn_loc.get(i)?;
+                body_holds(loc).then_some((i, loc))
+            })
+        });
+    let (fn_index, (item, sub)) = match found_in_file {
+        Some(hit) => hit,
+        None if !base.user_macros => return Err(outside_fn_reason(ast, file, a, b)),
+        None => front
+            .fn_loc
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|&(_, loc)| body_holds(loc))
+            .ok_or_else(|| outside_fn_reason(ast, file, a, b))?,
+    };
     let def = fn_def_at(ast, item, sub);
     let rpit = def.ret.is_some_and(|t| matches!(ast.ty(t), TyExpr::ImplTrait { .. })).then(|| super::ast_hash::body_scan(ast, def, None).0);
     if !matches!(ast.items[item].kind, ItemKind::Fn(_) | ItemKind::Impl(_)) {

@@ -735,6 +735,21 @@ fn make_map(seen: &[(PathBuf, String, FileId)]) -> (SourceMap, String) {
 /// fingerprints the whole cache: expansion answers depend on it.
 /// Decided with W-RESOLVE through the `iface:` commit that added
 /// `resolve_crate_cached`.
+/// A file's metadata stamp when its text was read (`ResolveCache::file_texts`):
+/// trusted only when modified at least two seconds before the request started,
+/// matching `driver::patch::Stamp`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    mtime: std::time::SystemTime,
+    len: u64,
+}
+
+fn file_stamp_from_md(md: &std::fs::Metadata, request_start: std::time::SystemTime) -> Option<FileStamp> {
+    let mtime = md.modified().ok()?;
+    let old = request_start.duration_since(mtime).is_ok_and(|age| age.as_secs() >= 2);
+    old.then_some(FileStamp { mtime, len: md.len() })
+}
+
 #[derive(Default)]
 pub struct ResolveCache {
     env_fp: u64,
@@ -743,6 +758,14 @@ pub struct ResolveCache {
     /// filesystem call per path, and discovery asks for every file
     /// on every request.
     canon: FxMap<PathBuf, String>,
+    /// File texts read by the session's initial `StdPlan::guess_crate` in
+    /// this same request (`seed_texts`), consumed by the first resolve so
+    /// cold discovery does not read every file from disk twice.
+    prefetched: FxMap<PathBuf, String>,
+    /// Cached file texts keyed by canonical path with their trusted metadata
+    /// stamp, for warm daemon full resolves (`!one_shot`): unchanged files
+    /// whose stamp holds skip reading from disk.
+    file_texts: FxMap<String, (Option<FileStamp>, String)>,
     /// Set for a one-shot process, which compiles once: no later request
     /// reads the cache, so it stores nothing (no copies of token streams
     /// or final chunks), and the resolve skips the expanded-stream
@@ -831,6 +854,8 @@ impl ResolveCache {
         }
         if part == 5 {
             drop(std::mem::take(&mut self.canon));
+            drop(std::mem::take(&mut self.prefetched));
+            drop(std::mem::take(&mut self.file_texts));
             drop(self.seed.take());
             drop(self.file_expander.take());
         }
@@ -1119,6 +1144,12 @@ impl ResolveCache {
     /// An empty cache; `one_shot` for a process that compiles once.
     pub fn new(one_shot: bool) -> ResolveCache {
         ResolveCache { one_shot, ..ResolveCache::default() }
+    }
+
+    /// Hands off file texts already read by `StdPlan::guess_crate` in this
+    /// same request so cold discovery reuses them without a second disk read.
+    pub fn seed_texts(&mut self, texts: FxMap<PathBuf, String>) {
+        self.prefetched = texts;
     }
 
     /// Holds a crate root's raw token list, lexed by routing, for
@@ -1434,6 +1465,11 @@ impl SharedFiles {
     /// The session-global FileId of one (file, module) pair.
     fn file_id(&mut self, path: &std::path::Path, module: ModuleId) -> FileId {
         let canon = modules::canonical_string(path);
+        self.file_id_canon(&canon, module)
+    }
+
+    /// `file_id` when the caller already has `path`'s canonical string.
+    fn file_id_canon(&mut self, canon: &str, module: ModuleId) -> FileId {
         let next = &mut self.next_file;
         *self.file_ids.entry(format!("{canon}#{}", module.0)).or_insert_with(|| {
             let id = FileId(*next);
@@ -1903,24 +1939,62 @@ pub fn resolve_crate_with(
         order.insert(at, sj);
     }
     let mut shared = SharedFiles::default();
-    // Every file an earlier resolve canonicalized, read again now in
-    // parallel: discovery walks the module tree one file at a time and
-    // finds these texts here (a CI checkout is not in the page cache, and
-    // the walk read about 1000 files in turn). A file gone since is left
-    // out, and a new one is the walk's own read, as before.
+    let prefetched = std::mem::take(&mut cache.prefetched);
+    let request_start = std::time::SystemTime::now();
+    // Every file an earlier resolve canonicalized, checked/read in parallel:
+    // warm daemon sessions reuse cached texts whose trusted metadata stamp
+    // (`age >= 2s`, matching `driver::patch::Stamp`) still holds, skipping
+    // disk reads for unchanged files.
     {
         let seen: Vec<(&PathBuf, &String)> = cache.canon.iter().collect();
+        let has_overlay = crate::driver::has_source_overlay();
+        let one_shot = cache.one_shot;
         // A front image build read most of them beside its load (`prefetch`).
         let pre = std::sync::Mutex::new(crate::resolve::prefetch::take().unwrap_or_default());
-        let read = |path: &PathBuf| {
-            let hit = pre.lock().unwrap().remove(path);
-            // A prefetch hit is the file on disk. An overlay (`lust test`'s
-            // harness shims) replaces that text for this compile.
-            hit.filter(|_| !crate::driver::has_source_overlay()).or_else(|| crate::driver::read_source(path).ok())
+        enum PreRead {
+            Reuse(String),
+            Fresh(Option<FileStamp>, String),
+            Missing,
+        }
+        let read = |(path, canon): &(&PathBuf, &String)| -> PreRead {
+            if !has_overlay {
+                if let Some(text) = pre.lock().unwrap().remove(*path) {
+                    let st = (!one_shot).then(|| std::fs::metadata(path).ok().and_then(|md| file_stamp_from_md(&md, request_start))).flatten();
+                    return PreRead::Fresh(st, text);
+                }
+                if !one_shot
+                    && let Some((Some(st), cached)) = cache.file_texts.get(*canon)
+                    && let Ok(md) = std::fs::metadata(path)
+                    && let Ok(mtime) = md.modified()
+                    && *st == (FileStamp { mtime, len: md.len() })
+                {
+                    return PreRead::Reuse(cached.clone());
+                }
+            }
+            let st = (!has_overlay && !one_shot)
+                .then(|| std::fs::metadata(path).ok().and_then(|md| file_stamp_from_md(&md, request_start)))
+                .flatten();
+            match crate::driver::read_source(path) {
+                Ok(text) => PreRead::Fresh(st, text),
+                Err(_) => PreRead::Missing,
+            }
         };
-        for ((_, canon), text) in seen.iter().zip(par_map(&seen, |(path, _)| read(path))) {
-            if let Some(text) = text {
-                shared.text_by_path.insert((*canon).clone(), text);
+        let loaded = par_map(&seen, read);
+        let canons: Vec<String> = seen.iter().map(|(_, c)| (*c).clone()).collect();
+        for (canon, res) in canons.into_iter().zip(loaded) {
+            match res {
+                PreRead::Reuse(text) => {
+                    shared.text_by_path.insert(canon, text);
+                }
+                PreRead::Fresh(st, text) => {
+                    if !one_shot && !has_overlay {
+                        cache.file_texts.insert(canon.clone(), (st, text.clone()));
+                    }
+                    shared.text_by_path.insert(canon, text);
+                }
+                PreRead::Missing => {
+                    cache.file_texts.remove(&canon);
+                }
             }
         }
     }
@@ -1930,7 +2004,8 @@ pub fn resolve_crate_with(
     // dependencies resolve first: the spliced std ranges, the error
     // footer, and `Program::shipped_crate_at` all read file 0 as the
     // selected root.
-    shared.file_id(&input.root_path, ROOT_MODULE);
+    let root_canon = cache.canon(&input.root_path);
+    shared.file_id_canon(&root_canon, ROOT_MODULE);
     let mut all_seen: Vec<(PathBuf, String, FileId)> = Vec::new();
     let (mut std_asks, mut platform_asks) = (StdPlan::default(), with_platform.then(StdPlan::default));
     let mut add_asks = |j: usize, asks: StdPlan| match &mut platform_asks {
@@ -1978,7 +2053,7 @@ pub fn resolve_crate_with(
                 dep_exports.push((interner.get(jobs[d].magic).to_string(), sources.clone()));
             }
         }
-        match resolve_one(&jobs[j], &mut tables, &mut shared, cache, &dep_exports, &input.client, interner, known) {
+        match resolve_one(&jobs[j], &mut tables, &mut shared, cache, &prefetched, request_start, &dep_exports, &input.client, interner, known) {
             Ok(out) => {
                 if let Some(exact_layout) = &jobs[j].adapter {
                     tables.adapters.push(super::imports::AdapterCrate {
@@ -2195,6 +2270,7 @@ fn seen_of(discs: &[FileDisc]) -> Vec<(PathBuf, String, FileId)> {
 /// processing. A declaration whose module already exists is a no-op,
 /// which is what lets the same code serve the first discovery pass
 /// and the macro-generated edges of later expansion rounds.
+/// Creates inline modules, resolves `mod name;` declarations, and queues newly discovered files.
 #[allow(clippy::too_many_arguments)]
 fn outline_mods(
     di: usize,
@@ -2204,6 +2280,7 @@ fn outline_mods(
     queue: &mut Vec<usize>,
     tables: &mut ResolvedTables,
     shared: &mut SharedFiles,
+    cache: &mut ResolveCache,
     job: &CrateJob,
     interner: &Interner,
     diags: &mut Vec<Diag>,
@@ -2278,12 +2355,12 @@ fn outline_mods(
                         let (flat, nested) = modules::module_candidates(&file_path, dir_owner, &inline_names, interner.get(decl.name));
                         tables.module_alts.push(if f == flat { nested } else { flat });
                     }
-                    let fcanon = modules::canonical_string(&f);
+                    let fcanon = cache.canon(&f);
                     let ftext = match shared.text_by_path.get(&fcanon) {
                         Some(t) => t.clone(),
                         None => match crate::driver::read_source(&f) {
                             Ok(t) => {
-                                shared.text_by_path.insert(fcanon, t.clone());
+                                shared.text_by_path.insert(fcanon.clone(), t.clone());
                                 t
                             }
                             Err(e) => {
@@ -2297,7 +2374,7 @@ fn outline_mods(
                             }
                         },
                     };
-                    let file_id = shared.file_id(&f, child);
+                    let file_id = shared.file_id_canon(&fcanon, child);
                     discs.push(FileDisc {
                         path: f,
                         text: ftext,
@@ -2367,58 +2444,314 @@ fn bind_outline_macros(
     }
 }
 
-/// Lexes and outlines one discovered file (the original text), creates
-/// its module edges, and binds its macro names.
+/// Lexes and outlines waves of discovered files in parallel, resolving child
+/// module files and reading uncached sources in parallel per wave, then
+/// committing module registrations, caches, and `FileDisc`s in deterministic
+/// wave order.
 #[allow(clippy::too_many_arguments)]
-fn process_disc_orig(
-    di: usize,
+fn discover_waves(
+    mut wave: Vec<usize>,
     discs: &mut Vec<FileDisc>,
-    queue: &mut Vec<usize>,
     tables: &mut ResolvedTables,
     shared: &mut SharedFiles,
     cache: &mut ResolveCache,
+    prefetched: &FxMap<PathBuf, String>,
+    request_start: std::time::SystemTime,
     job: &CrateJob,
     interner: &Interner,
     diags: &mut Vec<Diag>,
     std_asks: &mut StdPlan,
 ) {
-    let (text, file_id, module) = (discs[di].text.clone(), discs[di].file_id, discs[di].module);
-    // Raw tokens and outline from the per-file cache when the text
-    // stands (keyed by canonical path plus module, as in discovery).
-    let file_key = job.file_key(&cache.canon(&discs[di].path), module);
-    let text_hash = hash_str(&text);
-    // The root file's std splice is the driver's, not the user's ask.
-    let own = match job.input.std_splice_lo {
-        Some(lo) if file_id == FileId(0) => text.get(..lo as usize).unwrap_or(&text),
-        _ => &text,
-    };
-    *std_asks = std_asks.or(cache.std_asks(&file_key, text_hash, file_id, own));
-    let lexed = match cache.raw(&file_key, text_hash, file_id) {
-        Some(l) => l,
-        None => match lex_file(&text, file_id, interner) {
-            Ok(l) => {
-                cache.put_raw(&file_key, text_hash, file_id, &l);
-                l
-            }
-            Err(d) => {
-                diags.push(d);
-                return;
-            }
+    struct PendingChild {
+        di: usize,
+        file_path: PathBuf,
+        dir_owner: bool,
+        inline_names: Vec<String>,
+        name: String,
+        path_attr: Option<String>,
+        span: Span,
+        child: ModuleId,
+        container: Vec<Sym>,
+        macro_use: bool,
+    }
+    enum ChildRes {
+        Ok {
+            f: PathBuf,
+            alt: Option<PathBuf>,
+            canon: String,
+            new_canon: bool,
+            text: String,
+            new_text: bool,
+            stamp: Option<FileStamp>,
         },
-    };
-    let outline = match cache.outline(&file_key, text_hash, file_id) {
-        Some(o) => o,
-        None => {
-            let o = scan::outline(&lexed, interner);
-            cache.put_outline(&file_key, text_hash, file_id, &o);
-            o
+        Err(Diag),
+    }
+    let has_overlay = crate::driver::has_source_overlay();
+    let one_shot = cache.one_shot;
+    while !wave.is_empty() {
+        // Step 1: check caches on the main thread; lex/outline/std_asks misses in parallel.
+        struct Prepared {
+            di: usize,
+            file_key: String,
+            text_hash: u64,
+            file_id: FileId,
+            module: ModuleId,
+            asks: Option<StdPlan>,
+            lexed: Option<lexer::Lexed>,
+            outline: Option<scan::Outline>,
         }
-    };
-    let inline = outline_mods(di, &outline, &lexed.strings.clone(), discs, queue, tables, shared, job, interner, diags);
-    bind_outline_macros(&outline, module, &inline, job, tables, interner);
-    discs[di].use_sites = cache.use_sites(&file_key, text_hash, file_id, &tables.modules[module.0 as usize].path);
-    discs[di].outline = outline;
-    discs[di].lexed = Some(lexed);
+        let mut prepared: Vec<Prepared> = Vec::with_capacity(wave.len());
+        let mut miss_idxs: Vec<usize> = Vec::new();
+        for &di in &wave {
+            let file_id = discs[di].file_id;
+            let module = discs[di].module;
+            let file_key = job.file_key(&cache.canon(&discs[di].path), module);
+            let text_hash = hash_str(&discs[di].text);
+            let own_len = match job.input.std_splice_lo {
+                Some(lo) if file_id == FileId(0) => (lo as usize).min(discs[di].text.len()),
+                _ => discs[di].text.len(),
+            };
+            let asks = cache
+                .peek(&file_key, text_hash, file_id)
+                .and_then(|e| e.std_asks)
+                .filter(|(l, _)| *l == own_len)
+                .map(|(_, a)| a);
+            let lexed = cache.raw(&file_key, text_hash, file_id);
+            let outline = cache.outline(&file_key, text_hash, file_id);
+            if asks.is_none() || lexed.is_none() || outline.is_none() {
+                miss_idxs.push(prepared.len());
+            }
+            prepared.push(Prepared { di, file_key, text_hash, file_id, module, asks, lexed, outline });
+        }
+        if !miss_idxs.is_empty() {
+            let compute = |&pi: &usize| -> (Option<StdPlan>, Option<Result<lexer::Lexed, Diag>>, Option<scan::Outline>) {
+                let p = &prepared[pi];
+                let text = &discs[p.di].text;
+                let own = match job.input.std_splice_lo {
+                    Some(lo) if p.file_id == FileId(0) => text.get(..lo as usize).unwrap_or(text),
+                    _ => text,
+                };
+                let new_asks = if p.asks.is_none() { Some(StdPlan::asks(own)) } else { None };
+                let (new_lex, new_outline) = if p.lexed.is_none() {
+                    match lex_file(text, p.file_id, interner) {
+                        Ok(l) => {
+                            let o = if p.outline.is_none() { Some(scan::outline(&l, interner)) } else { None };
+                            (Some(Ok(l)), o)
+                        }
+                        Err(d) => (Some(Err(d)), None),
+                    }
+                } else {
+                    let o = if p.outline.is_none() { p.lexed.as_ref().map(|l| scan::outline(l, interner)) } else { None };
+                    (None, o)
+                };
+                (new_asks, new_lex, new_outline)
+            };
+            let computed: Vec<_> = if miss_idxs.len() >= 2 && crate::pool::threads() > 1 {
+                par_map(&miss_idxs, compute)
+            } else {
+                miss_idxs.iter().map(compute).collect()
+            };
+            for (pi, (new_asks, new_lex, new_outline)) in miss_idxs.into_iter().zip(computed) {
+                let p = &mut prepared[pi];
+                if let Some(a) = new_asks {
+                    let own_len = match job.input.std_splice_lo {
+                        Some(lo) if p.file_id == FileId(0) => (lo as usize).min(discs[p.di].text.len()),
+                        _ => discs[p.di].text.len(),
+                    };
+                    cache.entry(&p.file_key, p.text_hash, p.file_id).std_asks = Some((own_len, a));
+                    p.asks = Some(a);
+                }
+                if let Some(res) = new_lex {
+                    match res {
+                        Ok(l) => {
+                            cache.put_raw(&p.file_key, p.text_hash, p.file_id, &l);
+                            p.lexed = Some(l);
+                        }
+                        Err(d) => {
+                            diags.push(d);
+                            continue;
+                        }
+                    }
+                }
+                if let Some(o) = new_outline {
+                    cache.put_outline(&p.file_key, p.text_hash, p.file_id, &o);
+                    p.outline = Some(o);
+                }
+            }
+        }
+        // Step 2: commit lexed/outline/std_asks, register inline & child modules deterministically,
+        // and collect child file resolutions for this wave.
+        let mut pending: Vec<PendingChild> = Vec::new();
+        for p in prepared {
+            if let Some(a) = p.asks {
+                *std_asks = std_asks.or(a);
+            }
+            let (Some(lexed), Some(outline)) = (p.lexed, p.outline) else { continue };
+            let di = p.di;
+            let file_path = discs[di].path.clone();
+            let dir_owner = discs[di].dir_owner;
+            let file_module = p.module;
+            let mut inline_modules: FxMap<Vec<Sym>, ModuleId> = FxMap::default();
+            inline_modules.insert(Vec::new(), file_module);
+            let mut disabled_containers: Vec<Vec<Sym>> = Vec::new();
+            for decl in &outline.mods {
+                if (1..=decl.container.len()).any(|k| disabled_containers.iter().any(|d| d == &decl.container[..k])) {
+                    continue;
+                }
+                let enabled = match cfg::outline_enabled(&job.input.env, &decl.cfg, &lexed.strings, interner, decl.span)
+                    .and_then(|e| Ok(e && cfg::outline_cfg_attr_enabled(&job.input.env, &decl.cfg_attr, &lexed.strings, interner, decl.span)?))
+                {
+                    Ok(e) => e,
+                    Err(d) => {
+                        diags.push(d);
+                        false
+                    }
+                };
+                if !enabled {
+                    if decl.inline {
+                        let mut key = decl.container.clone();
+                        key.push(decl.name);
+                        disabled_containers.push(key);
+                    }
+                    continue;
+                }
+                let parent = inline_modules.get(&decl.container).copied().unwrap_or(file_module);
+                let mut child_path = tables.modules[parent.0 as usize].path.clone();
+                child_path.push(decl.name);
+                let existing = tables.module_by_path_in(job.root_module, &child_path);
+                let child = match existing {
+                    Some(c) => c,
+                    None => {
+                        let vis = match decl.vis {
+                            scan::OutlineVis::Private => VisKind::Priv,
+                            scan::OutlineVis::Pub => VisKind::Pub,
+                            scan::OutlineVis::Restricted => VisKind::Crate,
+                        };
+                        tables.add_module(parent, decl.name, vis, decl.span)
+                    }
+                };
+                tables.modules[child.0 as usize].macro_use |= decl.macro_use;
+                if decl.inline {
+                    let mut key = decl.container.clone();
+                    key.push(decl.name);
+                    inline_modules.insert(key, child);
+                } else if existing.is_none() {
+                    if let Some(bad) = decl.path_bad {
+                        diags.push(Diag::new(
+                            "L0524",
+                            bad,
+                            "malformed `path` attribute input".to_string(),
+                            "Write the attribute in one of the forms Rust documents for it.",
+                        ));
+                        continue;
+                    }
+                    let inline_names: Vec<String> = decl.container.iter().map(|s| interner.get(*s).to_string()).collect();
+                    pending.push(PendingChild {
+                        di,
+                        file_path: file_path.clone(),
+                        dir_owner,
+                        inline_names,
+                        name: interner.get(decl.name).to_string(),
+                        path_attr: decl.path_attr.clone(),
+                        span: decl.span,
+                        child,
+                        container: decl.container.clone(),
+                        macro_use: decl.macro_use,
+                    });
+                }
+            }
+            bind_outline_macros(&outline, file_module, &inline_modules, job, tables, interner);
+            discs[di].use_sites = cache.use_sites(&p.file_key, p.text_hash, p.file_id, &tables.modules[file_module.0 as usize].path);
+            discs[di].outline = outline;
+            discs[di].lexed = Some(lexed);
+        }
+        // Step 3: resolve child module files, canonical paths, and file texts in parallel.
+        let mut next_wave: Vec<usize> = Vec::new();
+        if !pending.is_empty() {
+            let resolve_child = |c: &PendingChild| -> ChildRes {
+                let f = match modules::module_file(&c.file_path, c.dir_owner, &c.inline_names, &c.name, c.path_attr.as_deref(), c.span) {
+                    Ok(f) => f,
+                    Err(d) => return ChildRes::Err(d),
+                };
+                let alt = if c.path_attr.is_none() {
+                    let (flat, nested) = modules::module_candidates(&c.file_path, c.dir_owner, &c.inline_names, &c.name);
+                    Some(if f == flat { nested } else { flat })
+                } else {
+                    None
+                };
+                let (canon, new_canon) = match cache.canon.get(&f) {
+                    Some(s) => (s.clone(), false),
+                    None => (modules::canonical_string(&f), true),
+                };
+                if let Some(t) = shared.text_by_path.get(&canon) {
+                    return ChildRes::Ok { f, alt, canon, new_canon, text: t.clone(), new_text: false, stamp: None };
+                }
+                if !has_overlay
+                    && let Some(t) = prefetched.get(&f)
+                {
+                    let stamp = (!one_shot)
+                        .then(|| std::fs::metadata(&f).ok().and_then(|md| file_stamp_from_md(&md, request_start)))
+                        .flatten();
+                    return ChildRes::Ok { f, alt, canon, new_canon, text: t.clone(), new_text: true, stamp };
+                }
+                let stamp = (!has_overlay && !one_shot)
+                    .then(|| std::fs::metadata(&f).ok().and_then(|md| file_stamp_from_md(&md, request_start)))
+                    .flatten();
+                match crate::driver::read_source(&f) {
+                    Ok(text) => ChildRes::Ok { f, alt, canon, new_canon, text, new_text: true, stamp },
+                    Err(e) => ChildRes::Err(Diag::new(
+                        "L0503",
+                        c.span,
+                        format!("cannot read module file {}: {e}", f.display()),
+                        "Check the file exists and is readable.",
+                    )),
+                }
+            };
+            let resolved: Vec<ChildRes> = if pending.len() >= 2 && crate::pool::threads() > 1 {
+                par_map(&pending, resolve_child)
+            } else {
+                pending.iter().map(resolve_child).collect()
+            };
+            for (c, res) in pending.into_iter().zip(resolved) {
+                match res {
+                    ChildRes::Ok { f, alt, canon, new_canon, text, new_text, stamp } => {
+                        if let Some(a) = alt {
+                            tables.module_alts.push(a);
+                        }
+                        if new_canon {
+                            cache.canon.insert(f.clone(), canon.clone());
+                        }
+                        if new_text {
+                            if !one_shot && !has_overlay {
+                                cache.file_texts.insert(canon.clone(), (stamp, text.clone()));
+                            }
+                            shared.text_by_path.entry(canon.clone()).or_insert_with(|| text.clone());
+                        }
+                        let file_id = shared.file_id_canon(&canon, c.child);
+                        discs.push(FileDisc {
+                            path: f,
+                            text,
+                            file_id,
+                            module: c.child,
+                            dir_owner: c.path_attr.is_some(),
+                            parent: Some(ParentDecl {
+                                disc: c.di,
+                                container: c.container,
+                                lo: c.span.lo,
+                                macro_use: c.macro_use,
+                            }),
+                            lexed: None,
+                            outline: scan::Outline::default(),
+                            use_sites: None,
+                        });
+                        next_wave.push(discs.len() - 1);
+                    }
+                    ChildRes::Err(d) => diags.push(d),
+                }
+            }
+        }
+        wave = next_wave;
+    }
 }
 
 /// One macro definition in this crate, located in one file's token
@@ -3498,11 +3831,14 @@ impl MacroEnv {
 /// discovery, the expansion rounds of section 6.1 (cfg names, seeded
 /// macro expansion, macro-generated module edges), the import
 /// worklist, the path rewrite, and flattening.
+#[allow(clippy::too_many_arguments)]
 fn resolve_one(
     job: &CrateJob,
     tables: &mut ResolvedTables,
     shared: &mut SharedFiles,
     cache: &mut ResolveCache,
+    prefetched: &FxMap<PathBuf, String>,
+    request_start: std::time::SystemTime,
     dep_exports: &[(String, Vec<OwnedMacroSource>)],
     client: &crate::expand::ClientView,
     interner: &Interner,
@@ -3520,7 +3856,8 @@ fn resolve_one(
     }
     let mut std_asks = StdPlan::default();
     let mut diags: Vec<Diag> = Vec::new();
-    let root_file_id = shared.file_id(&input.root_path, job.root_module);
+    let root_canon = cache.canon(&input.root_path);
+    let root_file_id = shared.file_id_canon(&root_canon, job.root_module);
     let mut discs: Vec<FileDisc> = vec![FileDisc {
         path: input.root_path.clone(),
         text: input.root_text.clone(),
@@ -3532,10 +3869,7 @@ fn resolve_one(
         outline: scan::Outline::default(),
         use_sites: None,
     }];
-    let mut queue: Vec<usize> = vec![0];
-    while let Some(di) = queue.pop() {
-        process_disc_orig(di, &mut discs, &mut queue, tables, shared, cache, job, interner, &mut diags, &mut std_asks);
-    }
+    discover_waves(vec![0], &mut discs, tables, shared, cache, prefetched, request_start, job, interner, &mut diags, &mut std_asks);
     if !diags.is_empty() {
         return Err(OneError { diags, seen: seen_of(&discs), std_asks });
     }
@@ -3718,11 +4052,11 @@ fn resolve_one(
         for (di, outline) in outlines.into_iter().enumerate() {
             let (Some(exp), Some(outline)) = (expanded[di].as_ref(), outline) else { continue };
             let disc_module = discs[di].module;
-            let inline = outline_mods(di, &outline, &exp.strings, &mut discs, &mut new_queue, tables, shared, job, interner, &mut diags);
+            let inline = outline_mods(di, &outline, &exp.strings, &mut discs, &mut new_queue, tables, shared, cache, job, interner, &mut diags);
             bind_outline_macros(&outline, disc_module, &inline, job, tables, interner);
         }
-        while let Some(di) = new_queue.pop() {
-            process_disc_orig(di, &mut discs, &mut new_queue, tables, shared, cache, job, interner, &mut diags, &mut std_asks);
+        if !new_queue.is_empty() {
+            discover_waves(new_queue, &mut discs, tables, shared, cache, prefetched, request_start, job, interner, &mut diags, &mut std_asks);
         }
         if !diags.is_empty() {
             return Err(OneError { diags, seen: seen_of(&discs), std_asks });

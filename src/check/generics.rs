@@ -10625,7 +10625,10 @@ fn template_check(p: &mut Program) -> Vec<Diag> {
     // A template whose check only reads the program (no closures to
     // register, no hidden type of its own) checks ahead in a window, as
     // discovery bodies do (`Ahead`); its writes go in at its turn.
-    let mut ahead: Ahead<TemplateBody> = Ahead::new(!p.record_reads && !reuse.on, false);
+    // When `reuse` already holds cached templates, skip speculation so
+    // `check_template` replays hits directly; on a fresh daemon session
+    // (`templates_empty`), run the window in parallel.
+    let mut ahead: Ahead<TemplateBody> = Ahead::new(!reuse.on || reuse.templates_empty(), false);
     ahead.start(templates.len());
     for (k, &t) in templates.iter().enumerate() {
         crate::driver::graph::FpMemo::sync(p);
@@ -12425,12 +12428,14 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
     // compile skips them, and runs them only for a clean body whose
     // requests name a stub (`lint_tail`, below).
     let lints = reuse.on || !reuse.one_shot;
-    // Window checks run only where a check records no reads: a read's
-    // fingerprint can come from the deep memo, which logs no table read.
+    // Speculative parallel windows (`Ahead`): `FpMemo` reads/resets log
+    // `spec::tab::FP_MEMO`, so window checks are sound even when recording
+    // reads in a daemon session (`p.record_reads` / `reuse.on`), and
+    // `ahead.fill` skips entries prejudged as reuse hits.
     // A build runs windows on one thread too: its early interning
     // (below) decides the global type numbering, which the emitted C
     // reads, so it must not depend on the thread count.
-    let mut ahead: Ahead<Found> = Ahead::new(!p.record_reads && !reuse.on, p.gx.walk_instances);
+    let mut ahead: Ahead<Found> = Ahead::new(true, p.gx.walk_instances);
     let compare = std::env::var_os("LUST_CHECK_PARDISC");
     while !queue.is_empty() {
         rounds += 1;
@@ -12451,9 +12456,10 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
         // their turns (`GenReuse::prejudge`; the same verdicts).
         crate::driver::graph::FpMemo::sync(p);
         let mut prejudged = reuse.prejudge(p, &round);
+        let walk_reqs = p.gx.walk_instances || !p.gx.assoc_const_tmpls.is_empty();
         for (k, &fid) in round.iter().enumerate() {
             crate::driver::graph::FpMemo::sync(p);
-            if ahead.fill(&round, k, |_| true, |&f| discover_one(p, f, lints)) && p.gx.walk_instances {
+            if ahead.fill(&round, k, |i| prejudged.get(i).is_none_or(Option::is_none), |&f| discover_one(p, f, lints)) {
                 // Early interning: every type the window's bodies name goes
                 // into the global store now, in turn order, rather than at
                 // each body's turn (its apply step below interns them
@@ -12462,19 +12468,25 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
                 // interned it; the stale ones check again now, in parallel.
                 for found in ahead.window(k) {
                     let (adt_tys, reqs, closures, vts) = &found.out;
-                    let args = reqs.iter().flat_map(|(_, a)| a.iter()).filter_map(|a| match a {
-                        OwnedArg::Ty(t) => Some(t),
-                        _ => None,
-                    });
+                    let args = reqs
+                        .iter()
+                        .filter(|_| walk_reqs)
+                        .flat_map(|(_, a)| a.iter())
+                        .filter_map(|a| match a {
+                            OwnedArg::Ty(t) => Some(t),
+                            _ => None,
+                        });
                     let closure_tys = closures.iter().flat_map(|c| [&c.env, &c.output].into_iter().chain(&c.inputs));
                     for owned in adt_tys.iter().map(|t| &**t).chain(args).chain(closure_tys).chain(vts.iter().flat_map(|(a, b)| [a, b])) {
                         build_owned_ty(p, owned);
                     }
                     // Each request's instance key, as its apply step makes it
                     // (`lift_request`): a caller's `instance_for` asks for it.
-                    for (_, owned_args) in reqs {
-                        let lifted = lift_request(p, owned_args);
-                        p.tys.intern_args(&lifted);
+                    if walk_reqs {
+                        for (_, owned_args) in reqs {
+                            let lifted = lift_request(p, owned_args);
+                            p.tys.intern_args(&lifted);
+                        }
                     }
                 }
                 ahead.recheck(&round, k, |&f| discover_one(p, f, lints));

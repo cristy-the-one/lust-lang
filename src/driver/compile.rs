@@ -2063,17 +2063,23 @@ fn splice_std(
 }
 
 /// `StdLoad::close`, loading std only when the plan splices some.
+/// When `guess_plat` is true (initial guess), lazily folds in
+/// `stdload::guess_platform()` if either `user` or its spliced std modules
+/// pull in the platform crate, avoiding a wasted resolve retry pass.
 fn close_std_plan(
     std_cache: &mut Option<Result<std::sync::Arc<crate::stdload::StdLoad>, String>>,
     user: StdPlan,
     platform: Option<StdPlan>,
+    guess_plat: bool,
 ) -> Result<StdPlan, Response> {
-    let first = if user.platform { user.or(platform.unwrap_or_default()) } else { user };
+    let init_plat = platform.or_else(|| (guess_plat && user.platform).then(crate::stdload::guess_platform));
+    let first = if user.platform { user.or(init_plat.unwrap_or_default()) } else { user };
     if !first.needs.any() {
         return Ok(first); // An empty splice asks nothing.
     }
     let load = std_cache.get_or_insert_with(|| crate::stdload::load_std().map(std::sync::Arc::new)).clone();
-    load.and_then(|l| l.close(user, platform)).map_err(|e| Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() })
+    load.and_then(|l| l.close_with(user, init_plat, || guess_plat.then(crate::stdload::guess_platform)))
+        .map_err(|e| Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() })
 }
 
 /// The resolver front end (W-RESOLVE): Cargo graph selection, the
@@ -2322,13 +2328,17 @@ fn resolved_setup(
     let mut plan = match front.std_plan {
         Some(p) => p,
         None => {
-            let mut user = StdPlan::guess_crate(&root_path, &unspliced_root, root_asks);
+            let mut prefetched: FxMap<PathBuf, String> = FxMap::default();
+            let mut user = StdPlan::guess_crate_with_texts(&root_path, &unspliced_root, root_asks, Some(&mut prefetched));
             for dep in crate::resolve::worklist::dep_roots(&externs) {
                 if let Ok(text) = crate::driver::read_source(&dep) {
-                    user = user.or(StdPlan::guess_crate(&dep, &text, StdPlan::asks(&text)));
+                    user = user.or(StdPlan::guess_crate_with_texts(&dep, &text, StdPlan::asks(&text), Some(&mut prefetched)));
                 }
             }
-            let plan = close_std_plan(std_cache, user, user.platform.then(crate::stdload::guess_platform))?;
+            if !prefetched.is_empty() {
+                front.resolve_cache.seed_texts(prefetched);
+            }
+            let plan = close_std_plan(std_cache, user, None, true)?;
             t.lap("std plan guess");
             plan
         }
@@ -2378,7 +2388,7 @@ fn resolved_setup(
             Ok(r) => (r.std_asks, r.platform_asks),
             Err(e) => (e.std_asks, e.platform_asks),
         };
-        let seen = close_std_plan(std_cache, user, platform)?;
+        let seen = close_std_plan(std_cache, user, platform, false)?;
         // Each pass's plan is the same function of the same user files,
         // so the second pass agrees; the cap only guards a broken rule.
         if seen == plan || passes == 3 {
@@ -2540,10 +2550,12 @@ fn resolved_setup(
             false => {
                 let texts = (1..front.map.file_count()).filter_map(|k| front.map.text(FileId(k as u32)));
                 let texts: Vec<&str> = std::iter::once(unspliced_root.as_str()).chain(texts).collect();
-                let ok = !texts.iter().any(|t| t.contains("macro_rules")) || !texts.iter().any(|t| super::patch::shadows_builtin(t));
+                let ok = !texts.iter().any(|t| t.contains("macro_rules"))
+                    || !par_map(&texts, |t| super::patch::shadows_builtin(t)).into_iter().any(|s| s);
                 if ok { vec![crate::ty::defs::ModuleId(0)] } else { Vec::new() }
             }
         };
+        let no_builtin_shadow = !has_deps && !shut.is_empty();
         let patch_expand: FxMap<_, _> = shut
             .into_iter()
             .filter_map(|r| match r.0 {
@@ -2567,6 +2579,7 @@ fn resolved_setup(
             body_hashes.clone(),
             request_start,
             patch_expand,
+            no_builtin_shadow,
         ));
         if let Some(b) = front.patch.as_mut() {
             b.oracle_input = oracle_input;

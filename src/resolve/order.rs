@@ -184,36 +184,47 @@ fn seed_keys(tables: &ResolvedTables, globs: &Globs, interner: &Interner) -> Vec
         count.clear();
         narrow.clear();
         // Only a binding this module can see is ever brought here.
+        let has_std_aliases = !tables.std_aliases.is_empty();
         for &(src, g) in list {
+            let g_ra = if one_vis { tables.vis_region(&g.vis, g.module, interner).0 } else { 0 };
             for nsi in 0..3u8 {
                 for (&name, state) in &tables.maps[src.0 as usize][nsi as usize] {
-                    let seen = match state {
-                        BindState::One(b) => tables.visible(&b.vis, b.def_module, m, interner),
-                        BindState::Ambiguous => true,
-                    };
-                    if !seen {
-                        continue;
-                    }
-                    if one_vis {
-                        if let BindState::One(b) = state
-                            && !tables.vis_within(&g.vis, g.module, &b.vis, b.def_module, interner)
-                        {
-                            narrow.push((nsi, name));
+                    match state {
+                        BindState::One(b) => {
+                            if one_vis {
+                                // `Pub` is always at least as wide as `g.vis`, and `Crate`
+                                // is at least as wide as any non-`Pub` `g.vis`: never narrow.
+                                if b.vis == VisKind::Pub || (b.vis == VisKind::Crate && g_ra != 2) {
+                                    continue;
+                                }
+                                if tables.visible(&b.vis, b.def_module, m, interner)
+                                    && !tables.vis_within(&g.vis, g.module, &b.vis, b.def_module, interner)
+                                {
+                                    narrow.push((nsi, name));
+                                }
+                            } else if b.vis == VisKind::Pub || tables.visible(&b.vis, b.def_module, m, interner) {
+                                *count.entry((nsi, name)).or_default() += 1;
+                            }
                         }
-                    } else {
-                        *count.entry((nsi, name)).or_default() += 1;
+                        BindState::Ambiguous => {
+                            if !one_vis {
+                                *count.entry((nsi, name)).or_default() += 1;
+                            }
+                        }
                     }
                 }
             }
-            let range = (src, 0, Sym(0))..=(src, u8::MAX, Sym(u32::MAX));
-            for (&(_, nsi, name), (vis, _)) in tables.std_aliases.range(range) {
-                if !tables.visible(vis, tables.std_alias_def_module((src, nsi, name)), m, interner) {
-                    continue;
-                }
-                if one_vis {
-                    narrow.push((nsi, name));
-                } else {
-                    *count.entry((nsi, name)).or_default() += 1;
+            if has_std_aliases {
+                let range = (src, 0, Sym(0))..=(src, u8::MAX, Sym(u32::MAX));
+                for (&(_, nsi, name), (vis, _)) in tables.std_aliases.range(range) {
+                    if !tables.visible(vis, tables.std_alias_def_module((src, nsi, name)), m, interner) {
+                        continue;
+                    }
+                    if one_vis {
+                        narrow.push((nsi, name));
+                    } else {
+                        *count.entry((nsi, name)).or_default() += 1;
+                    }
                 }
             }
         }

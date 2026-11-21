@@ -61,6 +61,15 @@ impl GlobSrc {
         self.0[m].reserve(n);
     }
 
+    /// Mutable reference to module `m`'s map, growing the outer vector if needed.
+    pub fn map_mut(&mut self, m: ModuleId) -> &mut FxMap<(u8, Sym), ModuleId> {
+        let m = m.0 as usize;
+        if self.0.len() <= m {
+            self.0.resize_with(m + 1, FxMap::default);
+        }
+        &mut self.0[m]
+    }
+
     /// True when module `m` has no entry.
     pub fn none_in(&self, m: ModuleId) -> bool {
         self.0.get(m.0 as usize).is_none_or(FxMap::is_empty)
@@ -86,7 +95,7 @@ pub fn ns_index(ns: Namespace) -> usize {
 /// `::` (`in_path` splits it), resolved against module paths by name when
 /// checked: one `Sym` keeps a binding (`Bind`) at 40 bytes, where a list of
 /// segments made it 56 (the binding maps hold millions).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VisKind {
     Priv,
     Pub,
@@ -136,7 +145,7 @@ pub enum Target {
 /// own vis for a local def, the `use` item's vis for an import), its
 /// source rank (0 empty, 1 glob, 2 local or explicit), and the module
 /// whose scope defines privacy for it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct Bind {
     pub target: Target,
     pub vis: VisKind,
@@ -335,6 +344,9 @@ pub struct ResolvedTables {
     /// binding the single import later replaces. Fixpoint state of
     /// `run_imports` only.
     pub pending_single: FxMap<(ModuleId, Sym), Vec<PendingSingle>>,
+    /// Per module, the number of pending single-import names in `pending_single`,
+    /// so `copy_glob` skips per-name `pending_single` probes for modules with none.
+    pub pending_single_count: Vec<u32>,
     /// True once the fixpoint stalls: no sweep changes anything. Until
     /// then a single import that reads an ambiguous glob name waits,
     /// since the source's own explicit import may still settle it; after
@@ -510,6 +522,7 @@ impl ResolvedTables {
             std_glob_aliases: FxMap::default(),
             glob_src: GlobSrc::default(),
             pending_single: FxMap::default(),
+            pending_single_count: Vec::new(),
             import_stall: false,
             single_binds: Vec::new(),
             ambig_vis: FxMap::default(),
@@ -960,66 +973,64 @@ impl ResolvedTables {
                 return InsertOut::Changed;
             }
         }
-        let wider = matches!(self.lookup(module, ns, name),
-            Some(BindState::One(old)) if old.target == bind.target && old.rank == 1 && bind.rank == 1 && self.glob_vis_wider(&bind, old));
-        let map = &mut self.maps[module.0 as usize][ns_index(ns)];
-        let out = match map.get(&name) {
-            None => {
-                map.insert(name, BindState::One(bind));
-                InsertOut::Changed
-            }
-            Some(BindState::One(old)) => {
-                if old.target == bind.target {
-                    // The same target bound twice at explicit rank is still
-                    // two definitions of one name (rustc E0252/E0255): a
-                    // repeated `use`, or a `use` of an item this module
-                    // defines. A glob (rank 1) re-binding the same target
-                    // is legal and stays `Same`. An explicit import of the
-                    // item a glob already brought is legal too, and it
-                    // raises the binding to explicit rank: other globs
-                    // can then no longer make the name ambiguous here. A
-                    // second glob of the item with a wider visibility
-                    // widens the binding, as rustc keeps the widest
-                    // (`ambiguity_vis_max`; `resolve::order` rejects the
-                    // orders where rustc drops it again).
-                    if old.rank == 2 && bind.rank == 2 {
-                        InsertOut::Dup
-                    } else if bind.rank > old.rank {
-                        map.insert(name, BindState::One(bind));
-                        InsertOut::Changed
-                    } else if wider {
-                        map.insert(name, BindState::One(bind));
-                        InsertOut::Changed
-                    } else {
-                        InsertOut::Same
-                    }
-                } else if bind.rank > old.rank {
-                    map.insert(name, BindState::One(bind));
+        let out = {
+            let map = &self.maps[module.0 as usize][ns_index(ns)];
+            match map.get(&name) {
+                None => {
+                    self.maps[module.0 as usize][ns_index(ns)].insert(name, BindState::One(bind));
                     InsertOut::Changed
-                } else if bind.rank < old.rank {
-                    InsertOut::Same
-                } else if bind.rank <= 1 {
-                    let vis = vec![
-                        (old.vis.clone(), old.def_module, AmbItem::Item(old.target)),
-                        (bind.vis.clone(), bind.def_module, AmbItem::Item(bind.target)),
-                    ];
-                    let _ = self.set_ambiguous(module, ns, name, vis);
-                    InsertOut::Changed
-                } else {
-                    InsertOut::Dup
                 }
-            }
-            Some(BindState::Ambiguous) => {
-                if bind.rank >= 2 {
-                    map.insert(name, BindState::One(bind));
-                    InsertOut::Changed
-                } else {
-                    // One more glob item: its visibility can carry
-                    // the ambiguity onward too.
-                    if self.set_ambiguous(module, ns, name, vec![(bind.vis, bind.def_module, AmbItem::Item(bind.target))]) {
+                Some(BindState::One(old)) => {
+                    let old = *old;
+                    if old.target == bind.target {
+                        // The same target bound twice at explicit rank is still
+                        // two definitions of one name (rustc E0252/E0255): a
+                        // repeated `use`, or a `use` of an item this module
+                        // defines. A glob (rank 1) re-binding the same target
+                        // is legal and stays `Same`. An explicit import of the
+                        // item a glob already brought is legal too, and it
+                        // raises the binding to explicit rank: other globs
+                        // can then no longer make the name ambiguous here. A
+                        // second glob of the item with a wider visibility
+                        // widens the binding, as rustc keeps the widest
+                        // (`ambiguity_vis_max`; `resolve::order` rejects the
+                        // orders where rustc drops it again).
+                        if old.rank == 2 && bind.rank == 2 {
+                            InsertOut::Dup
+                        } else if bind.rank > old.rank || (old.rank == 1 && bind.rank == 1 && self.glob_vis_wider(&bind, &old)) {
+                            self.maps[module.0 as usize][ns_index(ns)].insert(name, BindState::One(bind));
+                            InsertOut::Changed
+                        } else {
+                            InsertOut::Same
+                        }
+                    } else if bind.rank > old.rank {
+                        self.maps[module.0 as usize][ns_index(ns)].insert(name, BindState::One(bind));
+                        InsertOut::Changed
+                    } else if bind.rank < old.rank {
+                        InsertOut::Same
+                    } else if bind.rank <= 1 {
+                        let vis = vec![
+                            (old.vis, old.def_module, AmbItem::Item(old.target)),
+                            (bind.vis, bind.def_module, AmbItem::Item(bind.target)),
+                        ];
+                        let _ = self.set_ambiguous(module, ns, name, vis);
                         InsertOut::Changed
                     } else {
-                        InsertOut::Same
+                        InsertOut::Dup
+                    }
+                }
+                Some(BindState::Ambiguous) => {
+                    if bind.rank >= 2 {
+                        self.maps[module.0 as usize][ns_index(ns)].insert(name, BindState::One(bind));
+                        InsertOut::Changed
+                    } else {
+                        // One more glob item: its visibility can carry
+                        // the ambiguity onward too.
+                        if self.set_ambiguous(module, ns, name, vec![(bind.vis, bind.def_module, AmbItem::Item(bind.target))]) {
+                            InsertOut::Changed
+                        } else {
+                            InsertOut::Same
+                        }
                     }
                 }
             }
@@ -1155,26 +1166,32 @@ impl ResolvedTables {
         // fewer table reads (a glob copy inserts millions of names on tsgo): with no std alias
         // of the name here, a name with no binding and no glob source takes the copy, and a
         // binding that the copy would not change stays.
-        if !self.std_glob_aliases.contains_key(&key) {
-            match self.maps[module.0 as usize][ns_index(ns)].get(&name) {
-                None if !self.glob_src.contains_key(&key) => {
-                    self.maps[module.0 as usize][ns_index(ns)].insert(name, BindState::One(bind));
-                    self.touch(module, name);
-                    self.glob_src.insert(key, src);
-                    return InsertOut::Changed;
+        let has_std_glob = !self.std_glob_aliases.is_empty() && self.std_glob_aliases.contains_key(&key);
+        if !has_std_glob {
+            let nsi = ns_index(ns);
+            match self.maps[module.0 as usize][nsi].entry(name) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    if !self.glob_src.contains_key(&key) {
+                        v.insert(BindState::One(bind));
+                        self.touch(module, name);
+                        self.glob_src.insert(key, src);
+                        return InsertOut::Changed;
+                    }
                 }
-                Some(BindState::One(old))
-                    if if old.target == bind.target {
-                        bind.rank <= old.rank
-                            && !(old.rank == 2 && bind.rank == 2)
-                            && !(old.rank == 1 && bind.rank == 1 && self.glob_vis_wider(&bind, old))
-                    } else {
-                        bind.rank < old.rank && old.rank >= 2
-                    } =>
-                {
-                    return InsertOut::Same;
+                std::collections::hash_map::Entry::Occupied(o) => {
+                    if let BindState::One(old) = *o.get() {
+                        let unchanged = if old.target == bind.target {
+                            bind.rank <= old.rank
+                                && !(old.rank == 2 && bind.rank == 2)
+                                && !(old.rank == 1 && bind.rank == 1 && self.glob_vis_wider(&bind, &old))
+                        } else {
+                            bind.rank < old.rank && old.rank >= 2
+                        };
+                        if unchanged {
+                            return InsertOut::Same;
+                        }
+                    }
                 }
-                _ => {}
             }
         }
         // The name's binding here now, read once: a stale copy of this
@@ -2388,6 +2405,8 @@ pub fn run_imports(tables: &mut ResolvedTables, imports: &[Import], interner: &I
     let mut pending: Vec<(usize, &Import)> = imports.iter().enumerate().collect();
     let mut resolved = vec![false; imports.len()];
     tables.pending_single.clear();
+    tables.pending_single_count.clear();
+    tables.pending_single_count.resize(tables.modules.len(), 0);
     tables.ambig_single.clear();
     tables.single_binds.clear();
     tables.order_dep.clear();
@@ -2397,7 +2416,13 @@ pub fn run_imports(tables: &mut ResolvedTables, imports: &[Import], interner: &I
             && let Some((&last, mod_path)) = path.split_last()
         {
             let p = PendingSingle { span: imp.span, vis: imp.vis.clone(), mod_path: mod_path.to_vec(), leading_colon: imp.leading_colon, last };
-            tables.pending_single.entry((imp.module, *name)).or_default().push(p);
+            let list = tables.pending_single.entry((imp.module, *name)).or_default();
+            if list.is_empty()
+                && let Some(c) = tables.pending_single_count.get_mut(imp.module.0 as usize)
+            {
+                *c += 1;
+            }
+            list.push(p);
         }
     }
     let cap = tables.modules.len() + 2;
@@ -2485,6 +2510,7 @@ pub fn run_imports(tables: &mut ResolvedTables, imports: &[Import], interner: &I
         }
     }
     tables.pending_single.clear();
+    tables.pending_single_count.clear();
     crate::resolve::order::compute_order_dep(tables, imports, interner);
     // The plain checks first: where they report (L0507, L0510), rustc
     // does too; the order rule (L0509) takes the imports they pass.
@@ -2577,65 +2603,177 @@ fn glob_names<'t>(tables: &'t ResolvedTables, src: ModuleId, ns: Namespace, only
 /// change.
 fn copy_glob(tables: &mut ResolvedTables, imp: &Import, src: ModuleId, only: Option<&[Sym]>, interner: &Interner) -> bool {
     let mut changed = false;
-    let mut entries: Vec<(Namespace, Sym, Bind)> = Vec::new();
     // The source's ambiguous names per namespace, read in the same pass: the copies write
     // the importer only, so the source's states stand as read.
     let mut ambiguous: [Vec<Sym>; 3] = Default::default();
-    for ns in [Namespace::Type, Namespace::Value, Namespace::Macro] {
-        for (name, state) in glob_names(tables, src, ns, only) {
-            // A `macro_rules!` definition is not in its
-            // module's namespace, so no glob copies it.
-            // A glob binding a pending single import of
-            // the name hides is not copied yet.
-            match state {
-                BindState::One(b)
-                    if (b.rank >= 2 || !tables.pending_single.contains_key(&(src, name)))
-                        && tables.visible(&b.vis, b.def_module, imp.module, interner)
-                        && !(ns == Namespace::Macro && tables.is_textual_bind(src, name, b)) =>
-                {
-                    let (vis, def_module) = tables.glob_vis(imp, &b.vis, b.def_module, interner);
-                    entries.push((ns, name, Bind { target: b.target, vis, rank: 1, def_module }));
+    let m = imp.module;
+    let first = tables.glob_src.none_in(m)
+        && (tables.std_aliases.is_empty() || tables.std_aliases.range((m, 0, Sym(0))..=(m, u8::MAX, Sym(u32::MAX))).next().is_none());
+    if src != m {
+        // Direct zero-allocation split-borrow copy: `src` and `m` are distinct slots in
+        // `tables.maps`, so we copy directly from `src`'s maps into `m`'s maps without
+        // materializing an intermediate `entries` vector or repeating visibility region
+        // calculations for every binding.
+        let m_root = tables.root_of(m);
+        let (imp_ra, _) = tables.vis_region(&imp.vis, m, interner);
+        let has_pending = !tables.pending_single.is_empty() && tables.pending_single_count.get(src.0 as usize).copied().unwrap_or(0) > 0;
+        let has_textual = !tables.macro_textual_binds.is_empty();
+        let has_std_glob = !tables.std_glob_aliases.is_empty();
+        let (src_i, dst_i) = (src.0 as usize, m.0 as usize);
+        if tables.glob_log.len() <= dst_i {
+            tables.glob_log.resize_with(dst_i + 1, Vec::new);
+        }
+        let log_m = &mut tables.glob_log[dst_i];
+        let gsrc_m = tables.glob_src.map_mut(m);
+        let modules = &tables.modules;
+        let pending_single = &tables.pending_single;
+        let macro_textual_binds = &tables.macro_textual_binds;
+        let std_glob_aliases = &tables.std_glob_aliases;
+        let (src_maps, dst_maps) = if src_i < dst_i {
+            let (a, b) = tables.maps.split_at_mut(dst_i);
+            (&a[src_i], &mut b[0])
+        } else {
+            let (a, b) = tables.maps.split_at_mut(src_i);
+            (&b[0], &mut a[dst_i])
+        };
+        if only.is_none() {
+            if first {
+                let mut total = 0usize;
+                for nsi in 0..3 {
+                    let slen = src_maps[nsi].len();
+                    dst_maps[nsi].reserve(slen);
+                    total += slen;
                 }
-                BindState::Ambiguous => ambiguous[ns_index(ns)].push(name),
-                BindState::One(_) => {}
+                gsrc_m.reserve(total);
+                log_m.reserve(total);
+            } else {
+                for nsi in 0..3 {
+                    let slen = src_maps[nsi].len();
+                    let dlen = dst_maps[nsi].len();
+                    if slen > dlen {
+                        dst_maps[nsi].reserve(slen - dlen);
+                    }
+                }
             }
         }
-    }
-    // The importer's first glob copy (most of the millions of names copied on tsgo): with no
-    // glob source and no std alias in the module yet (each std glob alias is a std alias too),
-    // a name it does not hold takes the copy as `insert_glob` would, in one table probe.
-    let m = imp.module;
-    let first = tables.glob_src.none_in(m) && tables.std_aliases.range((m, 0, Sym(0))..=(m, u8::MAX, Sym(u32::MAX))).next().is_none();
-    // A full copy brings a source's whole namespace at once (a prelude: thousands of names):
-    // the importer's maps get room for the names they lack in one step, where growing by
-    // doubling rehashed them again and again (a quarter of the copy's time on tsgo). A first
-    // copy meets only the importer's own names (a few), so it counts every name.
-    if only.is_none() {
-        let mut new = [0usize; 3];
-        for (ns, name, _) in &entries {
-            let i = ns_index(*ns);
-            new[i] += usize::from(first || !tables.maps[m.0 as usize][i].contains_key(name));
-        }
-        for (i, &n) in new.iter().enumerate() {
-            tables.maps[m.0 as usize][i].reserve(n);
-        }
-        tables.glob_src.reserve(m, new.iter().sum());
-    }
-    for (ns, name, bind) in entries {
-        let took = first
-            && match tables.maps[m.0 as usize][ns_index(ns)].entry(name) {
-                std::collections::hash_map::Entry::Vacant(v) => {
-                    v.insert(BindState::One(bind.clone()));
-                    true
+        let mut slow: Vec<(Namespace, Sym, Bind)> = Vec::new();
+        let mut other_vis: Vec<(Namespace, Sym, Bind)> = Vec::new();
+        for (nsi, ns) in [Namespace::Type, Namespace::Value, Namespace::Macro].into_iter().enumerate() {
+            let nsi_u8 = nsi as u8;
+            let src_map = &src_maps[nsi];
+            let dst_map = &mut dst_maps[nsi];
+            let amb_ns = &mut ambiguous[nsi];
+            let mut handle_one = |name: Sym, state: &BindState| match state {
+                BindState::Ambiguous => amb_ns.push(name),
+                BindState::One(b) => {
+                    if b.rank < 2 && has_pending && pending_single.contains_key(&(src, name)) {
+                        return;
+                    }
+                    if ns == Namespace::Macro
+                        && has_textual
+                        && matches!(b.target, Target::Def(d) if macro_textual_binds.get(&(src, name)) == Some(&d))
+                    {
+                        return;
+                    }
+                    let (vis, def_module) = match b.vis {
+                        VisKind::Pub => (imp.vis, m),
+                        VisKind::Crate => {
+                            if m_root != modules[b.def_module.0 as usize].krate_root {
+                                return;
+                            }
+                            if imp_ra != 2 { (imp.vis, m) } else { (VisKind::Crate, b.def_module) }
+                        }
+                        VisKind::Priv | VisKind::Super | VisKind::In(_) => {
+                            other_vis.push((ns, name, *b));
+                            return;
+                        }
+                    };
+                    let bind = Bind { target: b.target, vis, rank: 1, def_module };
+                    if has_std_glob && std_glob_aliases.contains_key(&(m, nsi_u8, name)) {
+                        slow.push((ns, name, bind));
+                        return;
+                    }
+                    match dst_map.entry(name) {
+                        std::collections::hash_map::Entry::Vacant(v) => {
+                            if first || !gsrc_m.contains_key(&(nsi_u8, name)) {
+                                v.insert(BindState::One(bind));
+                                log_m.push(name);
+                                gsrc_m.insert((nsi_u8, name), src);
+                                changed = true;
+                            } else {
+                                slow.push((ns, name, bind));
+                            }
+                        }
+                        std::collections::hash_map::Entry::Occupied(o) => match *o.get() {
+                            BindState::One(old) => {
+                                if old.rank >= 2 {
+                                    // Local def or explicit import beats glob (`Same`).
+                                } else if old.rank == 1
+                                    && old.target == bind.target
+                                    && ((old.vis == bind.vis && old.def_module == bind.def_module) || old.vis == VisKind::Pub)
+                                {
+                                    // Same glob target with equal or already-pub visibility (`Same`).
+                                } else {
+                                    slow.push((ns, name, bind));
+                                }
+                            }
+                            BindState::Ambiguous => slow.push((ns, name, bind)),
+                        },
+                    }
                 }
-                std::collections::hash_map::Entry::Occupied(_) => false,
             };
-        if took {
-            tables.touch(m, name);
-            tables.glob_src.insert((m, ns_index(ns) as u8, name), src);
-            changed = true;
-        } else if tables.insert_glob(m, ns, name, bind, src) == InsertOut::Changed {
-            changed = true;
+            match only {
+                None => {
+                    for (&name, state) in src_map {
+                        handle_one(name, state);
+                    }
+                }
+                Some(o) => {
+                    for &name in o {
+                        if let Some(state) = src_map.get(&name) {
+                            handle_one(name, state);
+                        }
+                    }
+                }
+            }
+        }
+        for (ns, name, b) in other_vis {
+            if tables.visible(&b.vis, b.def_module, m, interner) {
+                let (vis, def_module) = tables.glob_vis(imp, &b.vis, b.def_module, interner);
+                let bind = Bind { target: b.target, vis, rank: 1, def_module };
+                if tables.insert_glob(m, ns, name, bind, src) == InsertOut::Changed {
+                    changed = true;
+                }
+            }
+        }
+        for (ns, name, bind) in slow {
+            if tables.insert_glob(m, ns, name, bind, src) == InsertOut::Changed {
+                changed = true;
+            }
+        }
+    } else {
+        // Self-glob fallback (only a std overlay module can glob itself).
+        let mut entries: Vec<(Namespace, Sym, Bind)> = Vec::new();
+        for ns in [Namespace::Type, Namespace::Value, Namespace::Macro] {
+            for (name, state) in glob_names(tables, src, ns, only) {
+                match state {
+                    BindState::One(b)
+                        if (b.rank >= 2 || !tables.pending_single.contains_key(&(src, name)))
+                            && tables.visible(&b.vis, b.def_module, imp.module, interner)
+                            && !(ns == Namespace::Macro && tables.is_textual_bind(src, name, b)) =>
+                    {
+                        let (vis, def_module) = tables.glob_vis(imp, &b.vis, b.def_module, interner);
+                        entries.push((ns, name, Bind { target: b.target, vis, rank: 1, def_module }));
+                    }
+                    BindState::Ambiguous => ambiguous[ns_index(ns)].push(name),
+                    BindState::One(_) => {}
+                }
+            }
+        }
+        for (ns, name, bind) in entries {
+            if tables.insert_glob(m, ns, name, bind, src) == InsertOut::Changed {
+                changed = true;
+            }
         }
     }
     // An ambiguous name in the source is ambiguous
@@ -2681,21 +2819,25 @@ fn copy_glob(tables: &mut ResolvedTables, imp: &Import, src: ModuleId, only: Opt
     // The std imports of the source module
     // (`pub use std::rc::Rc;`) bind like its other names. `only` is sorted
     // for them (a few sources have std aliases).
-    let aliases = tables.visible_std_aliases(src, imp.module, interner);
-    let only_sorted: Option<Vec<Sym>> = only.filter(|_| !aliases.is_empty()).map(|o| {
-        let mut v = o.to_vec();
-        v.sort_unstable();
-        v
-    });
-    for (ns, name, vis, def_module, path) in aliases {
-        if only_sorted.as_ref().is_some_and(|o| o.binary_search(&name).is_err())
-            || (tables.pending_single.contains_key(&(src, name)) && tables.std_glob_aliases.contains_key(&(src, ns, name)))
-        {
-            continue;
+    if !tables.std_aliases.is_empty()
+        && tables.std_aliases.range((src, 0, Sym(0))..=(src, u8::MAX, Sym(u32::MAX))).next().is_some()
+    {
+        let aliases = tables.visible_std_aliases(src, imp.module, interner);
+        let only_sorted: Option<Vec<Sym>> = only.filter(|_| !aliases.is_empty()).map(|o| {
+            let mut v = o.to_vec();
+            v.sort_unstable();
+            v
+        });
+        for (ns, name, vis, def_module, path) in aliases {
+            if only_sorted.as_ref().is_some_and(|o| o.binary_search(&name).is_err())
+                || (tables.pending_single.contains_key(&(src, name)) && tables.std_glob_aliases.contains_key(&(src, ns, name)))
+            {
+                continue;
+            }
+            let (vis, def_module) = tables.glob_vis(imp, &vis, def_module, interner);
+            let ns = [Namespace::Type, Namespace::Value, Namespace::Macro][ns as usize];
+            changed |= tables.insert_glob_std_alias(imp.module, ns, name, vis, def_module, path);
         }
-        let (vis, def_module) = tables.glob_vis(imp, &vis, def_module, interner);
-        let ns = [Namespace::Type, Namespace::Value, Namespace::Macro][ns as usize];
-        changed |= tables.insert_glob_std_alias(imp.module, ns, name, vis, def_module, path);
     }
     changed
 }
@@ -2708,12 +2850,7 @@ fn glob_source(tables: &ResolvedTables, imp: &Import, interner: &Interner) -> Op
     if path.is_empty() {
         return None;
     }
-    if let PathRes::Done(Target::Def(adt)) = tables.resolve_path(imp.module, path, Namespace::Type, PathMode::Use, imp.leading_colon, interner)
-        && tables.variants.contains_key(&adt)
-    {
-        return None;
-    }
-    match tables.resolve_module_path(imp.module, path, imp.leading_colon, interner) {
+    match tables.resolve_path(imp.module, path, Namespace::Type, PathMode::Use, imp.leading_colon, interner) {
         PathRes::Done(Target::Module(src)) if src != imp.module => Some(src),
         _ => None,
     }
@@ -3496,6 +3633,9 @@ fn settle_single(tables: &mut ResolvedTables, module: ModuleId, name: Sym, span:
         list.retain(|p| p.span != span);
         if list.is_empty() {
             tables.pending_single.remove(&(module, name));
+            if let Some(c) = tables.pending_single_count.get_mut(module.0 as usize) {
+                *c = c.saturating_sub(1);
+            }
         }
         tables.touch(module, name);
     }

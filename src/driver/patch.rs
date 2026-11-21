@@ -85,6 +85,116 @@ use crate::ty::lang::{ShippedCrate, StdFnDef, StdNeeds};
 use std::sync::Arc;
 use std::time::SystemTime;
 
+/// Directory-grouped index of `tables.module_alts` so `find_edits` batches
+/// absent-alternative checks with one `read_dir` per unique parent directory
+/// instead of one `stat` per candidate path. Tracked source file stamps always
+/// use `std::fs::metadata` (`GetFileInformationByHandle` on Windows, `stat` on
+/// Unix) so NTFS lazy directory-entry updates can never hide an edit (Rule 4).
+#[derive(Default)]
+struct DirWatch {
+    dirs: Vec<WatchedDir>,
+    loose_alts: Vec<std::path::PathBuf>,
+}
+
+struct WatchedDir {
+    path: std::path::PathBuf,
+    direct_alts: Vec<(AltKey, std::path::PathBuf)>,
+    subdir_alts: Vec<(AltKey, std::path::PathBuf)>,
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+type AltKey = String;
+#[cfg(not(any(windows, target_os = "macos")))]
+type AltKey = std::ffi::OsString;
+
+fn alt_key(name: &std::ffi::OsStr) -> Option<AltKey> {
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        name.to_str().map(str::to_lowercase)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        Some(name.to_os_string())
+    }
+}
+
+impl DirWatch {
+    fn build(module_alts: &[std::path::PathBuf]) -> DirWatch {
+        let mut dir_idx: FxMap<std::path::PathBuf, usize> = FxMap::default();
+        let mut dirs: Vec<WatchedDir> = Vec::new();
+        let mut loose_alts: Vec<std::path::PathBuf> = Vec::new();
+        fn slot(dir_idx: &mut FxMap<std::path::PathBuf, usize>, dirs: &mut Vec<WatchedDir>, dir: &std::path::Path) -> usize {
+            if let Some(&i) = dir_idx.get(dir) {
+                return i;
+            }
+            let i = dirs.len();
+            let pb = dir.to_path_buf();
+            dir_idx.insert(pb.clone(), i);
+            dirs.push(WatchedDir { path: pb, direct_alts: Vec::new(), subdir_alts: Vec::new() });
+            i
+        }
+        let mod_rs = std::ffi::OsStr::new("mod.rs");
+        for alt in module_alts {
+            if alt.file_name() == Some(mod_rs)
+                && let Some(sub) = alt.parent()
+                && let (Some(gp), Some(sub_name)) = (sub.parent(), sub.file_name())
+                && !gp.as_os_str().is_empty()
+                && let Some(key) = alt_key(sub_name)
+            {
+                let i = slot(&mut dir_idx, &mut dirs, gp);
+                dirs[i].subdir_alts.push((key, alt.clone()));
+            } else if let (Some(parent), Some(fname)) = (alt.parent(), alt.file_name())
+                && !parent.as_os_str().is_empty()
+                && let Some(key) = alt_key(fname)
+            {
+                let i = slot(&mut dir_idx, &mut dirs, parent);
+                dirs[i].direct_alts.push((key, alt.clone()));
+            } else {
+                // Paths with no parent part, or non-UTF-8 names on Windows/macOS,
+                // always fall back to `Path::is_file` so none is ever skipped.
+                loose_alts.push(alt.clone());
+            }
+        }
+        DirWatch { dirs, loose_alts }
+    }
+
+    fn check_dir(d: &WatchedDir) -> bool {
+        if let Ok(rd) = std::fs::read_dir(&d.path) {
+            // Map present entry names -> true if any matching entry is a dir, symlink,
+            // or has unknown file_type (the only entries under which `sub/mod.rs` can exist).
+            let mut entries: FxMap<AltKey, bool> = FxMap::default();
+            for ent in rd.flatten() {
+                let is_dir_or_link = ent.file_type().ok().is_none_or(|t| t.is_dir() || t.is_symlink());
+                if let Some(key) = alt_key(&ent.file_name()) {
+                    let slot = entries.entry(key).or_insert(false);
+                    *slot |= is_dir_or_link;
+                }
+            }
+            for (key, alt_path) in &d.direct_alts {
+                if entries.contains_key(key) && alt_path.is_file() {
+                    return true;
+                }
+            }
+            for (key, alt_path) in &d.subdir_alts {
+                if entries.get(key).copied().unwrap_or(false) && alt_path.is_file() {
+                    return true;
+                }
+            }
+            return false;
+        }
+        d.direct_alts.iter().any(|(_, p)| p.is_file()) || d.subdir_alts.iter().any(|(_, p)| p.is_file())
+    }
+
+    fn any_added(&self) -> bool {
+        let dir_hit = if self.dirs.len() >= 4 && crate::pool::threads() > 1 {
+            super::compile::par_map(&self.dirs, Self::check_dir).into_iter().any(|b| b)
+        } else {
+            self.dirs.iter().any(Self::check_dir)
+        };
+        dir_hit || self.loose_alts.iter().any(|p| p.is_file())
+    }
+}
+
 /// A file's stat when its text entered the map: modification time and
 /// size. Trusted only when the file was already older than the request
 /// that read it, so a write in the same clock tick is never missed.
@@ -118,6 +228,7 @@ impl PatchBase {
                 drop(take(&mut self.fn_lines));
                 drop(take(&mut self.live_slots));
                 drop(take(&mut self.root_unspliced));
+                drop(take(&mut self.dir_watch));
                 drop(self.local_names.take());
             }
             _ => {}
@@ -143,6 +254,8 @@ pub(crate) struct PatchBase {
     needs: Vec<(StdNeeds, bool)>,
     /// Per map file: the stat that proves its text unchanged, if any.
     stamps: Vec<Option<Stamp>>,
+    /// Parent-directory index for batched `read_dir` checks in `find_edits`.
+    dir_watch: DirWatch,
     /// Some file of the session defines a macro (`macro_rules`): tokens
     /// of one file can then sit in another file's nodes (no `ranges`).
     user_macros: bool,
@@ -288,6 +401,10 @@ fn file_needs(text: &str) -> (StdNeeds, bool) {
 
 fn stamp_of(path: &str, request_start: SystemTime) -> Option<Stamp> {
     let md = std::fs::metadata(path).ok()?;
+    stamp_from_md(&md, request_start)
+}
+
+fn stamp_from_md(md: &std::fs::Metadata, request_start: SystemTime) -> Option<Stamp> {
     let mtime = md.modified().ok()?;
     // A file modified within two seconds of the request that read it may
     // change again without its stat moving: never trust that stat.
@@ -309,6 +426,7 @@ impl PatchBase {
         body_hashes: Vec<u64>,
         request_start: SystemTime,
         expand: FxMap<crate::ty::defs::ModuleId, (crate::resolve::cfg::CfgEnv, String)>,
+        no_builtin_shadow: bool,
     ) -> PatchBase {
         let map = &front.map;
         let n = map.file_count();
@@ -319,13 +437,16 @@ impl PatchBase {
         let needs = super::compile::par_map(&texts, |&(k, t)| {
             if k > 0 && std::path::Path::new(map.path(FileId(k as u32))).starts_with(platform) { Default::default() } else { file_needs(t) }
         });
-        // The stamps (a stat per file) and the shadow scan (every file's text) on the pool.
+        let dir_watch = DirWatch::build(&tables.module_alts);
+        // The stamps (a `fs::metadata` per file, current on NTFS and Unix) on the pool.
         let stamps = super::compile::par_map(&texts, |&(k, _)| {
             let path = map.path(FileId(k as u32));
             if path.is_empty() { None } else { stamp_of(path, request_start) }
         });
         let user_macros = texts.iter().any(|(_, t)| t.contains("macro_rules"));
-        let shadowed = user_macros && super::compile::par_map(&texts, |(_, t)| shadows_parser_macro(t)).into_iter().any(|s| s);
+        // Every parser macro is a builtin macro (`is_passthrough`), so when the caller
+        // already proved no file shadows any builtin, no parser macro is shadowed either.
+        let shadowed = user_macros && !no_builtin_shadow && super::compile::par_map(&texts, |(_, t)| shadows_parser_macro(t)).into_iter().any(|s| s);
         let includes = front.chunks.iter().any(|c| c.expand_deps.iter().any(|d| matches!(d, crate::expand::Dep::File { .. })));
         let ranges = (!user_macros && !includes).then(|| span_shift::ranges_by_file(&front.ast, n));
         let mut fns_by_file: Vec<Vec<u32>> = vec![Vec::new(); n];
@@ -363,6 +484,7 @@ impl PatchBase {
             spliced,
             needs,
             stamps,
+            dir_watch,
             user_macros,
             shadowed,
             expand,
@@ -815,37 +937,60 @@ fn find_edits(front: &mut Front, inputs: u64, root: &str, request_start: SystemT
     }
     let mut fresh_stamps: Vec<(usize, Option<Stamp>)> = Vec::new();
     let mut reads = 0usize;
-    for k in 1..front.map.file_count() {
+    enum FileCheck {
+        Unchanged,
+        Refreshed(Option<Stamp>),
+        Changed(String),
+        Gone,
+    }
+    let has_overlay = crate::driver::has_source_overlay();
+    let check_one = |k: usize| -> FileCheck {
         let file = FileId(k as u32);
         let path = front.map.path(file);
         if path.is_empty() {
-            continue;
+            return FileCheck::Unchanged;
         }
         // An overlay text (`lust test`'s harness shims) can change while its file's stamp
         // stands: the shims of a module name the tests of the modules below it. Compare it.
-        if let Some(text) = crate::driver::overlay_text(std::path::Path::new(path)) {
-            if front.map.text(file) != Some(text.as_str()) {
-                changed.push((file, text));
-            }
-            continue;
+        if has_overlay
+            && let Some(text) = crate::driver::overlay_text(std::path::Path::new(path))
+        {
+            return if front.map.text(file) != Some(text.as_str()) { FileCheck::Changed(text) } else { FileCheck::Unchanged };
         }
-        let md = std::fs::metadata(path).map_err(|_| "file gone")?;
+        let Ok(md) = std::fs::metadata(path) else { return FileCheck::Gone };
         if let (Some(st), Ok(mtime)) = (base.stamps.get(k).copied().flatten(), md.modified())
             && st == (Stamp { mtime, len: md.len() })
         {
-            continue;
+            return FileCheck::Unchanged;
         }
-        let text = crate::srctext::read(std::path::Path::new(path)).map_err(|_| "file gone")?;
+        let Ok(text) = crate::srctext::read(std::path::Path::new(path)) else { return FileCheck::Gone };
         if front.map.text(file) == Some(text.as_str()) {
-            reads += 1;
-            fresh_stamps.push((k, stamp_of(path, request_start)));
-            continue;
+            FileCheck::Refreshed(stamp_from_md(&md, request_start))
+        } else {
+            FileCheck::Changed(text)
         }
-        changed.push((file, text));
+    };
+    let n_files = front.map.file_count();
+    let results: Vec<(usize, FileCheck)> = if n_files >= 32 && crate::pool::threads() > 1 {
+        let keys: Vec<usize> = (1..n_files).collect();
+        super::compile::par_map(&keys, |&k| (k, check_one(k)))
+    } else {
+        (1..n_files).map(|k| (k, check_one(k))).collect()
+    };
+    for (k, res) in results {
+        match res {
+            FileCheck::Unchanged => {}
+            FileCheck::Refreshed(st) => {
+                reads += 1;
+                fresh_stamps.push((k, st));
+            }
+            FileCheck::Changed(text) => changed.push((FileId(k as u32), text)),
+            FileCheck::Gone => return Err("file gone"),
+        }
     }
     // Each `mod name;` stands while the file it did not take stays absent
     // (`ResolvedTables::module_alts`): with both, a cold resolve rejects it.
-    if base.tables.module_alts.iter().any(|p| p.is_file()) {
+    if base.dir_watch.any_added() {
         return Err("module file added");
     }
     if !changed.is_empty() {
@@ -926,20 +1071,36 @@ fn find_body_edit(front: &Front, text: &str, edit: Edit) -> Result<NewBody, &'st
     let old = front.map.text(file).ok_or("no text")?;
     let (a, b, d) = (edit.a as usize, edit.b as usize, edit.d);
     let ast = &front.ast;
-    let (fn_index, &(item, sub)) = front
-        .fn_loc
-        .iter()
-        .enumerate()
-        .find(|&(_, &(item, sub))| {
-            item != usize::MAX && {
-                let def = fn_def_at(ast, item, sub);
-                def.body.is_some_and(|bl| {
-                    let sp = ast.blocks[bl.0 as usize].span;
-                    sp.file == file && (sp.lo as usize) < a && b < sp.hi as usize
-                })
-            }
-        })
-        .ok_or_else(|| outside_fn_reason(ast, file, a, b))?;
+    let body_holds = |(item, sub): (usize, Option<usize>)| {
+        item != usize::MAX && {
+            let def = fn_def_at(ast, item, sub);
+            def.body.is_some_and(|bl| {
+                let sp = ast.blocks[bl.0 as usize].span;
+                sp.file == file && (sp.lo as usize) < a && b < sp.hi as usize
+            })
+        }
+    };
+    let found_in_file = base
+        .fns_by_file
+        .get(file.0 as usize)
+        .and_then(|fns| {
+            fns.iter().find_map(|&idx| {
+                let i = idx as usize;
+                let loc = *front.fn_loc.get(i)?;
+                body_holds(loc).then_some((i, loc))
+            })
+        });
+    let (fn_index, (item, sub)) = match found_in_file {
+        Some(hit) => hit,
+        None if !base.user_macros => return Err(outside_fn_reason(ast, file, a, b)),
+        None => front
+            .fn_loc
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|&(_, loc)| body_holds(loc))
+            .ok_or_else(|| outside_fn_reason(ast, file, a, b))?,
+    };
     let def = fn_def_at(ast, item, sub);
     let rpit = def.ret.is_some_and(|t| matches!(ast.ty(t), TyExpr::ImplTrait { .. })).then(|| super::ast_hash::body_scan(ast, def, None).0);
     if !matches!(ast.items[item].kind, ItemKind::Fn(_) | ItemKind::Impl(_)) {
@@ -4861,5 +5022,197 @@ pub fn run() -> i64 {
         assert!(!shadows_builtin("// treated as line terminators."));
         assert!(!shadows_builtin("let x = y as u8;"));
         assert!(!shadows_builtin("macro_rules! dbl { () => {} }"));
+    }
+
+    /// Adding the unused alternative module file (`foo.rs` beside `foo/mod.rs`,
+    /// and `bar/mod.rs` beside `bar.rs`) must reject the body patch with
+    /// `why=module file added` and match the cold diagnostic.
+    #[test]
+    fn dir_watch_detects_added_mod_alts_both_directions() {
+        let dir = std::env::temp_dir().join(format!("lust-dirwatch-alts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("foo")).unwrap();
+        let root = dir.join("main.rs");
+        std::fs::write(&root, "mod foo;\nmod bar;\nfn main() { let _ = foo::a() + bar::b(); }\n").unwrap();
+        std::fs::write(dir.join("foo/mod.rs"), "pub fn a() -> i64 { 1 }\n").unwrap();
+        std::fs::write(dir.join("bar.rs"), "pub fn b() -> i64 { 2 }\n").unwrap();
+
+        let mut warm = Session::new(dir.join("obj"), true, SessionKey::synthetic(&root, false));
+        assert_eq!(check(&mut warm, &root).0, 0);
+        // No-op check reuses the last answer.
+        assert_eq!(check(&mut warm, &root).0, 0);
+        assert_eq!(field(&warm.front.last_visits, "path"), "reuse");
+
+        // Case 1: add `foo.rs` beside `foo/mod.rs` (direct alt).
+        std::fs::write(dir.join("foo.rs"), "pub fn a() -> i64 { 1 }\n").unwrap();
+        let (wcode, werr) = check(&mut warm, &root);
+        let mut cold = Session::new(dir.join("obj-cold1"), false, SessionKey::synthetic(&root, false));
+        let (ccode, cerr) = check(&mut cold, &root);
+        assert_ne!(wcode, 0);
+        assert_eq!((wcode, werr), (ccode, cerr));
+
+        // Remove `foo.rs` and re-establish a clean warm base.
+        std::fs::remove_file(dir.join("foo.rs")).unwrap();
+        assert_eq!(check(&mut warm, &root).0, 0);
+        assert_eq!(check(&mut warm, &root).0, 0);
+        assert_eq!(field(&warm.front.last_visits, "path"), "reuse");
+
+        // Case 2: add `bar/mod.rs` beside `bar.rs` (subdir alt).
+        std::fs::create_dir_all(dir.join("bar")).unwrap();
+        std::fs::write(dir.join("bar/mod.rs"), "pub fn b() -> i64 { 2 }\n").unwrap();
+        let (wcode, werr) = check(&mut warm, &root);
+        let mut cold2 = Session::new(dir.join("obj-cold2"), false, SessionKey::synthetic(&root, false));
+        let (ccode, cerr) = check(&mut cold2, &root);
+        assert_ne!(wcode, 0);
+        assert_eq!((wcode, werr), (ccode, cerr));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Deleting a tracked module file in a watched directory must reject the
+    /// body patch (`file gone`) and match the cold diagnostic.
+    #[test]
+    fn patch_detects_deleted_file() {
+        let dir = std::env::temp_dir().join(format!("lust-dirwatch-del-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = write_crate(&dir, 2);
+        let mut warm = Session::new(dir.join("obj"), true, SessionKey::synthetic(&root, false));
+        assert_eq!(check(&mut warm, &root).0, 0);
+        assert_eq!(check(&mut warm, &root).0, 0);
+        assert_eq!(field(&warm.front.last_visits, "path"), "reuse");
+
+        std::fs::remove_file(dir.join("m1.rs")).unwrap();
+        let (wcode, werr) = check(&mut warm, &root);
+        let mut cold = Session::new(dir.join("obj-cold"), false, SessionKey::synthetic(&root, false));
+        let (ccode, cerr) = check(&mut cold, &root);
+        assert_ne!(wcode, 0);
+        assert_eq!((wcode, werr), (ccode, cerr));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `DirWatch::any_added` across both serial (< 4 watched dirs) and parallel
+    /// (>= 4 watched dirs) paths, case-variant entries on Windows/macOS,
+    /// parent-less `loose_alts`, and non-UTF-8 alternative names.
+    #[test]
+    fn dir_watch_serial_parallel_case_and_loose_alts() {
+        use super::DirWatch;
+        let dir = std::env::temp_dir().join(format!("lust-dirwatch-unit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for i in 0..6 {
+            std::fs::create_dir_all(dir.join(format!("d{i}"))).unwrap();
+        }
+
+        // Serial path (< 4 dirs): 2 directories with direct and subdir alts.
+        let serial_alts = vec![
+            dir.join("d0/alpha.rs"),
+            dir.join("d1/beta/mod.rs"),
+        ];
+        let w_ser = DirWatch::build(&serial_alts);
+        assert_eq!(w_ser.dirs.len(), 2);
+        assert!(!w_ser.any_added());
+        std::fs::write(dir.join("d0/alpha.rs"), "").unwrap();
+        assert!(w_ser.any_added());
+        std::fs::remove_file(dir.join("d0/alpha.rs")).unwrap();
+        assert!(!w_ser.any_added());
+        std::fs::create_dir_all(dir.join("d1/beta")).unwrap();
+        std::fs::write(dir.join("d1/beta/mod.rs"), "").unwrap();
+        assert!(w_ser.any_added());
+        std::fs::remove_dir_all(dir.join("d1/beta")).unwrap();
+
+        // Parallel path (>= 4 dirs): 6 directories.
+        let par_alts: Vec<std::path::PathBuf> = (0..6)
+            .flat_map(|i| [dir.join(format!("d{i}/m{i}.rs")), dir.join(format!("d{i}/sub{i}/mod.rs"))])
+            .collect();
+        let w_par = DirWatch::build(&par_alts);
+        assert_eq!(w_par.dirs.len(), 6);
+        assert!(!w_par.any_added());
+        std::fs::write(dir.join("d4/m4.rs"), "").unwrap();
+        assert!(w_par.any_added());
+        std::fs::remove_file(dir.join("d4/m4.rs")).unwrap();
+        std::fs::create_dir_all(dir.join("d5/sub5")).unwrap();
+        std::fs::write(dir.join("d5/sub5/mod.rs"), "").unwrap();
+        assert!(w_par.any_added());
+        std::fs::remove_dir_all(dir.join("d5/sub5")).unwrap();
+        assert!(!w_par.any_added());
+
+        // Case-variant alt: must match `Path::is_file()` on every filesystem
+        // (case-insensitive Windows/macOS detects `Alpha.rs` for `alpha.rs`;
+        // case-sensitive Linux/APFS reports false).
+        let case_dir = dir.join("d2");
+        let case_alt = case_dir.join("gamma.rs");
+        let case_sub_alt = case_dir.join("delta/mod.rs");
+        let w_case = DirWatch::build(&[case_alt.clone(), case_sub_alt.clone()]);
+        std::fs::write(case_dir.join("Gamma.rs"), "").unwrap();
+        assert_eq!(w_case.any_added(), case_alt.is_file());
+        std::fs::remove_file(case_dir.join("Gamma.rs")).unwrap();
+        std::fs::create_dir_all(case_dir.join("Delta")).unwrap();
+        std::fs::write(case_dir.join("Delta/mod.rs"), "").unwrap();
+        assert_eq!(w_case.any_added(), case_sub_alt.is_file());
+        std::fs::remove_dir_all(case_dir.join("Delta")).unwrap();
+
+        // Parent-less path lands in `loose_alts` and is checked via `is_file()`.
+        let loose = std::path::PathBuf::from("lust-nonexistent-loose-alt-file.rs");
+        let w_loose = DirWatch::build(&[loose]);
+        assert!(w_loose.dirs.is_empty());
+        assert_eq!(w_loose.loose_alts.len(), 1);
+        assert!(!w_loose.any_added());
+
+        // Non-UTF-8 alternative filename: on Windows/macOS `alt_key` returns
+        // None, so it must route to `loose_alts` (never silently dropped).
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+            let bad_name = std::ffi::OsString::from_wide(&[b'x' as u16, 0xD800, b'.' as u16, b'r' as u16, b's' as u16]);
+            let bad_alt = dir.join("d3").join(bad_name);
+            let w_bad = DirWatch::build(&[bad_alt]);
+            assert_eq!(w_bad.loose_alts.len(), 1);
+            assert!(!w_bad.any_added());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let bad_name = std::ffi::OsString::from_vec(vec![b'x', 0xFF, b'.', b'r', b's']);
+            let bad_alt = dir.join("d3").join(bad_name);
+            let w_bad = DirWatch::build(&[bad_alt.clone()]);
+            #[cfg(target_os = "macos")]
+            assert_eq!(w_bad.loose_alts.len(), 1);
+            assert!(!w_bad.any_added());
+            if std::fs::write(&bad_alt, "").is_ok() {
+                assert!(w_bad.any_added());
+                let _ = std::fs::remove_file(&bad_alt);
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A case-only rename of a tracked file (`m1.rs` -> `M1.rs`) on Windows/macOS
+    /// still reads the updated file contents via `fs::metadata` (never stale
+    /// directory-entry metadata).
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn patch_case_only_rename_sees_edit() {
+        let dir = std::env::temp_dir().join(format!("lust-case-rename-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = write_crate(&dir, 2);
+        let m1 = dir.join("m1.rs");
+        let m1_upper = dir.join("M1.rs");
+        let mut warm = Session::new(dir.join("obj"), true, SessionKey::synthetic(&root, false));
+        assert_eq!(check(&mut warm, &root).0, 0);
+        // Case-only rename (via a temporary name so NTFS/APFS updates casing cleanly)
+        // plus a body edit.
+        let tmp = dir.join("m1_tmp.rs");
+        std::fs::rename(&m1, &tmp).unwrap();
+        std::fs::rename(&tmp, &m1_upper).unwrap();
+        let text = std::fs::read_to_string(&m1_upper).unwrap();
+        let edited = text.replacen("pub fn helper", "pub fn helper_renamed", 1);
+        assert_ne!(text, edited);
+        std::fs::write(&m1_upper, &edited).unwrap();
+        let (wcode, werr) = check(&mut warm, &root);
+        let mut cold = Session::new(dir.join("obj-cold"), false, SessionKey::synthetic(&root, false));
+        let (ccode, cerr) = check(&mut cold, &root);
+        assert_ne!(wcode, 0);
+        assert_eq!((wcode, werr), (ccode, cerr));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

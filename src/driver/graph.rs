@@ -949,6 +949,7 @@ impl FpMemo {
         if p.fp_memo.follow != Some(stamp) {
             p.fp_memo.on(p.adts.len());
             p.fp_memo.follow = Some(stamp);
+            crate::check::spec::wrote_all(crate::check::spec::tab::FP_MEMO);
         }
     }
 
@@ -970,7 +971,9 @@ impl DeepMemo {
         if self.1 {
             return None;
         }
-        let v = p.fp_memo.slot(p, kind, def).and_then(|s| s.get().copied())?;
+        let slot = p.fp_memo.slot(p, kind, def)?;
+        crate::check::spec::read_all(crate::check::spec::tab::FP_MEMO);
+        let v = slot.get().copied()?;
         if memo_check() {
             let fresh = adt_deep(p, kind, def, &mut DeepMemo(FxMap::default(), true));
             assert_eq!(fresh, v, "internal: stale deep fingerprint memo for {def:?} (LUST_CHECK_FPMEMO)");
@@ -1548,6 +1551,9 @@ fn closed_adt(p: &Program, def: DefId) -> bool {
 /// the derive log closed: it notes nothing into a body that records it.
 fn answer_fingerprint(p: &Program, def: DefId, kind: u8) -> Fingerprint {
     let slot = p.adt_by_def(def).and_then(|a| p.fp_memo.answers.get(a.0 as usize * ANSWER_KINDS + kind as usize));
+    if slot.is_some() {
+        crate::check::spec::read_all(crate::check::spec::tab::FP_MEMO);
+    }
     if let Some(v) = slot.and_then(|s| s.get()) {
         return Fingerprint(*v);
     }
@@ -2423,6 +2429,9 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
 /// the program memo is on.
 fn drop_check_fingerprint(p: &Program, def: DefId) -> Fingerprint {
     let slot = p.adt_by_def(def).and_then(|a| p.fp_memo.dropck.get(a.0 as usize));
+    if slot.is_some() {
+        crate::check::spec::read_all(crate::check::spec::tab::FP_MEMO);
+    }
     if let Some(v) = slot.and_then(|s| s.get()) {
         return Fingerprint(*v);
     }

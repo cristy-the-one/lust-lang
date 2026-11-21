@@ -289,6 +289,11 @@ fn prejudge_oracle(p: &Program, memo: &FxMap<ReadKey, Read>, keys: &ReadKeys, e:
 }
 
 impl GenReuse {
+    /// True when no template checks are cached yet (e.g. a daemon's first check).
+    pub(crate) fn templates_empty(&self) -> bool {
+        self.templates.is_empty() && self.closure_templates.is_empty()
+    }
+
     /// For `main::census` (LUST_FRONT_CENSUS=1, a probe of a front image): drops one part
     /// (0 templates, 1 closure templates, 2 discovery, 3 unstored, 4 held, 5 memo, 6 template
     /// and closure outputs, 7 readers index; 8 the discovery entries' read sets, 9 their
